@@ -1,0 +1,85 @@
+{
+  "schema_version": 1,
+  "platform": {
+    "product": "Raider 18 HX AI A2XWIG",
+    "board": "MS-1824",
+    "bios": "E1824IMS.310",
+    "ec_firmware": "1824EMS1.108",
+    "cpu": "Intel Core Ultra 9 285HX",
+    "gpu": "NVIDIA GeForce RTX 5080 Laptop GPU",
+    "os": "Ubuntu 24.04.4 LTS",
+    "kernel": "7.0.0-31-generic"
+  },
+  "factory_curve": {
+    "cpu_threshold_c": [58, 64, 70, 76, 82, 88],
+    "cpu_speed": [0, 25, 35, 44, 58, 70, 75],
+    "gpu_threshold_c": [52, 58, 64, 70, 76, 82],
+    "gpu_speed": [0, 25, 35, 44, 58, 70, 75]
+  },
+  "candidate14": {
+    "cpu_threshold_c": [50, 60, 70, 76, 82, 88],
+    "cpu_speed": [20, 30, 40, 50, 60, 80, 110],
+    "gpu_threshold_c": [38, 40, 42, 44, 55, 70],
+    "gpu_speed": [20, 30, 40, 60, 70, 100, 120]
+  },
+  "tests": [
+    {
+      "name": "settled_idle_candidate14",
+      "settle_seconds": 75,
+      "tail_cpu_package_c": 44.1,
+      "tail_gpu_c": 37.0,
+      "tail_fan1_rpm": 1585,
+      "tail_fan2_rpm": 1660
+    },
+    {
+      "name": "gpu75_candidate14",
+      "duration_seconds": 60,
+      "gpu_active_fraction": 0.738,
+      "tail_cpu_package_c": 79.5,
+      "tail_gpu_c": 64.4,
+      "tail_fan1_rpm": 2186,
+      "tail_fan2_rpm": 4339,
+      "max_cpu_package_c": 87,
+      "max_gpu_c": 65,
+      "result": "pass"
+    },
+    {
+      "name": "cpu6_candidate13_equivalent_cpu_curve",
+      "duration_seconds": 90,
+      "cpu_affinity": "0-5",
+      "tail_cpu_package_c": 87.6,
+      "tail_gpu_c": 45.6,
+      "tail_fan1_rpm": 5525,
+      "tail_fan2_rpm": 3743,
+      "max_cpu_package_c": 96,
+      "result": "pass"
+    },
+    {
+      "name": "combined6_gpu25_candidate14_soak",
+      "duration_seconds": 180,
+      "cpu_affinity": "0-5",
+      "gpu_active_fraction": 0.248,
+      "tail60_cpu_package_c": 93.9,
+      "tail60_gpu_c": 55.4,
+      "tail60_fan1_rpm": 5591,
+      "tail60_fan2_rpm": 4306,
+      "max_cpu_package_c": 95,
+      "max_gpu_c": 58,
+      "result": "pass"
+    },
+    {
+      "name": "combined6_gpu25_firmware_auto",
+      "observed_seconds": 45.5,
+      "tail_cpu_package_c": 98.3,
+      "tail_gpu_c": 59.6,
+      "tail_fan1_rpm": 3618,
+      "tail_fan2_rpm": 3607,
+      "result": "stopped_by_sustained_cpu_safety_gate"
+    }
+  ],
+  "limitations": [
+    "Temperature and RPM vary with ambient conditions and background workload.",
+    "Fan-only control cannot guarantee an 80-85C CPU ceiling under extreme sustained package power.",
+    "Suspend/resume forced-reapply implementation is pending final attended validation."
+  ]
+}

@@ -1,0 +1,19 @@
+This project contains original integration, monitoring, recovery, documentation,
+and calibration work for one exact MSI laptop configuration.
+
+The patch in patches/msi-ec-0.13.1-exact-fan-curve.patch is based on:
+
+  BeardOverflow/msi-ec
+  https://github.com/BeardOverflow/msi-ec
+  base commit d7fbbd88e6831e56801b860e46475cbf8ddbc7c1
+  base tree 072c10a344c22372665a729add6c10faada7c6da
+
+That upstream project and the derived patch are licensed GPL-2.0-or-later and
+retain upstream authorship notices in the patched source.
+
+The original manager, daemon, scripts, and documentation in this repository are
+licensed GPL-3.0-or-later.
+
+MSI and product names are trademarks of Micro-Star INT'L CO., LTD. NVIDIA is a
+trademark of NVIDIA Corporation. This independent community project is not
+affiliated with or endorsed by MSI, NVIDIA, Canonical, or Ubuntu.

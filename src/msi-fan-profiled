@@ -1,0 +1,522 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
+"""Persistent exact-platform MSI EC fan profile with read-only runtime monitoring."""
+from __future__ import annotations
+
+import fcntl
+import os
+import pathlib
+import signal
+import socket
+import stat
+import sys
+import time
+from dataclasses import dataclass
+from typing import Callable
+
+BASE = pathlib.Path("/sys/devices/platform/msi-ec")
+LOCK = pathlib.Path("/run/msi-fanctl.lock")
+OVERRIDE = pathlib.Path("/run/msi-fan-profile.factory-auto")
+ACK = pathlib.Path("/run/msi-fan-profile.ack")
+FACTORY = (
+    "58 64 70 76 82 88 0 25 35 44 58 70 75 "
+    "52 58 64 70 76 82 0 25 35 44 58 70 75"
+)
+DEFAULT = (
+    "50 60 70 76 82 88 20 30 40 50 60 80 110 "
+    "38 40 42 44 55 70 20 30 40 60 70 100 120"
+)
+STOP = False
+BOOST_REQUEST = False
+RELEASE_REQUEST = False
+
+
+class ProfileError(RuntimeError):
+    pass
+
+
+def read(path: pathlib.Path) -> str:
+    with path.open("r", encoding="ascii") as stream:
+        return stream.read().strip()
+
+
+def read_uint(path: pathlib.Path) -> int:
+    value = read(path)
+    if not value.isascii() or not value.isdecimal():
+        raise ProfileError(f"nonnumeric sensor {path}: {value!r}")
+    return int(value)
+
+
+def write(path: pathlib.Path, value: str) -> None:
+    # Every control mutation is preceded by a fresh immutable ABI/platform check.
+    if not immutable_identity_valid():
+        raise ProfileError("immutable identity invalid before control write")
+    with path.open("w", encoding="ascii") as stream:
+        stream.write(value + "\n")
+        stream.flush()
+    if read(path) != value:
+        raise ProfileError(f"readback mismatch for {path.name}")
+
+
+def one_hwmon(name: str) -> pathlib.Path:
+    matches = []
+    for path in pathlib.Path("/sys/class/hwmon").glob("hwmon*"):
+        try:
+            if read(path / "name") == name:
+                matches.append(path)
+        except OSError:
+            continue
+    if len(matches) != 1:
+        raise ProfileError(f"expected one {name} hwmon; found {len(matches)}")
+    return matches[0]
+
+
+def notify(message: str) -> None:
+    address = os.environ.get("NOTIFY_SOCKET")
+    if not address:
+        raise ProfileError("NOTIFY_SOCKET is absent")
+    if address.startswith("@"):
+        address = "\0" + address[1:]
+    with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as sock:
+        sock.settimeout(0.5)
+        sock.connect(address)
+        sock.sendall(message.encode("utf-8"))
+
+
+def immutable_identity_valid() -> bool:
+    expected = {
+        pathlib.Path("/sys/class/dmi/id/product_name"): "Raider 18 HX AI A2XWIG",
+        pathlib.Path("/sys/class/dmi/id/board_name"): "MS-1824",
+        pathlib.Path("/sys/class/dmi/id/bios_version"): "E1824IMS.310",
+        pathlib.Path("/sys/module/msi_ec/version"): "0.13.1",
+        pathlib.Path("/sys/module/msi_ec/srcversion"): "AB0BFAE2391B5ADD66E01BD",
+        BASE / "fw_version": "1824EMS1.108",
+    }
+    if pathlib.Path("/sys/module/ec_sys").exists():
+        return False
+    try:
+        return all(read(path) == wanted for path, wanted in expected.items())
+    except OSError:
+        return False
+
+
+def require_immutable_identity() -> None:
+    if not immutable_identity_valid():
+        raise ProfileError("immutable hardware/driver/EC identity validation failed")
+
+
+def require_policy_identity() -> None:
+    require_immutable_identity()
+    if read(BASE / "shift_mode") != "comfort":
+        raise ProfileError("EC shift mode is no longer comfort")
+
+
+def verify_boost(wmi: pathlib.Path, heartbeat: Callable[[str], None]) -> None:
+    write(BASE / "cooler_boost", "on")
+    for _ in range(12):
+        fan1 = read_uint(wmi / "fan1_input")
+        fan2 = read_uint(wmi / "fan2_input")
+        heartbeat(f"Verifying Cooler Boost: fans {fan1}/{fan2} RPM")
+        if fan1 >= 3000 and fan2 >= 3000:
+            return
+        time.sleep(1)
+    raise ProfileError("both physical fans did not verify under Cooler Boost")
+
+
+def force_apply_default(wmi: pathlib.Path, preserve_boost: bool,
+                        heartbeat: Callable[[str], None]) -> None:
+    """Reprogram Candidate14 under auto+Boost, then enter advanced mode."""
+    require_policy_identity()
+    curve = read(BASE / "fan_curve")
+    mode = read(BASE / "fan_mode")
+    boost = read(BASE / "cooler_boost")
+    recognized = ((curve == FACTORY and mode == "auto") or
+                  (curve == DEFAULT and mode == "advanced"))
+    if not recognized or boost not in ("on", "off"):
+        raise ProfileError(f"unrecognized pre-apply state: {mode}/{boost}/{curve!r}")
+    # Normalize before every apply, including resume. The transactional driver
+    # itself establishes and verifies auto+Boost around the curve write.
+    write(BASE / "cooler_boost", "on")
+    write(BASE / "fan_mode", "auto")
+    write(BASE / "fan_curve", DEFAULT)
+    if read(BASE / "fan_mode") != "auto" or read(BASE / "cooler_boost") != "on":
+        raise ProfileError("curve transaction did not retain auto/Boost envelope")
+    verify_boost(wmi, heartbeat)
+    require_policy_identity()
+    write(BASE / "fan_mode", "advanced")
+    if read(BASE / "cooler_boost") != "on":
+        raise ProfileError("Boost changed before advanced verification")
+    if not preserve_boost:
+        write(BASE / "cooler_boost", "off")
+    if (read(BASE / "fan_curve") != DEFAULT or
+            read(BASE / "fan_mode") != "advanced" or
+            read(BASE / "cooler_boost") != ("on" if preserve_boost else "off")):
+        raise ProfileError("default profile final readback failed")
+
+
+def restore_factory_envelope() -> bool:
+    """Best-effort full factory restore, deliberately ending at auto+Boost-on."""
+    if not immutable_identity_valid():
+        print("FATAL: immutable identity invalid; no recovery write attempted",
+              file=sys.stderr, flush=True)
+        return False
+    success = True
+    for path, value in (
+        (BASE / "cooler_boost", "on"),
+        (BASE / "fan_mode", "auto"),
+        (BASE / "fan_curve", FACTORY),
+        (BASE / "cooler_boost", "on"),
+    ):
+        try:
+            write(path, value)
+        except Exception as error:
+            success = False
+            print(f"restore write failed {path}: {error}", file=sys.stderr,
+                  flush=True)
+    try:
+        success &= read(BASE / "fan_mode") == "auto"
+        success &= read(BASE / "fan_curve") == FACTORY
+        success &= read(BASE / "cooler_boost") == "on"
+    except Exception as error:
+        success = False
+        print(f"restore verification failed: {error}", file=sys.stderr,
+              flush=True)
+    return bool(success)
+
+
+def cool_now(core: pathlib.Path) -> bool:
+    package = read_uint(core / "temp1_input")
+    ec_cpu = read_uint(BASE / "cpu/realtime_temperature")
+    ec_gpu = read_uint(BASE / "gpu/realtime_temperature")
+    return max(package, ec_cpu * 1000) < 85000 and (ec_gpu == 0 or ec_gpu < 70)
+
+
+def release_factory_if_cool(core: pathlib.Path) -> bool:
+    try:
+        if not cool_now(core):
+            return False
+        write(BASE / "fan_mode", "auto")
+        write(BASE / "cooler_boost", "off")
+        if read(BASE / "fan_mode") == "auto" and read(BASE / "cooler_boost") == "off":
+            return True
+        write(BASE / "cooler_boost", "on")
+    except Exception:
+        try:
+            write(BASE / "cooler_boost", "on")
+        except Exception:
+            pass
+    return False
+
+
+@dataclass
+class Safety:
+    cpu_100: float | None = None
+    cpu_98: float | None = None
+    gpu_82: float | None = None
+    gpu_80: float | None = None
+    fan1_stall: float | None = None
+    fan2_stall: float | None = None
+    cool_since: float | None = None
+
+    @staticmethod
+    def update_since(previous: float | None, condition: bool,
+                     now: float) -> float | None:
+        return (now if previous is None else previous) if condition else None
+
+    def update(self, cpu: int, gpu: int, fan1: int, fan2: int,
+               now: float) -> str | None:
+        if cpu >= 103000:
+            return f"CPU immediate limit {cpu} mC"
+        if gpu >= 85:
+            return f"GPU immediate limit {gpu} C"
+        self.cpu_100 = self.update_since(self.cpu_100, cpu >= 100000, now)
+        self.cpu_98 = self.update_since(self.cpu_98, cpu >= 98000, now)
+        self.gpu_82 = self.update_since(self.gpu_82, gpu >= 82, now)
+        self.gpu_80 = self.update_since(self.gpu_80, gpu >= 80, now)
+        self.fan1_stall = self.update_since(
+            self.fan1_stall, cpu >= 80000 and fan1 < 1000, now)
+        self.fan2_stall = self.update_since(
+            self.fan2_stall, gpu >= 70 and fan2 < 1000, now)
+        for since, limit, message in (
+            (self.cpu_100, 2, "CPU >=100 C for 2 seconds"),
+            (self.cpu_98, 9, "CPU >=98 C for 9 seconds"),
+            (self.gpu_82, 2, "GPU >=82 C for 2 seconds"),
+            (self.gpu_80, 9, "GPU >=80 C for 9 seconds"),
+            (self.fan1_stall, 4, "fan 1 stalled for 4 seconds"),
+            (self.fan2_stall, 4, "fan 2 stalled for 4 seconds"),
+        ):
+            if since is not None and now - since >= limit:
+                return message
+        return None
+
+
+def acknowledge(action: str) -> None:
+    temporary = pathlib.Path(f"/run/.msi-fan-profile.ack.{os.getpid()}")
+    payload = f"pid={os.getpid()} action={action} monotonic_ns={time.monotonic_ns()}\n"
+    descriptor = os.open(temporary,
+                         os.O_WRONLY | os.O_CREAT | os.O_EXCL |
+                         os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+    os.fchown(descriptor, 0, 0)
+    os.write(descriptor, payload.encode("ascii"))
+    os.fsync(descriptor)
+    os.close(descriptor)
+    os.replace(temporary, ACK)
+
+
+def on_stop(_number: int, _frame: object) -> None:
+    global STOP
+    STOP = True
+
+
+def on_boost(_number: int, _frame: object) -> None:
+    global BOOST_REQUEST
+    BOOST_REQUEST = True
+
+
+def on_release(_number: int, _frame: object) -> None:
+    global RELEASE_REQUEST
+    RELEASE_REQUEST = True
+
+
+def main() -> int:
+    global BOOST_REQUEST, RELEASE_REQUEST
+    if os.geteuid() != 0:
+        raise ProfileError("root required")
+    if read(pathlib.Path("/proc/self/cgroup")) != "0::/system.slice/msi-fan-profile.service":
+        raise ProfileError("unexpected service cgroup")
+    info = LOCK.stat()
+    if (not stat.S_ISREG(info.st_mode) or info.st_uid != 0 or
+            stat.S_IMODE(info.st_mode) != 0o600):
+        raise ProfileError("unsafe fan-control lock")
+    descriptor = os.open(LOCK, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError as error:
+        os.close(descriptor)
+        raise ProfileError("fan-control lock is busy") from error
+
+    try:
+        OVERRIDE.lstat()
+    except FileNotFoundError:
+        pass
+    else:
+        os.close(descriptor)
+        raise ProfileError("factory-auto runtime override pathname is present")
+
+    immutable_verified = False
+    mutated = False
+    clean_stop = False
+    wmi: pathlib.Path | None = None
+    core: pathlib.Path | None = None
+
+    def heartbeat(status: str) -> None:
+        notify(f"WATCHDOG=1\nSTATUS={status}")
+
+    try:
+        require_policy_identity()
+        immutable_verified = True
+        wmi = one_hwmon("msi_wmi_platform")
+        core = one_hwmon("coretemp")
+        existing_boost = read(BASE / "cooler_boost") == "on"
+        mutated = True
+        force_apply_default(wmi, existing_boost, heartbeat)
+        print(f"Candidate14 applied; preserved_boost={existing_boost}",
+              file=sys.stderr, flush=True)
+        notify("READY=1\nWATCHDOG=1\nSTATUS=Candidate14 active")
+
+        safety = Safety()
+        manual_boost = existing_boost
+        automatic_boost = False
+        release_pending = False
+        release_cool_since: float | None = None
+        alarm_since: float | None = None
+        last_suspend_offset = (time.clock_gettime(time.CLOCK_BOOTTIME) -
+                               time.monotonic())
+        last_log = 0.0
+
+        while not STOP:
+            started = time.monotonic()
+            try:
+                OVERRIDE.lstat()
+            except FileNotFoundError:
+                pass
+            else:
+                raise ProfileError("factory-auto runtime override pathname appeared")
+            require_policy_identity()
+            suspend_offset = (time.clock_gettime(time.CLOCK_BOOTTIME) -
+                              time.monotonic())
+            if suspend_offset - last_suspend_offset > 2:
+                preserve = manual_boost or automatic_boost or read(BASE / "cooler_boost") == "on"
+                print("resume detected; forcing Candidate14 reapply", file=sys.stderr,
+                      flush=True)
+                force_apply_default(wmi, preserve, heartbeat)
+                safety = Safety()
+                release_cool_since = None
+                alarm_since = None
+            last_suspend_offset = suspend_offset
+
+            curve = read(BASE / "fan_curve")
+            mode = read(BASE / "fan_mode")
+            boost = read(BASE / "cooler_boost")
+            if curve != DEFAULT or mode != "advanced" or boost not in ("on", "off"):
+                if curve == FACTORY and mode == "auto" and boost in ("on", "off"):
+                    preserve = manual_boost or automatic_boost or boost == "on"
+                    force_apply_default(wmi, preserve, heartbeat)
+                    safety = Safety()
+                    release_cool_since = None
+                    alarm_since = None
+                    boost = read(BASE / "cooler_boost")
+                else:
+                    raise ProfileError(f"unexpected runtime state: {mode}/{boost}/{curve!r}")
+
+            package = read_uint(core / "temp1_input")
+            ec_cpu = read_uint(BASE / "cpu/realtime_temperature")
+            ec_gpu = read_uint(BASE / "gpu/realtime_temperature")
+            fan1 = read_uint(wmi / "fan1_input")
+            fan2 = read_uint(wmi / "fan2_input")
+            if not (0 <= package <= 110000 and 0 <= ec_cpu <= 110 and
+                    0 <= ec_gpu <= 110 and 0 <= fan1 <= 10000 and
+                    0 <= fan2 <= 10000):
+                raise ProfileError("implausible thermal/fan sensor")
+            cpu = max(package, ec_cpu * 1000)
+            reason = safety.update(cpu, ec_gpu, fan1, fan2, started)
+
+            if BOOST_REQUEST:
+                write(BASE / "cooler_boost", "on")
+                verify_boost(wmi, heartbeat)
+                manual_boost = True
+                automatic_boost = False
+                release_pending = False
+                release_cool_since = None
+                alarm_since = None
+                BOOST_REQUEST = False
+                acknowledge("boost-on")
+                print("explicit Cooler Boost enabled and physically verified",
+                      file=sys.stderr, flush=True)
+            if RELEASE_REQUEST:
+                # Queue release only for an existing manual/automatic Boost latch.
+                if read(BASE / "cooler_boost") == "on":
+                    release_pending = True
+                    release_cool_since = None
+                    print("explicit Cooler Boost release queued", file=sys.stderr,
+                          flush=True)
+                else:
+                    release_pending = False
+                    release_cool_since = None
+                    acknowledge("boost-release")
+                    print("explicit Cooler Boost release acknowledged; Boost is off",
+                          file=sys.stderr, flush=True)
+                RELEASE_REQUEST = False
+
+            boost = read(BASE / "cooler_boost")
+            if reason:
+                # Preserve a queued explicit release, but require a fresh full
+                # cool interval after every unsafe observation.
+                release_cool_since = None
+                safety.cool_since = None
+                if boost != "on":
+                    write(BASE / "cooler_boost", "on")
+                verify_boost(wmi, heartbeat)
+                verified_at = time.monotonic()
+                if alarm_since is None:
+                    alarm_since = verified_at
+                    print(f"Cooler Boost established for alarm: {reason}",
+                          file=sys.stderr, flush=True)
+                elif verified_at - alarm_since >= 15:
+                    raise ProfileError(
+                        f"alarm persisted 15 seconds despite verified Boost: {reason}")
+                if not manual_boost:
+                    automatic_boost = True
+            else:
+                alarm_since = None
+                timer_now = time.monotonic()
+                if automatic_boost:
+                    # External/keyboard off cannot defeat the automatic latch.
+                    if boost != "on":
+                        write(BASE / "cooler_boost", "on")
+                    is_cool = cpu < 85000 and (ec_gpu == 0 or ec_gpu < 70)
+                    safety.cool_since = Safety.update_since(
+                        safety.cool_since, is_cool, timer_now)
+                    if (safety.cool_since is not None and
+                            timer_now - safety.cool_since >= 30):
+                        write(BASE / "cooler_boost", "off")
+                        automatic_boost = False
+                        if release_pending:
+                            acknowledge("boost-release")
+                        release_pending = False
+                        release_cool_since = None
+                        safety.cool_since = None
+                        print("automatic Cooler Boost released after 30-second cooldown",
+                              file=sys.stderr, flush=True)
+                else:
+                    # Track keyboard toggles only when no automatic latch is active.
+                    manual_boost = boost == "on"
+                    if not manual_boost:
+                        # An observed off transition fulfills/cancels any pending
+                        # request for the previous manual Boost latch.
+                        if release_pending:
+                            acknowledge("boost-release")
+                        release_pending = False
+                        release_cool_since = None
+
+                if release_pending and manual_boost:
+                    is_cool = cpu < 85000 and (ec_gpu == 0 or ec_gpu < 70)
+                    release_cool_since = Safety.update_since(
+                        release_cool_since, is_cool, timer_now)
+                    if (release_cool_since is not None and
+                            timer_now - release_cool_since >= 30):
+                        write(BASE / "cooler_boost", "off")
+                        manual_boost = False
+                        release_pending = False
+                        release_cool_since = None
+                        acknowledge("boost-release")
+                        print("explicit Cooler Boost released after 30-second cooldown",
+                              file=sys.stderr, flush=True)
+
+            if started - last_log >= 60:
+                print(f"status cpu={cpu//1000}C gpu={ec_gpu}C fans={fan1}/{fan2} "
+                      f"boost={read(BASE/'cooler_boost')}", file=sys.stderr,
+                      flush=True)
+                last_log = started
+            heartbeat(f"Candidate14 CPU {cpu//1000}C GPU {ec_gpu}C fans {fan1}/{fan2}")
+            delay = 1 - (time.monotonic() - started)
+            if delay > 0:
+                time.sleep(delay)
+
+        print("clean stop requested; restoring factory auto", file=sys.stderr,
+              flush=True)
+        heartbeat("Restoring factory auto")
+        if not restore_factory_envelope():
+            raise ProfileError("factory restoration failed")
+        if not release_factory_if_cool(core):
+            raise ProfileError("factory restored; Boost release unsafe")
+        mutated = False
+        clean_stop = True
+        notify("STOPPING=1\nSTATUS=Factory auto/off restored")
+        return 0
+    except BaseException:
+        if immutable_verified and mutated:
+            restore_factory_envelope()
+        raise
+    finally:
+        if immutable_verified and mutated and not clean_stop:
+            restore_factory_envelope()
+        # Keep descriptor open through all recovery and return handling.
+
+
+def entrypoint() -> int:
+    signal.signal(signal.SIGTERM, on_stop)
+    signal.signal(signal.SIGINT, on_stop)
+    signal.signal(signal.SIGHUP, on_stop)
+    signal.signal(signal.SIGUSR1, on_boost)
+    signal.signal(signal.SIGUSR2, on_release)
+    try:
+        return main()
+    except Exception as error:
+        print(f"ERROR {type(error).__name__}: {error}", file=sys.stderr,
+              flush=True)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(entrypoint())

@@ -1,0 +1,37 @@
+[Unit]
+Description=MSI Raider exact-platform Candidate14 fan profile
+Documentation=file:/usr/local/share/doc/msi-fan-profile/README.md
+After=systemd-modules-load.service systemd-tmpfiles-setup.service
+RequiresMountsFor=/usr/local /usr
+ConditionPathExists=/sys/devices/platform/msi-ec/fan_curve
+ConditionPathExists=!/run/msi-fan-profile.factory-auto
+
+[Service]
+Type=notify
+NotifyAccess=main
+Environment=MSI_CALIBRATION_PROFILE=candidate14
+ExecStart=/usr/local/libexec/msi-fan-profiled
+ExecStopPost=+/usr/local/libexec/msi-gpu-recover candidate14
+WatchdogSec=5s
+WatchdogSignal=SIGKILL
+TimeoutStartSec=30s
+TimeoutStopSec=30s
+KillMode=control-group
+SendSIGKILL=yes
+Restart=no
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+LockPersonality=yes
+RestrictRealtime=yes
+RestrictAddressFamilies=AF_UNIX
+DevicePolicy=closed
+MemoryMax=64M
+TasksMax=16
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

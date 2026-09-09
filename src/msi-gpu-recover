@@ -1,0 +1,193 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
+"""Root-owned ExecStopPost fail-safe for MSI GPU calibration services."""
+from __future__ import annotations
+
+import fcntl
+import os
+import pathlib
+import stat
+import sys
+import time
+
+BASE = pathlib.Path("/sys/devices/platform/msi-ec")
+LOCK = pathlib.Path("/run/msi-fanctl.lock")
+FACTORY = (
+    "58 64 70 76 82 88 0 25 35 44 58 70 75 "
+    "52 58 64 70 76 82 0 25 35 44 58 70 75"
+)
+
+
+def read(path: pathlib.Path) -> str:
+    with path.open("r", encoding="ascii") as stream:
+        return stream.read().strip()
+
+
+def write(path: pathlib.Path, value: str) -> None:
+    if not identity_safe_for_curve_write():
+        raise RuntimeError("immutable identity invalid before recovery write")
+    with path.open("w", encoding="ascii") as stream:
+        stream.write(value + "\n")
+        stream.flush()
+
+
+def identity_safe_for_curve_write() -> bool:
+    expected = {
+        pathlib.Path("/sys/class/dmi/id/product_name"): "Raider 18 HX AI A2XWIG",
+        pathlib.Path("/sys/class/dmi/id/board_name"): "MS-1824",
+        pathlib.Path("/sys/class/dmi/id/bios_version"): "E1824IMS.310",
+        pathlib.Path("/sys/module/msi_ec/version"): "0.13.1",
+        pathlib.Path("/sys/module/msi_ec/srcversion"): "AB0BFAE2391B5ADD66E01BD",
+        BASE / "fw_version": "1824EMS1.108",
+    }
+    if pathlib.Path("/sys/module/ec_sys").exists():
+        return False
+    try:
+        return all(read(path) == wanted for path, wanted in expected.items()) and (BASE / "fan_curve").exists()
+    except Exception:
+        return False
+
+
+def release_boost_if_cool() -> bool:
+    try:
+        matches = []
+        for path in pathlib.Path("/sys/class/hwmon").glob("hwmon*"):
+            try:
+                if read(path / "name") == "coretemp":
+                    matches.append(path)
+            except OSError:
+                continue
+        if len(matches) != 1:
+            return False
+        package = int(read(matches[0] / "temp1_input"))
+        ec_cpu = int(read(BASE / "cpu/realtime_temperature"))
+        gpu = int(read(BASE / "gpu/realtime_temperature"))
+        if not (max(package, ec_cpu * 1000) < 85000 and
+                (gpu == 0 or gpu < 70)):
+            return False
+        write(BASE / "fan_mode", "auto")
+        if read(BASE / "fan_mode") != "auto":
+            return False
+        write(BASE / "cooler_boost", "off")
+        if (read(BASE / "fan_mode") == "auto" and
+                read(BASE / "fan_curve") == FACTORY and
+                read(BASE / "cooler_boost") == "off"):
+            return True
+        write(BASE / "cooler_boost", "on")
+        return False
+    except Exception as error:
+        print(f"Boost release failed: {error}", file=sys.stderr)
+        try:
+            write(BASE / "cooler_boost", "on")
+        except Exception:
+            pass
+        return False
+
+
+def attempt_all() -> bool:
+    success = True
+    for path, value in (
+        (BASE / "cooler_boost", "on"),
+        (BASE / "fan_mode", "auto"),
+        (BASE / "fan_curve", FACTORY),
+        (BASE / "cooler_boost", "on"),
+    ):
+        try:
+            write(path, value)
+        except Exception as error:
+            success = False
+            print(f"recovery write failed {path}: {error}", file=sys.stderr)
+    try:
+        success &= read(BASE / "fan_mode") == "auto"
+        success &= read(BASE / "fan_curve") == FACTORY
+        success &= read(BASE / "cooler_boost") == "on"
+    except Exception as error:
+        success = False
+        print(f"recovery readback failed: {error}", file=sys.stderr)
+    return bool(success)
+
+
+def main() -> int:
+    if os.geteuid() != 0:
+        print("root required", file=sys.stderr)
+        return 1
+    service_result = os.environ.get("SERVICE_RESULT", "unknown")
+    exit_code = os.environ.get("EXIT_CODE", "unknown")
+    exit_status = os.environ.get("EXIT_STATUS", "unknown")
+    if len(sys.argv) != 2 or sys.argv[1] not in ("auto", "candidate5b", "candidate12", "candidate13", "candidate14"):
+        print("FATAL: recovery requires a fixed enumerated profile argument", file=sys.stderr)
+        return 1
+    profile = sys.argv[1]
+    if os.environ.get("MSI_CALIBRATION_PROFILE") != profile:
+        print("FATAL: recovery profile argument/environment mismatch", file=sys.stderr)
+        return 1
+    print(
+        f"recovery invoked profile={profile} service_result={service_result} "
+        f"exit_code={exit_code} exit_status={exit_status}",
+        file=sys.stderr,
+    )
+    success_result = service_result == "success" and exit_code == "exited" and exit_status == "0"
+    try:
+        info = LOCK.stat()
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != 0:
+            raise RuntimeError("unsafe fan-control lock")
+        descriptor = os.open(LOCK, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+        deadline = time.monotonic() + 12.0
+        while True:
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    raise TimeoutError("fan-control lock remained busy")
+                time.sleep(0.05)
+    except Exception as error:
+        print(f"FATAL: recovery lock unavailable; no unlocked write attempted: {error}", file=sys.stderr)
+        return 1
+    # No model-specific control operation is permitted before exact ABI and
+    # immutable hardware identity validation.
+    if not identity_safe_for_curve_write():
+        print("FATAL: exact recovery identity/ABI check failed; no curve write attempted", file=sys.stderr)
+        return 1
+    if success_result:
+        try:
+            if (read(BASE / "fan_mode") == "auto" and
+                    read(BASE / "fan_curve") == FACTORY and
+                    read(BASE / "cooler_boost") == "off"):
+                if release_boost_if_cool():
+                    print(f"successful {profile} service left thermally verified factory auto/off", file=sys.stderr)
+                    return 0
+                write(BASE / "cooler_boost", "on")
+                print("successful service ended factory auto/off while too hot; Boost re-enabled", file=sys.stderr)
+                return 1
+        except Exception as error:
+            print(f"success-state verification failed: {error}", file=sys.stderr)
+            try:
+                write(BASE / "cooler_boost", "on")
+            except Exception:
+                pass
+    # Candidate success, failure, timeout, watchdog, signal, or state mismatch.
+    recovered = False
+    for attempt in range(1, 4):
+        if attempt_all():
+            print(f"recovery verified on attempt {attempt}; Boost remains on", file=sys.stderr)
+            recovered = True
+            break
+        time.sleep(0.2)
+    if not recovered:
+        print("FATAL: recovery could not be verified; Boost was repeatedly requested", file=sys.stderr)
+        return 1
+    if success_result and profile in ("candidate5b", "candidate12", "candidate13", "candidate14"):
+        if release_boost_if_cool():
+            print("successful candidate service restored verified factory auto/off", file=sys.stderr)
+            return 0
+        print("candidate restored to factory but Boost release was unsafe; marking service failed", file=sys.stderr)
+        return 1
+    if success_result:
+        print("post-success auto state mismatch mitigated; marking service failed", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

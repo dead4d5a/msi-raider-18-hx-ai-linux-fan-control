@@ -1,0 +1,10 @@
+# SHA-256 of selected raw local systemd journal exports used for the public summary.
+# Raw journals are intentionally not published because they include host-specific metadata.
+d485254c417c285f4cf55dc76182cfcd58c73902a7201e5e3ed5a68d5467cc8a  firmware-auto-gpu75.journal.log
+659631153906cbd7c5fbf1d59d2d5eb1f12b917e3b46ac4b077db98fae800ad0  firmware-auto-cpu6.journal.log
+2f3a3b60eac7c1ad895f4e807732f7b453d6cc7f50a6aec2cfe4eabab6c8554b  firmware-auto-combined6-gpu25-cutoff.journal.log
+8d0337f18f3e5b102f9ed2b94e4a46f1ca42054417c921090bf9e9f89d4e641b  candidate13-clean-gpu75.journal.log
+dc5f53e24bf9ab0e44be24e5d3a97facb7f2955021ab148cde122ba42970954b  candidate13-clean-cpu6.journal.log
+929a6ae1717e152d2fe591bdc46954f6b5e8b587ee84580991a70adbee969d7c  candidate13-combined6-gpu25.journal.log
+99390161b270974f92b7d2f8035c1f2fb79c68cef7611f8b23e1898f9b561d70  candidate14-combined6-gpu25-180s.journal.log
+d6a3db28f560e813ba8b32144cd715945d282f76148fec55bd212912df0bd977  candidate14-gpu75.journal.log

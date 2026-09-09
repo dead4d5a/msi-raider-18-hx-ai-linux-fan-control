@@ -1,0 +1,577 @@
+diff --git a/LOCAL_FAN_CURVE.md b/LOCAL_FAN_CURVE.md
+new file mode 100644
+index 0000000..14794fe
+--- /dev/null
++++ b/LOCAL_FAN_CURVE.md
+@@ -0,0 +1,29 @@
++# Local exact-platform fan-curve extension 0.13.1
++
++Base: BeardOverflow/msi-ec commit `d7fbbd88e6831e56801b860e46475cbf8ddbc7c1`.
++
++This local revision adds one `fan_curve` sysfs attribute only for:
++
++- Product: Raider 18 HX AI A2XWIG
++- Board: MS-1824
++- BIOS: E1824IMS.310
++- EC: 1824EMS1.108
++
++Format: 26 unsigned decimal bytes in this order:
++
++1. CPU temperature thresholds, 6 values
++2. CPU fan speed points, 7 values
++3. GPU temperature thresholds, 6 values
++4. GPU fan speed points, 7 values
++
++The driver itself establishes and verifies firmware fan mode `auto` plus Cooler Boost
++`on` before reading or writing curve bytes, and leaves that safe envelope active when it
++returns. It reads the whole original curve, validates the whole requested curve, writes
++all four regions, and reads everything back. On transaction or verification failure it
++first re-establishes the safe envelope, attempts every original byte even after a write
++error, and verifies the complete rollback. The captured factory curve is always accepted
++for rollback. Other curves must pass monotonicity, temperature, speed, and high-
++temperature floor constraints.
++
++The interface exposes no arbitrary EC address access. Debug mode remains disabled.
++Raw `ec_sys` write support remains disabled.
+diff --git a/Makefile.vars b/Makefile.vars
+index bb65738..8c563da 100644
+--- a/Makefile.vars
++++ b/Makefile.vars
+@@ -1,2 +1,2 @@
+ MODNAME := msi-ec
+-VERSION := 0.13
+\ No newline at end of file
++VERSION := 0.13.1
+\ No newline at end of file
+diff --git a/docs/sysfs-platform-msi-ec b/docs/sysfs-platform-msi-ec
+index 78cd276..e83528b 100644
+--- a/docs/sysfs-platform-msi-ec
++++ b/docs/sysfs-platform-msi-ec
+@@ -63,6 +63,22 @@ Description:
+ 		Valid values: the values present in the available_fan_modes
+ 		list.
+ 
++What:		/sys/devices/platform/<platform>/fan_curve
++Description:
++		Local transactional fan curve for the exact validated platform:
++		Raider 18 HX AI A2XWIG, MS-1824, BIOS E1824IMS.310,
++		EC 1824EMS1.108, without firmware override or debug mode.
++
++		One line contains exactly 26 unsigned decimal bytes:
++		CPU temperatures[6], CPU speeds[7], GPU temperatures[6],
++		GPU speeds[7]. The driver establishes and verifies automatic
++		fan mode plus Cooler Boost, validates monotonicity and high-
++		temperature safety constraints, writes and reads back the whole
++		curve, and attempts full verified rollback on failure. It leaves
++		automatic mode plus Cooler Boost enabled after a write. Userspace
++		must explicitly select advanced mode or safely release Cooler
++		Boost after independent physical-RPM verification.
++
+ What:		/sys/devices/platform/<platform>/fw_version
+ Description:
+ 		Read-only, returns the version of the EC firmware.
+diff --git a/msi-ec.c b/msi-ec.c
+index ff33729..a572ff2 100644
+--- a/msi-ec.c
++++ b/msi-ec.c
+@@ -32,6 +32,7 @@
+ #include <linux/module.h>
+ #include <linux/moduleparam.h>
+ #include <linux/platform_device.h>
++#include <linux/dmi.h>
+ #include <linux/proc_fs.h>
+ #include <linux/seq_file.h>
+ #include <linux/string.h>
+@@ -43,6 +44,20 @@
+ static DEFINE_MUTEX(ec_set_by_mask_mutex);
+ static DEFINE_MUTEX(ec_unset_by_mask_mutex);
+ static DEFINE_MUTEX(ec_set_bit_mutex);
++static DEFINE_MUTEX(fan_curve_mutex);
++
++#define FAN_CURVE_TEMP_POINTS	6
++#define FAN_CURVE_SPEED_POINTS	7
++#define FAN_CURVE_CPU_TEMP_ADDR	0x6a
++#define FAN_CURVE_CPU_SPEED_ADDR	0x72
++#define FAN_CURVE_GPU_TEMP_ADDR	0x82
++#define FAN_CURVE_GPU_SPEED_ADDR	0x8a
++#define FAN_CURVE_MODE_ADDR	0xd4
++#define FAN_CURVE_AUTO_MODE	0x0d
++#define FAN_CURVE_BOOST_ADDR	0x98
++#define FAN_CURVE_BOOST_BIT	7
++#define FAN_CURVE_TOTAL_VALUES	(2 * FAN_CURVE_TEMP_POINTS + \
++				 2 * FAN_CURVE_SPEED_POINTS)
+ 
+ #define SM_ECO_NAME		"eco"
+ #define SM_COMFORT_NAME		"comfort"
+@@ -1853,6 +1868,7 @@ static struct msi_ec_conf *CONFIGURATIONS[] __initdata = {
+ 
+ static bool conf_loaded = false;
+ static struct msi_ec_conf conf; // current configuration
++static bool fan_curve_supported;
+ 
+ static bool charge_control_supported = false;
+ 
+@@ -2147,6 +2163,383 @@ static struct acpi_battery_hook battery_hook = {
+ 	.name = MSI_EC_DRIVER_NAME,
+ };
+ 
++/*
++ * Local, exact-platform fan-curve interface.
++ *
++ * The EC stores 6 temperature thresholds and 7 speed points per fan.  The
++ * whole 26-byte curve is exposed as one transaction in this order:
++ *
++ *   cpu_temp[6] cpu_speed[7] gpu_temp[6] gpu_speed[7]
++ *
++ * Writes are intentionally restricted to the one platform and EC revision on
++ * which these addresses were measured.  The curve is inactive while fan mode
++ * is automatic.  The driver establishes automatic mode plus Cooler Boost for
++ * the transaction and leaves that safe envelope active on return.  A failed
++ * write or readback attempts and verifies restoration of the complete
++ * pre-write curve.
++ */
++static const u8 fan_curve_factory[FAN_CURVE_TOTAL_VALUES] = {
++	58, 64, 70, 76, 82, 88,
++	0, 25, 35, 44, 58, 70, 75,
++	52, 58, 64, 70, 76, 82,
++	0, 25, 35, 44, 58, 70, 75,
++};
++
++static bool fan_curve_exact_platform(void)
++{
++	return dmi_match(DMI_PRODUCT_NAME, "Raider 18 HX AI A2XWIG") &&
++	       dmi_match(DMI_BOARD_NAME, "MS-1824") &&
++	       dmi_match(DMI_BIOS_VERSION, "E1824IMS.310");
++}
++
++static int fan_curve_check_firmware(void)
++{
++	u8 version[MSI_EC_FW_VERSION_LENGTH + 1];
++	int result;
++
++	if (!fan_curve_exact_platform())
++		return -EOPNOTSUPP;
++
++	result = ec_get_firmware_version(version);
++	if (result < 0)
++		return result;
++
++	return strcmp(version, "1824EMS1.108") ? -EOPNOTSUPP : 0;
++}
++
++static bool fan_curve_configuration_matches(void)
++{
++	return conf.fan_mode.address == FAN_CURVE_MODE_ADDR &&
++	       conf.cooler_boost.address == FAN_CURVE_BOOST_ADDR &&
++	       conf.cooler_boost.bit == FAN_CURVE_BOOST_BIT;
++}
++
++static int fan_curve_read_values(u8 values[FAN_CURVE_TOTAL_VALUES])
++{
++	int result;
++
++	result = ec_read_seq(FAN_CURVE_CPU_TEMP_ADDR, values,
++			     FAN_CURVE_TEMP_POINTS);
++	if (result < 0)
++		return result;
++
++	result = ec_read_seq(FAN_CURVE_CPU_SPEED_ADDR,
++			     values + FAN_CURVE_TEMP_POINTS,
++			     FAN_CURVE_SPEED_POINTS);
++	if (result < 0)
++		return result;
++
++	result = ec_read_seq(FAN_CURVE_GPU_TEMP_ADDR,
++			     values + FAN_CURVE_TEMP_POINTS +
++			     FAN_CURVE_SPEED_POINTS,
++			     FAN_CURVE_TEMP_POINTS);
++	if (result < 0)
++		return result;
++
++	return ec_read_seq(FAN_CURVE_GPU_SPEED_ADDR,
++			   values + 2 * FAN_CURVE_TEMP_POINTS +
++			   FAN_CURVE_SPEED_POINTS,
++			   FAN_CURVE_SPEED_POINTS);
++}
++
++static int fan_curve_write_region(u8 address, const u8 *values, size_t length)
++{
++	int result;
++
++	for (size_t i = 0; i < length; i++) {
++		result = ec_write(address + i, values[i]);
++		if (result < 0)
++			return result;
++	}
++
++	return 0;
++}
++
++static int fan_curve_write_region_best_effort(u8 address, const u8 *values,
++					      size_t length)
++{
++	int first_error = 0;
++	int result;
++
++	for (size_t i = 0; i < length; i++) {
++		result = ec_write(address + i, values[i]);
++		if (result < 0 && !first_error)
++			first_error = result;
++	}
++
++	return first_error;
++}
++
++static int fan_curve_write_values(const u8 values[FAN_CURVE_TOTAL_VALUES])
++{
++	int result;
++
++	result = fan_curve_write_region(FAN_CURVE_CPU_TEMP_ADDR, values,
++					FAN_CURVE_TEMP_POINTS);
++	if (result < 0)
++		return result;
++
++	result = fan_curve_write_region(FAN_CURVE_CPU_SPEED_ADDR,
++					values + FAN_CURVE_TEMP_POINTS,
++					FAN_CURVE_SPEED_POINTS);
++	if (result < 0)
++		return result;
++
++	result = fan_curve_write_region(FAN_CURVE_GPU_TEMP_ADDR,
++					values + FAN_CURVE_TEMP_POINTS +
++					FAN_CURVE_SPEED_POINTS,
++					FAN_CURVE_TEMP_POINTS);
++	if (result < 0)
++		return result;
++
++	return fan_curve_write_region(FAN_CURVE_GPU_SPEED_ADDR,
++				      values + 2 * FAN_CURVE_TEMP_POINTS +
++				      FAN_CURVE_SPEED_POINTS,
++				      FAN_CURVE_SPEED_POINTS);
++}
++
++static int fan_curve_restore_values(const u8 values[FAN_CURVE_TOTAL_VALUES])
++{
++	int first_error = 0;
++	int result;
++
++	result = fan_curve_write_region_best_effort(FAN_CURVE_CPU_TEMP_ADDR,
++						    values,
++						    FAN_CURVE_TEMP_POINTS);
++	if (result < 0 && !first_error)
++		first_error = result;
++
++	result = fan_curve_write_region_best_effort(FAN_CURVE_CPU_SPEED_ADDR,
++						    values + FAN_CURVE_TEMP_POINTS,
++						    FAN_CURVE_SPEED_POINTS);
++	if (result < 0 && !first_error)
++		first_error = result;
++
++	result = fan_curve_write_region_best_effort(FAN_CURVE_GPU_TEMP_ADDR,
++						    values + FAN_CURVE_TEMP_POINTS +
++						    FAN_CURVE_SPEED_POINTS,
++						    FAN_CURVE_TEMP_POINTS);
++	if (result < 0 && !first_error)
++		first_error = result;
++
++	result = fan_curve_write_region_best_effort(FAN_CURVE_GPU_SPEED_ADDR,
++						    values + 2 * FAN_CURVE_TEMP_POINTS +
++						    FAN_CURVE_SPEED_POINTS,
++						    FAN_CURVE_SPEED_POINTS);
++	if (result < 0 && !first_error)
++		first_error = result;
++
++	return first_error;
++}
++
++static int fan_curve_establish_safe_state(void)
++{
++	int result;
++	u8 mode;
++	bool boost;
++
++	result = ec_set_bit(FAN_CURVE_BOOST_ADDR, FAN_CURVE_BOOST_BIT, true);
++	if (result < 0)
++		return result;
++
++	result = ec_write(FAN_CURVE_MODE_ADDR, FAN_CURVE_AUTO_MODE);
++	if (result < 0)
++		return result;
++
++	result = ec_read(FAN_CURVE_MODE_ADDR, &mode);
++	if (result < 0)
++		return result;
++	result = ec_check_bit(FAN_CURVE_BOOST_ADDR, FAN_CURVE_BOOST_BIT, &boost);
++	if (result < 0)
++		return result;
++
++	return mode == FAN_CURVE_AUTO_MODE && boost ? 0 : -EIO;
++}
++
++static bool fan_curve_monotonic(const u8 *values, size_t length, bool strict)
++{
++	for (size_t i = 1; i < length; i++) {
++		if (strict ? values[i] <= values[i - 1] :
++			     values[i] < values[i - 1])
++			return false;
++	}
++
++	return true;
++}
++
++static bool fan_curve_values_safe(const u8 values[FAN_CURVE_TOTAL_VALUES])
++{
++	const u8 *cpu_temp = values;
++	const u8 *cpu_speed = values + FAN_CURVE_TEMP_POINTS;
++	const u8 *gpu_temp = cpu_speed + FAN_CURVE_SPEED_POINTS;
++	const u8 *gpu_speed = gpu_temp + FAN_CURVE_TEMP_POINTS;
++
++	/* The exact captured factory curve must always remain restorable. */
++	if (!memcmp(values, fan_curve_factory, sizeof(fan_curve_factory)))
++		return true;
++
++	if (!fan_curve_monotonic(cpu_temp, FAN_CURVE_TEMP_POINTS, true) ||
++	    !fan_curve_monotonic(gpu_temp, FAN_CURVE_TEMP_POINTS, true) ||
++	    !fan_curve_monotonic(cpu_speed, FAN_CURVE_SPEED_POINTS, false) ||
++	    !fan_curve_monotonic(gpu_speed, FAN_CURVE_SPEED_POINTS, false))
++		return false;
++
++	if (cpu_temp[0] < 40 || cpu_temp[5] > 90 ||
++	    cpu_temp[4] > 85 || gpu_temp[0] < 35 ||
++	    gpu_temp[5] > 85 || gpu_temp[4] > 80)
++		return false;
++
++	for (size_t i = 0; i < FAN_CURVE_SPEED_POINTS; i++) {
++		if (cpu_speed[i] > 150 || gpu_speed[i] > 150)
++			return false;
++	}
++
++	if (cpu_speed[0] > 40 || gpu_speed[0] > 40 ||
++	    cpu_speed[4] < 60 || gpu_speed[4] < 60 ||
++	    cpu_speed[5] < 80 || gpu_speed[5] < 80 ||
++	    cpu_speed[6] < 100 || gpu_speed[6] < 100)
++		return false;
++
++	return true;
++}
++
++static ssize_t fan_curve_show(struct device *device,
++			      struct device_attribute *attr, char *buf)
++{
++	u8 values[FAN_CURVE_TOTAL_VALUES];
++	int count = 0;
++	int result;
++
++	result = fan_curve_check_firmware();
++	if (result < 0 || !fan_curve_supported)
++		return result < 0 ? result : -EOPNOTSUPP;
++
++	mutex_lock(&fan_curve_mutex);
++	result = fan_curve_read_values(values);
++	mutex_unlock(&fan_curve_mutex);
++	if (result < 0)
++		return result;
++
++	for (size_t i = 0; i < ARRAY_SIZE(values); i++)
++		count += sysfs_emit_at(buf, count, "%u%c", values[i],
++				       i + 1 == ARRAY_SIZE(values) ? '\n' : ' ');
++
++	return count;
++}
++
++static int fan_curve_parse(const char *buf,
++			   u8 requested[FAN_CURVE_TOTAL_VALUES])
++{
++	char *copy;
++	char *cursor;
++	char *token;
++	int result = 0;
++	size_t i = 0;
++
++	copy = kstrdup(buf, GFP_KERNEL);
++	if (!copy)
++		return -ENOMEM;
++
++	cursor = strim(copy);
++	while ((token = strsep(&cursor, " \t\n")) != NULL) {
++		if (!*token)
++			continue;
++		if (i == FAN_CURVE_TOTAL_VALUES) {
++			result = -EINVAL;
++			goto free;
++		}
++		result = kstrtou8(token, 10, &requested[i]);
++		if (result < 0)
++			goto free;
++		i++;
++	}
++
++	if (i != FAN_CURVE_TOTAL_VALUES)
++		result = -EINVAL;
++
++free:
++	kfree(copy);
++	return result;
++}
++
++static ssize_t fan_curve_store(struct device *device,
++			       struct device_attribute *attr,
++			       const char *buf, size_t count)
++{
++	u8 requested[FAN_CURVE_TOTAL_VALUES];
++	u8 original[FAN_CURVE_TOTAL_VALUES];
++	u8 verify[FAN_CURVE_TOTAL_VALUES];
++	int result;
++	int cause;
++	int safe_result;
++	int rollback_result;
++	int verify_result;
++
++	result = fan_curve_parse(buf, requested);
++	if (result < 0)
++		return result;
++
++	if (!fan_curve_values_safe(requested))
++		return -EINVAL;
++
++	result = fan_curve_check_firmware();
++	if (result < 0 || !fan_curve_supported)
++		return result < 0 ? result : -EOPNOTSUPP;
++
++	mutex_lock(&fan_curve_mutex);
++
++	result = fan_curve_establish_safe_state();
++	if (result < 0)
++		goto unlock;
++
++	result = fan_curve_read_values(original);
++	if (result < 0)
++		goto unlock;
++
++	/* Revalidate the safe envelope immediately before the first curve write. */
++	result = fan_curve_establish_safe_state();
++	if (result < 0)
++		goto unlock;
++
++	result = fan_curve_write_values(requested);
++	if (result < 0)
++		goto rollback;
++
++	result = fan_curve_read_values(verify);
++	if (result < 0)
++		goto rollback;
++	if (memcmp(requested, verify, sizeof(requested))) {
++		result = -EIO;
++		goto rollback;
++	}
++
++	result = fan_curve_establish_safe_state();
++	if (result < 0)
++		goto rollback;
++
++	mutex_unlock(&fan_curve_mutex);
++	return count;
++
++rollback:
++	cause = result;
++	safe_result = fan_curve_establish_safe_state();
++	rollback_result = fan_curve_restore_values(original);
++	verify_result = fan_curve_read_values(verify);
++
++	if (safe_result < 0 || rollback_result < 0 || verify_result < 0 ||
++	    memcmp(original, verify, sizeof(original))) {
++		pr_err("fan curve rollback could not be verified\n");
++		result = -EIO;
++	} else {
++		pr_warn("fan curve update failed; original curve restored\n");
++		result = cause;
++	}
++
++unlock:
++	mutex_unlock(&fan_curve_mutex);
++	return result;
++}
++
+ // ============================================================ //
+ // Sysfs platform device attributes (root)
+ // ============================================================ //
+@@ -2306,7 +2699,9 @@ static ssize_t cooler_boost_store(struct device *dev,
+ 	if (result)
+ 		return result;
+ 
++	mutex_lock(&fan_curve_mutex);
+ 	result = ec_set_bit(conf.cooler_boost.address, conf.cooler_boost.bit, value);
++	mutex_unlock(&fan_curve_mutex);
+ 	if (result < 0)
+ 		return result;
+ 
+@@ -2367,8 +2762,10 @@ static ssize_t shift_mode_store(struct device *dev,
+ 		// NULL entries have NULL name
+ 
+ 		if (sysfs_streq(conf.shift_mode.modes[i].name, buf)) {
++			mutex_lock(&fan_curve_mutex);
+ 			result = ec_write(conf.shift_mode.address,
+ 					  conf.shift_mode.modes[i].value);
++			mutex_unlock(&fan_curve_mutex);
+ 			if (result < 0)
+ 				return result;
+ 
+@@ -2467,8 +2864,10 @@ static ssize_t fan_mode_store(struct device *dev, struct device_attribute *attr,
+ 		// NULL entries have NULL name
+ 
+ 		if (sysfs_streq(conf.fan_mode.modes[i].name, buf)) {
++			mutex_lock(&fan_curve_mutex);
+ 			result = ec_write(conf.fan_mode.address,
+ 					  conf.fan_mode.modes[i].value);
++			mutex_unlock(&fan_curve_mutex);
+ 			if (result < 0)
+ 				return result;
+ 
+@@ -2537,6 +2936,7 @@ static DEVICE_ATTR_RW(shift_mode);
+ static DEVICE_ATTR_RW(super_battery);
+ static DEVICE_ATTR_RO(available_fan_modes);
+ static DEVICE_ATTR_RW(fan_mode);
++static DEVICE_ATTR_RW(fan_curve);
+ static DEVICE_ATTR_RO(fw_version);
+ static DEVICE_ATTR_RO(fw_release_date);
+ 
+@@ -2551,6 +2951,7 @@ static struct attribute *msi_root_attrs[] = {
+ 	&dev_attr_super_battery.attr,
+ 	&dev_attr_available_fan_modes.attr,
+ 	&dev_attr_fan_mode.attr,
++	&dev_attr_fan_curve.attr,
+ 	&dev_attr_fw_version.attr,
+ 	&dev_attr_fw_release_date.attr,
+ 	NULL
+@@ -2904,6 +3305,9 @@ static umode_t msi_ec_is_visible(struct kobject *kobj,
+ 		 attr == &dev_attr_fan_mode.attr)
+ 		address = conf.fan_mode.address;
+ 
++	else if (attr == &dev_attr_fan_curve.attr)
++		return fan_curve_supported ? attr->mode : 0;
++
+ 	/* cpu group */
+ 	else if (attr == &dev_attr_cpu_realtime_temperature.attr)
+ 		address = conf.cpu.rt_temp_address;
+@@ -3042,6 +3446,10 @@ static int __init msi_ec_init(void)
+ 	if (result < 0)
+ 		return result;
+ 
++	fan_curve_supported = !firmware && !debug &&
++		fan_curve_configuration_matches() &&
++		fan_curve_check_firmware() == 0;
++
+ 	msi_platform_device = platform_create_bundle(&msi_platform_driver,
+ 						     msi_platform_probe,
+ 						     NULL, 0, NULL, 0);
+@@ -3109,8 +3517,8 @@ MODULE_LICENSE("GPL");
+ MODULE_AUTHOR("Jose Angel Pastrana <japp0005@red.ujaen.es>");
+ MODULE_AUTHOR("Aakash Singh <mail@singhaakash.dev>");
+ MODULE_AUTHOR("Nikita Kravets <teackot@gmail.com>");
+-MODULE_DESCRIPTION("MSI Embedded Controller");
+-MODULE_VERSION("0.13");
++MODULE_DESCRIPTION("MSI Embedded Controller with exact-platform transactional fan curve");
++MODULE_VERSION("0.13.1");
+ 
+ module_init(msi_ec_init);
+ module_exit(msi_ec_exit);

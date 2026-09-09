@@ -1,0 +1,151 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
+"""Exact-command manager for the persistent MSI Candidate14 fan profile."""
+from __future__ import annotations
+
+import fcntl,json,os,pathlib,signal,stat,subprocess,sys,time
+
+BASE=pathlib.Path('/sys/devices/platform/msi-ec');SERVICE='msi-fan-profile.service'
+OVERRIDE=pathlib.Path('/run/msi-fan-profile.factory-auto');ACK=pathlib.Path('/run/msi-fan-profile.ack')
+MANAGER_LOCK=pathlib.Path('/run/msi-fan-profile-manager.lock');FAN_LOCK=pathlib.Path('/run/msi-fanctl.lock')
+FACTORY='58 64 70 76 82 88 0 25 35 44 58 70 75 52 58 64 70 76 82 0 25 35 44 58 70 75'
+DEFAULT='50 60 70 76 82 88 20 30 40 50 60 80 110 38 40 42 44 55 70 20 30 40 60 70 100 120'
+COMMANDS=('status','apply-default','factory-auto','boost-on','boost-release')
+class ManagerError(RuntimeError):pass
+
+def read(p):
+ with pathlib.Path(p).open('r',encoding='ascii') as f:return f.read().strip()
+def run(*a,check=True,timeout=45):return subprocess.run(a,stdin=subprocess.DEVNULL,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True,timeout=timeout,check=check,env={'PATH':'/usr/sbin:/usr/bin:/sbin:/bin','LC_ALL':'C'})
+def ctl(*a,check=True,timeout=45):return run('/usr/bin/systemctl',*a,check=check,timeout=timeout)
+def identity():
+ e={pathlib.Path('/sys/class/dmi/id/product_name'):'Raider 18 HX AI A2XWIG',pathlib.Path('/sys/class/dmi/id/board_name'):'MS-1824',pathlib.Path('/sys/class/dmi/id/bios_version'):'E1824IMS.310',pathlib.Path('/sys/module/msi_ec/version'):'0.13.1',pathlib.Path('/sys/module/msi_ec/srcversion'):'AB0BFAE2391B5ADD66E01BD',BASE/'fw_version':'1824EMS1.108'}
+ if pathlib.Path('/sys/module/ec_sys').exists():raise ManagerError('ec_sys is loaded')
+ for p,w in e.items():
+  v=read(p)
+  if v!=w:raise ManagerError(f'identity mismatch {p}={v!r}')
+def write(p,v):
+ identity()
+ with pathlib.Path(p).open('w',encoding='ascii') as f:f.write(v+'\n');f.flush()
+ if read(p)!=v:raise ManagerError(f'readback mismatch {p}')
+def lock(p,blocking=False):
+ i=p.stat()
+ if not stat.S_ISREG(i.st_mode) or i.st_uid or i.st_gid or stat.S_IMODE(i.st_mode)!=0o600:raise ManagerError(f'unsafe lock {p}')
+ fd=os.open(p,os.O_RDONLY|os.O_NOFOLLOW|os.O_CLOEXEC);op=fcntl.LOCK_EX|(0 if blocking else fcntl.LOCK_NB)
+ try:fcntl.flock(fd,op)
+ except BlockingIOError as e:os.close(fd);raise ManagerError(f'lock busy {p}') from e
+ return fd
+def marker():
+ try:i=OVERRIDE.lstat()
+ except FileNotFoundError:return False
+ if not stat.S_ISREG(i.st_mode) or i.st_uid or i.st_gid or stat.S_IMODE(i.st_mode)!=0o600:raise ManagerError('unsafe override marker')
+ return True
+def make_marker():
+ if marker():return
+ fd=os.open(OVERRIDE,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW|os.O_CLOEXEC,0o600);os.fchown(fd,0,0);os.fchmod(fd,0o600);os.close(fd)
+ if not marker():raise ManagerError('marker verification failed')
+def unit_state():
+ vals={k:ctl('show',SERVICE,f'-p{k}','--value',timeout=8).stdout.strip() for k in ('ActiveState','SubState','MainPID','Job')}
+ return vals
+def inactive_dead():
+ s=unit_state();return s['ActiveState']=='inactive' and s['SubState']=='dead' and s['MainPID']=='0' and not s['Job']
+def enable_state():
+ r=ctl('is-enabled',SERVICE,check=False,timeout=8);state=r.stdout.strip()
+ if state not in ('enabled','disabled'):raise ManagerError(f'unknown service enable state: {state!r} rc={r.returncode}')
+ return state
+def enabled():return enable_state()=='enabled'
+def active():return ctl('is-active','--quiet',SERVICE,check=False,timeout=8).returncode==0
+def hw():
+ c=read(BASE/'fan_curve');return {'curve':'candidate14' if c==DEFAULT else 'factory' if c==FACTORY else 'unknown','raw':c,'mode':read(BASE/'fan_mode'),'boost':read(BASE/'cooler_boost')}
+def restore_factory_locked(release=True):
+ for p,v in ((BASE/'cooler_boost','on'),(BASE/'fan_mode','auto'),(BASE/'fan_curve',FACTORY),(BASE/'cooler_boost','on')):write(p,v)
+ h=hw()
+ if h['raw']!=FACTORY or h['mode']!='auto' or h['boost']!='on':raise ManagerError('factory envelope verification failed')
+ if release:
+  core=[p for p in pathlib.Path('/sys/class/hwmon').glob('hwmon*') if (p/'name').exists() and read(p/'name')=='coretemp']
+  if len(core)!=1:raise ManagerError('coretemp discovery failed')
+  pkg=int(read(core[0]/'temp1_input'));cpu=int(read(BASE/'cpu/realtime_temperature'));gpu=int(read(BASE/'gpu/realtime_temperature'))
+  if max(pkg,cpu*1000)>=85000 or not (gpu==0 or gpu<70):raise ManagerError('factory restored but too hot to release Boost')
+  write(BASE/'fan_mode','auto');write(BASE/'cooler_boost','off')
+  h=hw()
+  if h['raw']!=FACTORY or h['mode']!='auto' or h['boost']!='off':write(BASE/'cooler_boost','on');raise ManagerError('factory auto/off verification failed')
+def disable_and_safe_factory():
+ marker_error=None
+ try:make_marker()
+ except Exception as e:marker_error=e
+ ctl('disable',SERVICE,check=False,timeout=20);ctl('stop',SERVICE,check=False,timeout=45);ctl('reset-failed',SERVICE,check=False,timeout=10)
+ if not inactive_dead():raise ManagerError('service not inactive/dead during fail-safe')
+ if enabled():raise ManagerError('service remained persistently enabled during fail-safe')
+ fd=lock(FAN_LOCK)
+ try:restore_factory_locked(release=False)
+ finally:os.close(fd)
+ if marker_error is not None:raise ManagerError(f'unsafe override marker prevented verified boot block: {marker_error}')
+def full_status():
+ identity();s=unit_state();h=hw();return {'service_enabled':enabled(),'service_active_state':s['ActiveState'],'service_sub_state':s['SubState'],'service_main_pid':int(s['MainPID'] or 0),'service_job':s['Job'],'factory_override':marker(),'curve':h['curve'],'fan_mode':h['mode'],'cooler_boost':h['boost'],'shift_mode':read(BASE/'shift_mode'),'ec_firmware':read(BASE/'fw_version'),'driver_version':read('/sys/module/msi_ec/version'),'driver_srcversion':read('/sys/module/msi_ec/srcversion')}
+def status():
+ first=full_status();time.sleep(.05);second=full_status();stable=first==second;second['snapshot_stable']=stable;print(json.dumps(second,indent=2,sort_keys=True));s=second;default=stable and s['service_enabled'] and s['service_active_state']=='active' and s['service_sub_state']=='running' and s['service_main_pid']>0 and not s['service_job'] and not s['factory_override'] and s['curve']=='candidate14' and s['fan_mode']=='advanced' and s['cooler_boost'] in ('on','off');override=stable and s['service_enabled'] and s['service_active_state']=='inactive' and s['service_sub_state']=='dead' and s['service_main_pid']==0 and not s['service_job'] and s['factory_override'] and s['curve']=='factory' and s['fan_mode']=='auto' and s['cooler_boost']=='off';return 0 if default or override else 1
+def root():
+ if os.geteuid():raise ManagerError('root required; use sudo')
+def apply_default():
+ root();identity();fd=lock(MANAGER_LOCK)
+ try:
+  if marker():OVERRIDE.unlink()
+  ctl('reset-failed',SERVICE,check=False,timeout=10);ctl('enable',SERVICE,timeout=20);ctl('start',SERVICE,timeout=50)
+  s=full_status()
+  ok=s['service_enabled'] and s['service_active_state']=='active' and s['service_sub_state']=='running' and s['service_main_pid']>0 and not s['service_job'] and not s['factory_override'] and s['curve']=='candidate14' and s['fan_mode']=='advanced'
+  if not ok:raise ManagerError('default invariant failed')
+  print('Candidate14 is active and enabled for future boots.')
+ except Exception as e:
+  try:disable_and_safe_factory()
+  except Exception as r:raise ManagerError(f'apply-default failed: {e}; fail-safe failed: {r}') from e
+  raise ManagerError(f'apply-default failed: {e}; service disabled, factory auto with Boost on') from e
+ finally:os.close(fd)
+def factory_auto():
+ root();identity();fd=lock(MANAGER_LOCK)
+ try:
+  make_marker();ctl('stop',SERVICE,check=False,timeout=50);ctl('reset-failed',SERVICE,check=False,timeout=10)
+  if not inactive_dead():raise ManagerError('service did not become inactive/dead')
+  fan=lock(FAN_LOCK)
+  try:restore_factory_locked(release=True)
+  finally:os.close(fan)
+  s=full_status();ok=s['service_enabled'] and s['service_active_state']=='inactive' and s['service_sub_state']=='dead' and s['service_main_pid']==0 and not s['service_job'] and s['factory_override'] and s['curve']=='factory' and s['fan_mode']=='auto' and s['cooler_boost']=='off'
+  if not ok:raise ManagerError('factory override invariant failed')
+  print('Factory auto/off is active until apply-default or reboot.')
+ except Exception as e:
+  try:disable_and_safe_factory()
+  except Exception as r:raise ManagerError(f'factory-auto failed: {e}; fail-safe failed: {r}') from e
+  raise ManagerError(f'factory-auto failed: {e}; service disabled, factory auto with Boost on') from e
+ finally:os.close(fd)
+def ack(action,pid,after):
+ if not ACK.exists():return False
+ i=ACK.lstat()
+ if not stat.S_ISREG(i.st_mode) or i.st_uid or i.st_gid or stat.S_IMODE(i.st_mode)!=0o600:raise ManagerError('unsafe ack file')
+ parts=dict(x.split('=',1) for x in read(ACK).split())
+ return parts.get('pid')==str(pid) and parts.get('action')==action and int(parts.get('monotonic_ns','0'))>=after
+def signal_action(action,sig,timeout_s):
+ root();identity();fd=lock(MANAGER_LOCK)
+ try:
+  s=full_status()
+  if not(s['service_enabled'] and s['service_active_state']=='active' and s['service_sub_state']=='running' and s['service_main_pid']>0 and not s['factory_override'] and s['curve']=='candidate14' and s['fan_mode']=='advanced'):raise ManagerError('active default invariant missing')
+  if action=='boost-release' and s['cooler_boost']=='off':print('Cooler Boost is already off.');return
+  before=time.monotonic_ns();ctl('kill','--kill-whom=main',f'--signal={sig.name}',SERVICE,timeout=10);deadline=None if timeout_s is None else time.monotonic()+timeout_s
+  while deadline is None or time.monotonic()<deadline:
+   if not active():raise ManagerError('service failed while processing request')
+   h=hw()
+   if ack(action,s['service_main_pid'],before):
+    if action=='boost-on' and h['boost']=='on':print('Cooler Boost enabled and physically verified.');return
+    if action=='boost-release' and h['boost']=='off':print('Cooler Boost released after monitored cooldown.');return
+   time.sleep(.25)
+  raise ManagerError(f'{action} was not acknowledged before timeout')
+ finally:os.close(fd)
+def main():
+ if len(sys.argv)!=2 or sys.argv[1] not in COMMANDS:print('Usage: msi-fan-profile {status|apply-default|factory-auto|boost-on|boost-release}',file=sys.stderr);return 2
+ c=sys.argv[1]
+ if c=='status':return status()
+ if c=='apply-default':apply_default()
+ elif c=='factory-auto':factory_auto()
+ elif c=='boost-on':signal_action(c,signal.SIGUSR1,25)
+ elif c=='boost-release':signal_action(c,signal.SIGUSR2,None)
+ return 0
+if __name__=='__main__':
+ try:raise SystemExit(main())
+ except (ManagerError,subprocess.SubprocessError,OSError,ValueError) as e:print(f'ERROR: {e}',file=sys.stderr);raise SystemExit(1)

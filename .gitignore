@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+*.ko
+*.o
+*.mod
+*.mod.c
+*.symvers
+*.log
+*.csv
+*.bin
+*.der
+*.priv
+*.key
+*.pem
+/build/
