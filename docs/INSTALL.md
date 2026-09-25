@@ -34,6 +34,8 @@ The script:
 - refuses to overwrite an existing installation;
 - installs root-owned executables;
 - installs a root-only tmpfiles lock;
+- installs the matching README, operations, and safety documentation used by
+  the systemd unit;
 - installs and enables—but does not start—the systemd service.
 
 Activate after reviewing the output:
@@ -57,6 +59,25 @@ A healthy state includes:
   "snapshot_stable": true
 }
 ```
+
+## Upgrade an existing profile
+
+The regular installer deliberately refuses to overwrite an existing deployment.
+For a guarded in-place upgrade from this repository, use:
+
+```bash
+sudo ./scripts/upgrade-profile.sh
+```
+
+The upgrade command verifies the source manifest and exact platform, stages all
+artifacts, moves the existing controller to verified factory `auto/off`,
+disables it for the replacement window, keeps a root-only backup, refreshes the
+manager/daemon/recovery helper/unit/tmpfiles/documentation as one release, and
+reactivates only through the new guarded manager. Fresh installs and upgrades
+write an `INSTALL_RECORD` with the deployed artifact hashes under
+`/usr/local/share/doc/msi-fan-profile/`.
+If the upgrade stops after entering the safe state, it intentionally leaves the
+service disabled in factory auto mode rather than restarting a partial release.
 
 ## Verify systemd
 

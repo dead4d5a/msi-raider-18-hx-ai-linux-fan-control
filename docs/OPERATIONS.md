@@ -78,6 +78,22 @@ cooler_boost=on
 The service intentionally does not restart after failure. Inspect the cause,
 wait for cooldown, and use `apply-default` only after resolving it.
 
+## Sustained high heat
+
+After 15 seconds of an alarm with Cooler Boost physically verified, the service
+remains active rather than failing. `systemctl status msi-fan-profile.service`
+will report a sustained safety alarm, and the journal records the triggering
+temperature/fan condition. An automatically latched Cooler Boost releases only
+after the existing 30-second monitored cool interval; a manual Boost latch
+continues to use its separately requested, monitored release path.
+
+Stop or reduce the workload if this occurs. This fan-only controller cannot
+guarantee a CPU temperature below the mid-90s under every sustained workload;
+CPU power policy is deliberately outside its scope.
+
+The same sustained state can result from a verified fan-stall alarm. Treat that
+as a hardware fault and inspect the fan path before relying on the system.
+
 ## Direct sysfs writes
 
 Do not write the curve or fan mode manually during normal operation. Use the

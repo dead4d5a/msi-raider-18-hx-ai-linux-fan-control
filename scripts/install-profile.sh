@@ -5,6 +5,7 @@ set -Eeuo pipefail
 repo=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 [[ $EUID -eq 0 ]] || { echo 'Run with sudo.' >&2; exit 1; }
 "$repo/scripts/preflight.sh"
+"$repo/scripts/verify-release.sh"
 
 paths=(
   /usr/local/sbin/msi-fan-profile
@@ -35,9 +36,11 @@ load_state=$(systemctl show msi-fan-profile.service -p LoadState --value 2>/dev/
 }
 
 installed=0
+record_tmp=''
 rollback() {
   local rc=$?
   trap - ERR INT TERM EXIT
+  [[ -z $record_tmp ]] || rm -f -- "$record_tmp"
   if ((installed)); then
     systemctl disable --now msi-fan-profile.service >/dev/null 2>&1 || true
     rm -f /etc/systemd/system/multi-user.target.wants/msi-fan-profile.service
@@ -63,6 +66,7 @@ install -o root -g root -m 0755 "$repo/src/msi-gpu-recover" /usr/local/libexec/m
 install -o root -g root -m 0644 "$repo/systemd/msi-fan-profile.service" /etc/systemd/system/msi-fan-profile.service
 install -o root -g root -m 0644 "$repo/tmpfiles/msi-fan-profile.conf" /etc/tmpfiles.d/msi-fan-profile.conf
 install -d -o root -g root -m 0755 /usr/local/share/doc/msi-fan-profile
+install -o root -g root -m 0644 "$repo/README.md" /usr/local/share/doc/msi-fan-profile/README.md
 install -o root -g root -m 0644 "$repo/docs/OPERATIONS.md" /usr/local/share/doc/msi-fan-profile/OPERATIONS.md
 install -o root -g root -m 0644 "$repo/docs/SAFETY.md" /usr/local/share/doc/msi-fan-profile/SAFETY.md
 
@@ -72,6 +76,34 @@ systemctl enable msi-fan-profile.service
 [[ $(systemctl is-enabled msi-fan-profile.service) == enabled ]]
 [[ $(stat -c '%U:%G:%a' /run/msi-fanctl.lock) == root:root:600 ]]
 [[ $(stat -c '%U:%G:%a' /run/msi-fan-profile-manager.lock) == root:root:600 ]]
+
+record_tmp=$(mktemp /run/msi-fan-profile-install.XXXXXXXX)
+commit=$(git -C "$repo" rev-parse --verify HEAD 2>/dev/null || printf 'unavailable')
+if [[ -n $(git -C "$repo" status --porcelain 2>/dev/null || true) ]]; then
+  dirty=yes
+else
+  dirty=no
+fi
+{
+  printf 'source_commit=%s\n' "$commit"
+  printf 'source_tree_dirty=%s\n' "$dirty"
+  printf 'source_manifest_sha256=%s\n' "$(sha256sum "$repo/SHA256SUMS" | awk '{print $1}')"
+  for target in \
+      /usr/local/sbin/msi-fan-profile \
+      /usr/local/libexec/msi-fan-profiled \
+      /usr/local/libexec/msi-gpu-recover \
+      /etc/systemd/system/msi-fan-profile.service \
+      /etc/tmpfiles.d/msi-fan-profile.conf \
+      /usr/local/share/doc/msi-fan-profile/README.md \
+      /usr/local/share/doc/msi-fan-profile/OPERATIONS.md \
+      /usr/local/share/doc/msi-fan-profile/SAFETY.md; do
+    printf '%s  %s\n' "$(sha256sum "$target" | awk '{print $1}')" "$target"
+  done
+} > "$record_tmp"
+install -o root -g root -m 0644 "$record_tmp" \
+  /usr/local/share/doc/msi-fan-profile/INSTALL_RECORD
+rm -f -- "$record_tmp"
+record_tmp=''
 
 trap - ERR INT TERM
 installed=0

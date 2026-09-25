@@ -37,6 +37,9 @@ firmware. Related model names alone are not sufficient evidence of compatibility
 - Monitors temperatures, physical fan RPM, exact curve/mode, and immutable
   hardware/driver identity read-only.
 - Uses a systemd watchdog and exact-platform recovery.
+- Holds physically verified Cooler Boost and remains active during a sustained
+  safety alarm; it reports that degraded maximum-cooling state instead of
+  treating high temperature alone as a service failure.
 - Preserves temporary Cooler Boost overrides.
 - Restores the captured factory curve and firmware `auto` mode on clean stop.
 - On failure, restores factory `auto` and deliberately leaves Cooler Boost on.
@@ -97,6 +100,10 @@ sudo ./scripts/install-profile.sh
 sudo msi-fan-profile apply-default
 msi-fan-profile status
 ```
+
+For an already installed profile, use the guarded
+`sudo ./scripts/upgrade-profile.sh` procedure described in
+[Profile installation](docs/INSTALL.md).
 
 Do not skip the driver guide or compatibility checks.
 

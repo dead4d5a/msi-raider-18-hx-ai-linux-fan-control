@@ -29,6 +29,8 @@ DEFAULT = (
 STOP = False
 BOOST_REQUEST = False
 RELEASE_REQUEST = False
+SUSTAINED_ALARM_SECONDS = 15.0
+SUSTAINED_ALARM_REPORT_SECONDS = 60.0
 
 
 class ProfileError(RuntimeError):
@@ -250,6 +252,38 @@ class Safety:
         return None
 
 
+@dataclass
+class AlarmHold:
+    """Track a verified thermal alarm without turning maximum cooling into a fault."""
+    verified_since: float | None = None
+    sustained: bool = False
+    last_report: float | None = None
+
+    def record_verification(self, now: float) -> str | None:
+        """Return the state transition caused by a successful Boost verification."""
+        if self.verified_since is None:
+            self.verified_since = now
+            return "established"
+        if (not self.sustained and
+                now - self.verified_since >= SUSTAINED_ALARM_SECONDS):
+            self.sustained = True
+            self.last_report = now
+            return "sustained"
+        if (self.sustained and self.last_report is not None and
+                now - self.last_report >= SUSTAINED_ALARM_REPORT_SECONDS):
+            self.last_report = now
+            return "ongoing"
+        return None
+
+    def clear(self) -> bool:
+        """Reset on a safe sample and report whether a sustained alarm cleared."""
+        was_sustained = self.sustained
+        self.verified_since = None
+        self.sustained = False
+        self.last_report = None
+        return was_sustained
+
+
 def acknowledge(action: str) -> None:
     temporary = pathlib.Path(f"/run/.msi-fan-profile.ack.{os.getpid()}")
     payload = f"pid={os.getpid()} action={action} monotonic_ns={time.monotonic_ns()}\n"
@@ -329,7 +363,7 @@ def main() -> int:
         automatic_boost = False
         release_pending = False
         release_cool_since: float | None = None
-        alarm_since: float | None = None
+        alarm = AlarmHold()
         last_suspend_offset = (time.clock_gettime(time.CLOCK_BOOTTIME) -
                                time.monotonic())
         last_log = 0.0
@@ -352,7 +386,7 @@ def main() -> int:
                 force_apply_default(wmi, preserve, heartbeat)
                 safety = Safety()
                 release_cool_since = None
-                alarm_since = None
+                alarm.clear()
             last_suspend_offset = suspend_offset
 
             curve = read(BASE / "fan_curve")
@@ -364,7 +398,7 @@ def main() -> int:
                     force_apply_default(wmi, preserve, heartbeat)
                     safety = Safety()
                     release_cool_since = None
-                    alarm_since = None
+                    alarm.clear()
                     boost = read(BASE / "cooler_boost")
                 else:
                     raise ProfileError(f"unexpected runtime state: {mode}/{boost}/{curve!r}")
@@ -388,7 +422,7 @@ def main() -> int:
                 automatic_boost = False
                 release_pending = False
                 release_cool_since = None
-                alarm_since = None
+                alarm.clear()
                 BOOST_REQUEST = False
                 acknowledge("boost-on")
                 print("explicit Cooler Boost enabled and physically verified",
@@ -418,17 +452,28 @@ def main() -> int:
                     write(BASE / "cooler_boost", "on")
                 verify_boost(wmi, heartbeat)
                 verified_at = time.monotonic()
-                if alarm_since is None:
-                    alarm_since = verified_at
+                transition = alarm.record_verification(verified_at)
+                if transition == "established":
                     print(f"Cooler Boost established for alarm: {reason}",
                           file=sys.stderr, flush=True)
-                elif verified_at - alarm_since >= 15:
-                    raise ProfileError(
-                        f"alarm persisted 15 seconds despite verified Boost: {reason}")
+                elif transition == "sustained":
+                    print(
+                        f"WARNING sustained safety alarm; remaining active with "
+                        f"verified Cooler Boost: {reason}",
+                        file=sys.stderr, flush=True)
+                elif transition == "ongoing":
+                    print(
+                        f"WARNING sustained safety alarm continues with verified "
+                        f"Cooler Boost: {reason}",
+                        file=sys.stderr, flush=True)
                 if not manual_boost:
                     automatic_boost = True
             else:
-                alarm_since = None
+                if alarm.clear():
+                    print(
+                        "sustained safety alarm cleared; Cooler Boost remains "
+                        "governed by its current latch/release policy",
+                        file=sys.stderr, flush=True)
                 timer_now = time.monotonic()
                 if automatic_boost:
                     # External/keyboard off cannot defeat the automatic latch.
@@ -474,11 +519,18 @@ def main() -> int:
                               file=sys.stderr, flush=True)
 
             if started - last_log >= 60:
+                alarm_note = f" sustained_alarm={reason!r}" if alarm.sustained else ""
                 print(f"status cpu={cpu//1000}C gpu={ec_gpu}C fans={fan1}/{fan2} "
-                      f"boost={read(BASE/'cooler_boost')}", file=sys.stderr,
+                      f"boost={read(BASE/'cooler_boost')}{alarm_note}", file=sys.stderr,
                       flush=True)
                 last_log = started
-            heartbeat(f"Candidate14 CPU {cpu//1000}C GPU {ec_gpu}C fans {fan1}/{fan2}")
+            if alarm.sustained:
+                heartbeat(
+                    f"Sustained safety alarm: {reason}; Cooler Boost verified; "
+                    f"CPU {cpu//1000}C GPU {ec_gpu}C fans {fan1}/{fan2}")
+            else:
+                heartbeat(
+                    f"Candidate14 CPU {cpu//1000}C GPU {ec_gpu}C fans {fan1}/{fan2}")
             delay = 1 - (time.monotonic() - started)
             if delay > 0:
                 time.sleep(delay)

@@ -4,9 +4,16 @@ set -euo pipefail
 repo=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$repo"
 
-PYTHONDONTWRITEBYTECODE=1 python3 -m py_compile \
+verify_cache=$(mktemp -d)
+cleanup() {
+    rm -rf -- "$verify_cache"
+}
+trap cleanup EXIT
+
+PYTHONPYCACHEPREFIX="$verify_cache" python3 -m py_compile \
     src/msi-fan-profile src/msi-fan-profiled src/msi-gpu-recover
-rm -rf src/__pycache__
+PYTHONDONTWRITEBYTECODE=1 PYTHONPYCACHEPREFIX="$verify_cache" \
+    python3 -m unittest discover -s tests -p 'test_*.py'
 bash -n scripts/*.sh
 if command -v shellcheck >/dev/null; then
     shellcheck scripts/*.sh

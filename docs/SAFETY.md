@@ -58,7 +58,17 @@ The daemon requests and physically verifies Cooler Boost for:
 - fan 2 below 1,000 RPM for four seconds while GPU >=70°C.
 
 If an alarm persists 15 seconds despite physically verified Boost, the daemon
-fails. systemd kills it and runs recovery.
+enters a visible sustained-safety-alarm state. It remains active with Cooler
+Boost latched on, continues one-second monitoring and physical fan verification,
+and reports the condition through both the journal and systemd status. It emits
+an additional warning at most once per minute while the condition persists.
+
+High temperature alone is not proof that the fan controller is unsafe: once
+both physical fans have verified at maximum cooling, stopping the daemon would
+only replace Candidate 14 with factory auto plus Boost on and lose monitoring.
+The daemon still fails and invokes recovery for an invalid identity, curve/state
+drift, implausible sensor data, a write/readback error, watchdog failure, or a
+failed physical Boost verification.
 
 ### 6. systemd watchdog and recovery
 
@@ -71,7 +81,9 @@ action. `ExecStopPost` is root-owned and independently:
 - leaves Cooler Boost on for any failed service;
 - performs no model-specific write if identity is unknown.
 
-The service uses `Restart=no` so a fault is not hidden by an automatic loop.
+The service uses `Restart=no` so a real fault is not hidden by an automatic
+loop. A sustained, physically verified safety alarm is an active cooling state,
+not a service fault.
 
 ## Cooler Boost overrides
 
