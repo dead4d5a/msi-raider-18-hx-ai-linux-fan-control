@@ -31,10 +31,20 @@ BOOST_REQUEST = False
 RELEASE_REQUEST = False
 SUSTAINED_ALARM_SECONDS = 15.0
 SUSTAINED_ALARM_REPORT_SECONDS = 60.0
+SENSOR_DEGRADED_REPORT_SECONDS = 60.0
 
 
 class ProfileError(RuntimeError):
     pass
+
+
+class SensorSampleError(ProfileError):
+    """A malformed or implausible sampled telemetry value.
+
+    This is deliberately narrower than ProfileError: a short sequence can be
+    deglitched while keeping maximum cooling asserted, whereas control,
+    identity, and write failures must still fail immediately.
+    """
 
 
 def read(path: pathlib.Path) -> str:
@@ -45,7 +55,7 @@ def read(path: pathlib.Path) -> str:
 def read_uint(path: pathlib.Path) -> int:
     value = read(path)
     if not value.isascii() or not value.isdecimal():
-        raise ProfileError(f"nonnumeric sensor {path}: {value!r}")
+        raise SensorSampleError(f"nonnumeric sensor {path}: {value!r}")
     return int(value)
 
 
@@ -115,18 +125,38 @@ def require_policy_identity() -> None:
 
 def verify_boost(wmi: pathlib.Path, heartbeat: Callable[[str], None]) -> None:
     write(BASE / "cooler_boost", "on")
+    last_sensor_error: SensorSampleError | None = None
+    saw_plausible_rpm = False
     for _ in range(12):
-        fan1 = read_uint(wmi / "fan1_input")
-        fan2 = read_uint(wmi / "fan2_input")
+        try:
+            fan1 = read_uint(wmi / "fan1_input")
+            fan2 = read_uint(wmi / "fan2_input")
+            if not (0 <= fan1 <= 10000 and 0 <= fan2 <= 10000):
+                raise SensorSampleError(
+                    f"implausible physical fan telemetry: fan1={fan1}RPM "
+                    f"fan2={fan2}RPM")
+        except SensorSampleError as error:
+            # A WMI sentinel or malformed read must not be mistaken for RPM,
+            # but a single transient must not defeat a commanded Boost state.
+            last_sensor_error = error
+            heartbeat(f"Verifying Cooler Boost: invalid fan telemetry: {error}")
+            time.sleep(1)
+            continue
+        saw_plausible_rpm = True
         heartbeat(f"Verifying Cooler Boost: fans {fan1}/{fan2} RPM")
-        if fan1 >= 3000 and fan2 >= 3000:
+        if 3000 <= fan1 <= 10000 and 3000 <= fan2 <= 10000:
             return
         time.sleep(1)
-    raise ProfileError("both physical fans did not verify under Cooler Boost")
+    if not saw_plausible_rpm and last_sensor_error is not None:
+        raise SensorSampleError(
+            "physical Cooler Boost verification deferred: "
+            f"{last_sensor_error}")
+    detail = f"; last sensor error: {last_sensor_error}" if last_sensor_error else ""
+    raise ProfileError("both physical fans did not verify under Cooler Boost" + detail)
 
 
 def force_apply_default(wmi: pathlib.Path, preserve_boost: bool,
-                        heartbeat: Callable[[str], None]) -> None:
+                        heartbeat: Callable[[str], None]) -> bool:
     """Reprogram Candidate14 under auto+Boost, then enter advanced mode."""
     require_policy_identity()
     curve = read(BASE / "fan_curve")
@@ -143,17 +173,30 @@ def force_apply_default(wmi: pathlib.Path, preserve_boost: bool,
     write(BASE / "fan_curve", DEFAULT)
     if read(BASE / "fan_mode") != "auto" or read(BASE / "cooler_boost") != "on":
         raise ProfileError("curve transaction did not retain auto/Boost envelope")
-    verify_boost(wmi, heartbeat)
+    physically_verified = True
+    try:
+        verify_boost(wmi, heartbeat)
+    except SensorSampleError as error:
+        # The EC control write and its readbacks succeeded, but a WMI sentinel
+        # means physical RPM cannot be certified yet. Keep Boost latched and
+        # let the persistent degraded-telemetry state verify it later.
+        physically_verified = False
+        print(
+            "WARNING Candidate14 staged with Cooler Boost requested; "
+            f"physical fan telemetry is invalid: {error}",
+            file=sys.stderr, flush=True)
     require_policy_identity()
     write(BASE / "fan_mode", "advanced")
     if read(BASE / "cooler_boost") != "on":
         raise ProfileError("Boost changed before advanced verification")
-    if not preserve_boost:
+    keep_boost = preserve_boost or not physically_verified
+    if not keep_boost:
         write(BASE / "cooler_boost", "off")
     if (read(BASE / "fan_curve") != DEFAULT or
             read(BASE / "fan_mode") != "advanced" or
-            read(BASE / "cooler_boost") != ("on" if preserve_boost else "off")):
+            read(BASE / "cooler_boost") != ("on" if keep_boost else "off")):
         raise ProfileError("default profile final readback failed")
+    return physically_verified
 
 
 def restore_factory_envelope() -> bool:
@@ -208,6 +251,43 @@ def release_factory_if_cool(core: pathlib.Path) -> bool:
         except Exception:
             pass
     return False
+
+
+@dataclass(frozen=True)
+class RuntimeSample:
+    package: int
+    ec_cpu: int
+    ec_gpu: int
+    fan1: int
+    fan2: int
+
+    @property
+    def cpu(self) -> int:
+        return max(self.package, self.ec_cpu * 1000)
+
+
+def read_runtime_sample(core: pathlib.Path, wmi: pathlib.Path) -> RuntimeSample:
+    """Read one complete plausibility-checked runtime telemetry sample."""
+    sample = RuntimeSample(
+        package=read_uint(core / "temp1_input"),
+        ec_cpu=read_uint(BASE / "cpu/realtime_temperature"),
+        ec_gpu=read_uint(BASE / "gpu/realtime_temperature"),
+        fan1=read_uint(wmi / "fan1_input"),
+        fan2=read_uint(wmi / "fan2_input"),
+    )
+    if sample.ec_cpu == 255:
+        # msi_ec exposes the raw u8 EC read. 0xff is an unavailable/sentinel
+        # byte on this platform, never a plausible CPU temperature.
+        raise SensorSampleError("EC CPU temperature sentinel 255C")
+    if not (0 <= sample.package <= 110000 and 0 <= sample.ec_cpu <= 110 and
+            0 <= sample.ec_gpu <= 110 and 0 <= sample.fan1 <= 10000 and
+            0 <= sample.fan2 <= 10000):
+        raise SensorSampleError(
+            "implausible thermal/fan sensor: "
+            f"package={sample.package}mC ec_cpu={sample.ec_cpu}C "
+            f"ec_gpu={sample.ec_gpu}C fan1={sample.fan1}RPM "
+            f"fan2={sample.fan2}RPM")
+    return sample
 
 
 @dataclass
@@ -284,6 +364,34 @@ class AlarmHold:
         return was_sustained
 
 
+@dataclass
+class SensorHold:
+    """Non-expiring invalid-telemetry latch while maximum cooling stays active."""
+    started: float | None = None
+    last_report: float | None = None
+
+    def record(self, now: float) -> str | None:
+        if self.started is None:
+            self.started = now
+            self.last_report = now
+            return "established"
+        if (self.last_report is None or
+                now - self.last_report >= SENSOR_DEGRADED_REPORT_SECONDS):
+            self.last_report = now
+            return "ongoing"
+        return None
+
+    def elapsed(self, now: float) -> float:
+        return 0.0 if self.started is None else now - self.started
+
+    def clear(self) -> bool:
+        if self.started is None:
+            return False
+        self.started = None
+        self.last_report = None
+        return True
+
+
 def acknowledge(action: str) -> None:
     temporary = pathlib.Path(f"/run/.msi-fan-profile.ack.{os.getpid()}")
     payload = f"pid={os.getpid()} action={action} monotonic_ns={time.monotonic_ns()}\n"
@@ -337,9 +445,6 @@ def main() -> int:
         os.close(descriptor)
         raise ProfileError("factory-auto runtime override pathname is present")
 
-    immutable_verified = False
-    mutated = False
-    clean_stop = False
     wmi: pathlib.Path | None = None
     core: pathlib.Path | None = None
 
@@ -348,12 +453,11 @@ def main() -> int:
 
     try:
         require_policy_identity()
-        immutable_verified = True
         wmi = one_hwmon("msi_wmi_platform")
         core = one_hwmon("coretemp")
         existing_boost = read(BASE / "cooler_boost") == "on"
-        mutated = True
-        force_apply_default(wmi, existing_boost, heartbeat)
+        initial_physical_verification = force_apply_default(
+            wmi, existing_boost, heartbeat)
         print(f"Candidate14 applied; preserved_boost={existing_boost}",
               file=sys.stderr, flush=True)
         notify("READY=1\nWATCHDOG=1\nSTATUS=Candidate14 active")
@@ -364,6 +468,15 @@ def main() -> int:
         release_pending = False
         release_cool_since: float | None = None
         alarm = AlarmHold()
+        sensor_hold = SensorHold()
+        if initial_physical_verification is False:
+            sensor_hold.record(time.monotonic())
+            if not manual_boost:
+                automatic_boost = True
+            print(
+                "WARNING initial physical fan telemetry is invalid; "
+                "Candidate14 remains active with Cooler Boost latched",
+                file=sys.stderr, flush=True)
         last_suspend_offset = (time.clock_gettime(time.CLOCK_BOOTTIME) -
                                time.monotonic())
         last_log = 0.0
@@ -383,10 +496,17 @@ def main() -> int:
                 preserve = manual_boost or automatic_boost or read(BASE / "cooler_boost") == "on"
                 print("resume detected; forcing Candidate14 reapply", file=sys.stderr,
                       flush=True)
-                force_apply_default(wmi, preserve, heartbeat)
+                reapply_physical_verification = force_apply_default(
+                    wmi, preserve, heartbeat)
                 safety = Safety()
                 release_cool_since = None
                 alarm.clear()
+                if reapply_physical_verification is False:
+                    sensor_hold.record(time.monotonic())
+                    if not manual_boost:
+                        automatic_boost = True
+                else:
+                    sensor_hold.clear()
             last_suspend_offset = suspend_offset
 
             curve = read(BASE / "fan_curve")
@@ -395,24 +515,90 @@ def main() -> int:
             if curve != DEFAULT or mode != "advanced" or boost not in ("on", "off"):
                 if curve == FACTORY and mode == "auto" and boost in ("on", "off"):
                     preserve = manual_boost or automatic_boost or boost == "on"
-                    force_apply_default(wmi, preserve, heartbeat)
+                    reapply_physical_verification = force_apply_default(
+                        wmi, preserve, heartbeat)
                     safety = Safety()
                     release_cool_since = None
                     alarm.clear()
+                    if reapply_physical_verification is False:
+                        sensor_hold.record(time.monotonic())
+                        if not manual_boost:
+                            automatic_boost = True
+                    else:
+                        sensor_hold.clear()
                     boost = read(BASE / "cooler_boost")
                 else:
                     raise ProfileError(f"unexpected runtime state: {mode}/{boost}/{curve!r}")
 
-            package = read_uint(core / "temp1_input")
-            ec_cpu = read_uint(BASE / "cpu/realtime_temperature")
-            ec_gpu = read_uint(BASE / "gpu/realtime_temperature")
-            fan1 = read_uint(wmi / "fan1_input")
-            fan2 = read_uint(wmi / "fan2_input")
-            if not (0 <= package <= 110000 and 0 <= ec_cpu <= 110 and
-                    0 <= ec_gpu <= 110 and 0 <= fan1 <= 10000 and
-                    0 <= fan2 <= 10000):
-                raise ProfileError("implausible thermal/fan sensor")
-            cpu = max(package, ec_cpu * 1000)
+            try:
+                sample = read_runtime_sample(core, wmi)
+            except SensorSampleError as error:
+                # A malformed EC/WMI sample must never convert an active
+                # full-cooling state into an unattended service failure. Keep
+                # the exact active profile, continuously reassert Boost, and
+                # remain observable until both telemetry and physical RPM
+                # verification recover.
+                safety = Safety()
+                release_cool_since = None
+                alarm.clear()
+                transition = sensor_hold.record(started)
+                if boost != "on":
+                    write(BASE / "cooler_boost", "on")
+                if not manual_boost:
+                    automatic_boost = True
+                if transition == "established":
+                    print(
+                        "WARNING sensor telemetry degraded; "
+                        f"Candidate14 remains active with Cooler Boost requested: {error}",
+                        file=sys.stderr, flush=True)
+                elif transition == "ongoing":
+                    print(
+                        "WARNING sensor telemetry remains degraded; "
+                        f"Candidate14 and Cooler Boost remain latched: {error}",
+                        file=sys.stderr, flush=True)
+                elapsed = sensor_hold.elapsed(started)
+                heartbeat(
+                    f"Sensor telemetry degraded {elapsed:.0f}s; Candidate14 active; "
+                    f"Cooler Boost latched; awaiting valid telemetry; {error}")
+                delay = 1 - (time.monotonic() - started)
+                if delay > 0:
+                    time.sleep(delay)
+                continue
+
+            if sensor_hold.started is not None:
+                # A complete sample alone is insufficient to leave degraded
+                # mode: first prove that the commanded Boost still reaches both
+                # physical fans. Invalid RPM telemetry keeps the latch active;
+                # plausibly low RPM remains a genuine fan-response failure.
+                try:
+                    verify_boost(wmi, heartbeat)
+                except SensorSampleError as error:
+                    transition = sensor_hold.record(time.monotonic())
+                    if read(BASE / "cooler_boost") != "on":
+                        write(BASE / "cooler_boost", "on")
+                    if transition == "ongoing":
+                        print(
+                            "WARNING physical fan telemetry remains invalid; "
+                            f"Candidate14 and Cooler Boost remain latched: {error}",
+                            file=sys.stderr, flush=True)
+                    elapsed = sensor_hold.elapsed(time.monotonic())
+                    heartbeat(
+                        f"Sensor telemetry degraded {elapsed:.0f}s; Candidate14 active; "
+                        f"Cooler Boost latched; physical RPM unverified; {error}")
+                    delay = 1 - (time.monotonic() - started)
+                    if delay > 0:
+                        time.sleep(delay)
+                    continue
+                sensor_hold.clear()
+                print(
+                    "sensor telemetry recovered; Cooler Boost remains latched "
+                    "until monitored cooldown completes",
+                    file=sys.stderr, flush=True)
+
+            cpu = sample.cpu
+            ec_gpu = sample.ec_gpu
+            fan1 = sample.fan1
+            fan2 = sample.fan2
             reason = safety.update(cpu, ec_gpu, fan1, fan2, started)
 
             if BOOST_REQUEST:
@@ -542,18 +728,15 @@ def main() -> int:
             raise ProfileError("factory restoration failed")
         if not release_factory_if_cool(core):
             raise ProfileError("factory restored; Boost release unsafe")
-        mutated = False
-        clean_stop = True
         notify("STOPPING=1\nSTATUS=Factory auto/off restored")
         return 0
-    except BaseException:
-        if immutable_verified and mutated:
-            restore_factory_envelope()
-        raise
     finally:
-        if immutable_verified and mutated and not clean_stop:
-            restore_factory_envelope()
-        # Keep descriptor open through all recovery and return handling.
+        # Runtime faults deliberately do not write the factory curve here.
+        # systemd invokes the independent root-owned ExecStopPost helper after
+        # this process exits, so it can establish one verified full-cooling
+        # postcondition without concurrent daemon writes. Keep the descriptor
+        # open until this function finishes so that helper serializes after us.
+        pass
 
 
 def entrypoint() -> int:

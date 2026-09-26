@@ -12,6 +12,7 @@ paths=(
   /usr/local/libexec/msi-fan-profiled
   /usr/local/libexec/msi-gpu-recover
   /etc/systemd/system/msi-fan-profile.service
+  /etc/systemd/system/msi-fan-profile-keeper.service
   /run/systemd/system/msi-fan-profile.service
   /usr/lib/systemd/system/msi-fan-profile.service
   /lib/systemd/system/msi-fan-profile.service
@@ -29,11 +30,13 @@ for path in "${paths[@]}"; do
     exit 1
   }
 done
-load_state=$(systemctl show msi-fan-profile.service -p LoadState --value 2>/dev/null || true)
-[[ -z $load_state || $load_state == not-found ]] || {
-  echo "Refusing to replace an already loaded unit: LoadState=$load_state" >&2
-  exit 1
-}
+for unit in msi-fan-profile.service msi-fan-profile-keeper.service; do
+  load_state=$(systemctl show "$unit" -p LoadState --value 2>/dev/null || true)
+  [[ -z $load_state || $load_state == not-found ]] || {
+    echo "Refusing to replace an already loaded unit $unit: LoadState=$load_state" >&2
+    exit 1
+  }
+done
 
 installed=0
 record_tmp=''
@@ -42,9 +45,11 @@ rollback() {
   trap - ERR INT TERM EXIT
   [[ -z $record_tmp ]] || rm -f -- "$record_tmp"
   if ((installed)); then
+    systemctl stop msi-fan-profile-keeper.service >/dev/null 2>&1 || true
     systemctl disable --now msi-fan-profile.service >/dev/null 2>&1 || true
     rm -f /etc/systemd/system/multi-user.target.wants/msi-fan-profile.service
     rm -f /etc/systemd/system/msi-fan-profile.service
+    rm -f /etc/systemd/system/msi-fan-profile-keeper.service
     rm -f /etc/tmpfiles.d/msi-fan-profile.conf
     rm -f /usr/local/sbin/msi-fan-profile
     rm -f /usr/local/libexec/msi-fan-profiled
@@ -64,6 +69,7 @@ install -o root -g root -m 0755 "$repo/src/msi-fan-profile" /usr/local/sbin/msi-
 install -o root -g root -m 0755 "$repo/src/msi-fan-profiled" /usr/local/libexec/msi-fan-profiled
 install -o root -g root -m 0755 "$repo/src/msi-gpu-recover" /usr/local/libexec/msi-gpu-recover
 install -o root -g root -m 0644 "$repo/systemd/msi-fan-profile.service" /etc/systemd/system/msi-fan-profile.service
+install -o root -g root -m 0644 "$repo/systemd/msi-fan-profile-keeper.service" /etc/systemd/system/msi-fan-profile-keeper.service
 install -o root -g root -m 0644 "$repo/tmpfiles/msi-fan-profile.conf" /etc/tmpfiles.d/msi-fan-profile.conf
 install -d -o root -g root -m 0755 /usr/local/share/doc/msi-fan-profile
 install -o root -g root -m 0644 "$repo/README.md" /usr/local/share/doc/msi-fan-profile/README.md
@@ -93,6 +99,7 @@ fi
       /usr/local/libexec/msi-fan-profiled \
       /usr/local/libexec/msi-gpu-recover \
       /etc/systemd/system/msi-fan-profile.service \
+      /etc/systemd/system/msi-fan-profile-keeper.service \
       /etc/tmpfiles.d/msi-fan-profile.conf \
       /usr/local/share/doc/msi-fan-profile/README.md \
       /usr/local/share/doc/msi-fan-profile/OPERATIONS.md \

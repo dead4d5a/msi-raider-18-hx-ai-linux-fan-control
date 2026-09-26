@@ -110,15 +110,21 @@ load the blacklisted module in that recovery boot.
 
 ## Failure state
 
-A service failure intentionally prefers:
+A runtime service failure intentionally attempts:
 
 ```text
-factory curve
-fan mode auto
+Candidate 14 curve
+fan mode advanced
 Cooler Boost on
+both fans physically verified when valid WMI RPM telemetry is available
 service failed, Restart=no
+failure keeper active, continuously reasserting Candidate 14/advanced/Boost
 ```
 
-Do not blindly turn Boost off after a failure. Stop heavy workloads, inspect
-temperatures and logs, then use the guarded manager only after resolving the
-cause.
+If telemetry is invalid, the recovery log records that physical verification
+could not be established; it does not substitute the factory curve for the
+runtime fault. The keeper never treats incomplete telemetry as a reason to
+release Boost. Do not blindly turn Boost off after a failure. Stop heavy
+workloads, inspect both unit logs and temperatures, then use the guarded manager
+only after resolving the cause. Use `factory-auto` only when an intentional
+factory rollback is wanted.

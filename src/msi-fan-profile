@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import fcntl,json,os,pathlib,signal,stat,subprocess,sys,time
 
-BASE=pathlib.Path('/sys/devices/platform/msi-ec');SERVICE='msi-fan-profile.service'
+BASE=pathlib.Path('/sys/devices/platform/msi-ec');SERVICE='msi-fan-profile.service';KEEPER='msi-fan-profile-keeper.service'
 OVERRIDE=pathlib.Path('/run/msi-fan-profile.factory-auto');ACK=pathlib.Path('/run/msi-fan-profile.ack')
 MANAGER_LOCK=pathlib.Path('/run/msi-fan-profile-manager.lock');FAN_LOCK=pathlib.Path('/run/msi-fanctl.lock')
 FACTORY='58 64 70 76 82 88 0 25 35 44 58 70 75 52 58 64 70 76 82 0 25 35 44 58 70 75'
@@ -43,11 +43,14 @@ def make_marker():
  if marker():return
  fd=os.open(OVERRIDE,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW|os.O_CLOEXEC,0o600);os.fchown(fd,0,0);os.fchmod(fd,0o600);os.close(fd)
  if not marker():raise ManagerError('marker verification failed')
-def unit_state():
- vals={k:ctl('show',SERVICE,f'-p{k}','--value',timeout=8).stdout.strip() for k in ('ActiveState','SubState','MainPID','Job')}
+def unit_state(service=SERVICE):
+ vals={k:ctl('show',service,f'-p{k}','--value',timeout=8).stdout.strip() for k in ('ActiveState','SubState','MainPID','Job')}
  return vals
-def inactive_dead():
- s=unit_state();return s['ActiveState']=='inactive' and s['SubState']=='dead' and s['MainPID']=='0' and not s['Job']
+def inactive_dead(service=SERVICE):
+ s=unit_state(service);return s['ActiveState']=='inactive' and s['SubState']=='dead' and s['MainPID']=='0' and not s['Job']
+def stop_keeper():
+ ctl('stop',KEEPER,check=False,timeout=50);ctl('reset-failed',KEEPER,check=False,timeout=10)
+ if not inactive_dead(KEEPER):raise ManagerError('recovery keeper did not become inactive/dead')
 def enable_state():
  r=ctl('is-enabled',SERVICE,check=False,timeout=8);state=r.stdout.strip()
  if state not in ('enabled','disabled'):raise ManagerError(f'unknown service enable state: {state!r} rc={r.returncode}')
@@ -72,6 +75,7 @@ def disable_and_safe_factory():
  marker_error=None
  try:make_marker()
  except Exception as e:marker_error=e
+ stop_keeper()
  ctl('disable',SERVICE,check=False,timeout=20);ctl('stop',SERVICE,check=False,timeout=45);ctl('reset-failed',SERVICE,check=False,timeout=10)
  if not inactive_dead():raise ManagerError('service not inactive/dead during fail-safe')
  if enabled():raise ManagerError('service remained persistently enabled during fail-safe')
@@ -80,21 +84,22 @@ def disable_and_safe_factory():
  finally:os.close(fd)
  if marker_error is not None:raise ManagerError(f'unsafe override marker prevented verified boot block: {marker_error}')
 def full_status():
- identity();s=unit_state();h=hw();return {'service_enabled':enabled(),'service_active_state':s['ActiveState'],'service_sub_state':s['SubState'],'service_main_pid':int(s['MainPID'] or 0),'service_job':s['Job'],'factory_override':marker(),'curve':h['curve'],'fan_mode':h['mode'],'cooler_boost':h['boost'],'shift_mode':read(BASE/'shift_mode'),'ec_firmware':read(BASE/'fw_version'),'driver_version':read('/sys/module/msi_ec/version'),'driver_srcversion':read('/sys/module/msi_ec/srcversion')}
+ identity();s=unit_state();k=unit_state(KEEPER);h=hw();return {'service_enabled':enabled(),'service_active_state':s['ActiveState'],'service_sub_state':s['SubState'],'service_main_pid':int(s['MainPID'] or 0),'service_job':s['Job'],'keeper_active_state':k['ActiveState'],'keeper_sub_state':k['SubState'],'keeper_main_pid':int(k['MainPID'] or 0),'keeper_job':k['Job'],'factory_override':marker(),'curve':h['curve'],'fan_mode':h['mode'],'cooler_boost':h['boost'],'shift_mode':read(BASE/'shift_mode'),'ec_firmware':read(BASE/'fw_version'),'driver_version':read('/sys/module/msi_ec/version'),'driver_srcversion':read('/sys/module/msi_ec/srcversion')}
 def status():
- first=full_status();time.sleep(.05);second=full_status();stable=first==second;second['snapshot_stable']=stable;print(json.dumps(second,indent=2,sort_keys=True));s=second;default=stable and s['service_enabled'] and s['service_active_state']=='active' and s['service_sub_state']=='running' and s['service_main_pid']>0 and not s['service_job'] and not s['factory_override'] and s['curve']=='candidate14' and s['fan_mode']=='advanced' and s['cooler_boost'] in ('on','off');override=stable and s['service_enabled'] and s['service_active_state']=='inactive' and s['service_sub_state']=='dead' and s['service_main_pid']==0 and not s['service_job'] and s['factory_override'] and s['curve']=='factory' and s['fan_mode']=='auto' and s['cooler_boost']=='off';return 0 if default or override else 1
+ first=full_status();time.sleep(.05);second=full_status();stable=first==second;second['snapshot_stable']=stable;print(json.dumps(second,indent=2,sort_keys=True));s=second;keeper_inactive=s['keeper_active_state']=='inactive' and s['keeper_sub_state']=='dead' and s['keeper_main_pid']==0 and not s['keeper_job'];default=stable and s['service_enabled'] and s['service_active_state']=='active' and s['service_sub_state']=='running' and s['service_main_pid']>0 and not s['service_job'] and keeper_inactive and not s['factory_override'] and s['curve']=='candidate14' and s['fan_mode']=='advanced' and s['cooler_boost'] in ('on','off');override=stable and s['service_enabled'] and s['service_active_state']=='inactive' and s['service_sub_state']=='dead' and s['service_main_pid']==0 and not s['service_job'] and keeper_inactive and s['factory_override'] and s['curve']=='factory' and s['fan_mode']=='auto' and s['cooler_boost']=='off';return 0 if default or override else 1
 def root():
  if os.geteuid():raise ManagerError('root required; use sudo')
 def apply_default():
- root();identity();fd=lock(MANAGER_LOCK)
+ root();identity();fd=lock(MANAGER_LOCK);start_attempted=False
  try:
   if marker():OVERRIDE.unlink()
-  ctl('reset-failed',SERVICE,check=False,timeout=10);ctl('enable',SERVICE,timeout=20);ctl('start',SERVICE,timeout=50)
+  stop_keeper();ctl('reset-failed',SERVICE,check=False,timeout=10);ctl('enable',SERVICE,timeout=20);start_attempted=True;ctl('start',SERVICE,timeout=50)
   s=full_status()
-  ok=s['service_enabled'] and s['service_active_state']=='active' and s['service_sub_state']=='running' and s['service_main_pid']>0 and not s['service_job'] and not s['factory_override'] and s['curve']=='candidate14' and s['fan_mode']=='advanced'
+  ok=s['service_enabled'] and s['service_active_state']=='active' and s['service_sub_state']=='running' and s['service_main_pid']>0 and not s['service_job'] and s['keeper_active_state']=='inactive' and s['keeper_sub_state']=='dead' and s['keeper_main_pid']==0 and not s['keeper_job'] and not s['factory_override'] and s['curve']=='candidate14' and s['fan_mode']=='advanced'
   if not ok:raise ManagerError('default invariant failed')
   print('Candidate14 is active and enabled for future boots.')
  except Exception as e:
+  if start_attempted:raise ManagerError(f'apply-default activation failed after start was attempted: {e}; left service state and runtime full-cooling recovery untouched') from e
   try:disable_and_safe_factory()
   except Exception as r:raise ManagerError(f'apply-default failed: {e}; fail-safe failed: {r}') from e
   raise ManagerError(f'apply-default failed: {e}; service disabled, factory auto with Boost on') from e
@@ -102,12 +107,12 @@ def apply_default():
 def factory_auto():
  root();identity();fd=lock(MANAGER_LOCK)
  try:
-  make_marker();ctl('stop',SERVICE,check=False,timeout=50);ctl('reset-failed',SERVICE,check=False,timeout=10)
+  make_marker();stop_keeper();ctl('stop',SERVICE,check=False,timeout=50);ctl('reset-failed',SERVICE,check=False,timeout=10)
   if not inactive_dead():raise ManagerError('service did not become inactive/dead')
   fan=lock(FAN_LOCK)
   try:restore_factory_locked(release=True)
   finally:os.close(fan)
-  s=full_status();ok=s['service_enabled'] and s['service_active_state']=='inactive' and s['service_sub_state']=='dead' and s['service_main_pid']==0 and not s['service_job'] and s['factory_override'] and s['curve']=='factory' and s['fan_mode']=='auto' and s['cooler_boost']=='off'
+  s=full_status();ok=s['service_enabled'] and s['service_active_state']=='inactive' and s['service_sub_state']=='dead' and s['service_main_pid']==0 and not s['service_job'] and s['keeper_active_state']=='inactive' and s['keeper_sub_state']=='dead' and s['keeper_main_pid']==0 and not s['keeper_job'] and s['factory_override'] and s['curve']=='factory' and s['fan_mode']=='auto' and s['cooler_boost']=='off'
   if not ok:raise ManagerError('factory override invariant failed')
   print('Factory auto/off is active until apply-default or reboot.')
  except Exception as e:
@@ -125,7 +130,7 @@ def signal_action(action,sig,timeout_s):
  root();identity();fd=lock(MANAGER_LOCK)
  try:
   s=full_status()
-  if not(s['service_enabled'] and s['service_active_state']=='active' and s['service_sub_state']=='running' and s['service_main_pid']>0 and not s['factory_override'] and s['curve']=='candidate14' and s['fan_mode']=='advanced'):raise ManagerError('active default invariant missing')
+  if not(s['service_enabled'] and s['service_active_state']=='active' and s['service_sub_state']=='running' and s['service_main_pid']>0 and s['keeper_active_state']=='inactive' and s['keeper_sub_state']=='dead' and s['keeper_main_pid']==0 and not s['keeper_job'] and not s['factory_override'] and s['curve']=='candidate14' and s['fan_mode']=='advanced'):raise ManagerError('active default invariant missing')
   if action=='boost-release' and s['cooler_boost']=='off':print('Cooler Boost is already off.');return
   before=time.monotonic_ns();ctl('kill','--kill-whom=main',f'--signal={sig.name}',SERVICE,timeout=10);deadline=None if timeout_s is None else time.monotonic()+timeout_s
   while deadline is None or time.monotonic()<deadline:

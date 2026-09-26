@@ -46,7 +46,7 @@ wanted = {
     "FACTORY": "58 64 70 76 82 88 0 25 35 44 58 70 75 52 58 64 70 76 82 0 25 35 44 58 70 75",
     "DEFAULT": "50 60 70 76 82 88 20 30 40 50 60 80 110 38 40 42 44 55 70 20 30 40 60 70 100 120",
 }
-for filename in ("src/msi-fan-profile", "src/msi-fan-profiled"):
+for filename in ("src/msi-fan-profile", "src/msi-fan-profiled", "src/msi-gpu-recover"):
     tree = ast.parse(Path(filename).read_text())
     values = {}
     for node in tree.body:
@@ -55,7 +55,38 @@ for filename in ("src/msi-fan-profile", "src/msi-fan-profiled"):
                 if isinstance(target, ast.Name) and target.id in wanted:
                     values[target.id] = ast.literal_eval(node.value)
     assert values == wanted, (filename, values)
+recovery = ast.parse(Path("src/msi-gpu-recover").read_text())
+recovery_curve_map = None
+for node in recovery.body:
+    if isinstance(node, ast.Assign):
+        for target in node.targets:
+            if isinstance(target, ast.Name) and target.id == "FULL_COOLING_CURVES":
+                recovery_curve_map = node.value
+assert isinstance(recovery_curve_map, ast.Dict)
+assert len(recovery_curve_map.keys) == len(recovery_curve_map.values) == 1
+assert ast.literal_eval(recovery_curve_map.keys[0]) == "candidate14"
+assert isinstance(recovery_curve_map.values[0], ast.Name)
+assert recovery_curve_map.values[0].id == "DEFAULT"
 print("profile constants: OK")
+PY
+
+python3 - <<'PY'
+from pathlib import Path
+
+primary = Path("systemd/msi-fan-profile.service").read_text(encoding="utf-8")
+keeper = Path("systemd/msi-fan-profile-keeper.service").read_text(encoding="utf-8")
+assert "OnFailure=msi-fan-profile-keeper.service" in primary
+assert "Restart=no" in primary
+for setting in (
+    "Conflicts=msi-fan-profile.service",
+    "Before=msi-fan-profile.service",
+    "ExecStart=/usr/local/libexec/msi-gpu-recover --keeper candidate14",
+    "Restart=on-failure",
+    "WatchdogSec=5s",
+):
+    assert setting in keeper, setting
+assert "[Install]" not in keeper
+print("failure keeper unit: OK")
 PY
 
 sha256sum -c SHA256SUMS >/dev/null

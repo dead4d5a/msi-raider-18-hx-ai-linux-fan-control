@@ -85,10 +85,15 @@ GPU load was accepted. The final calibration harness used:
 - hotter-of-sensor thermal decisions;
 - physical fan-stall detection;
 - exact profile readback on every sample;
-- root `ExecStopPost` factory recovery.
+- root `ExecStopPost` recovery.
 
-Forced-kill and marker-race tests proved that a failed service restored factory
-auto with Cooler Boost on and did not leave a workload alive.
+At that stage, forced-kill and marker-race tests proved that a failed service
+restored factory auto with Cooler Boost on and did not leave a workload alive.
+That factory-fallback policy was later replaced by Candidate 14/`advanced` plus
+Boost-on runtime recovery. Its attended forced-`SIGKILL` validation completed
+on 2026-09-26. The production policy now keeps invalid EC/WMI telemetry in a
+visible full-cooling state and uses a separate failure keeper for genuine daemon
+faults; final attended validation remains listed in `VALIDATION.md`.
 
 The production daemon retains the same conservative philosophy but does not
 install or run synthetic calibration workloads.

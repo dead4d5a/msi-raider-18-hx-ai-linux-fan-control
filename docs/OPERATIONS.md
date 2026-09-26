@@ -18,8 +18,12 @@ sudo msi-fan-profile apply-default
 ```
 
 This persistently enables the service and verifies the exact curve and advanced
-mode. If the transition fails, it disables the service and prefers factory auto
-with Cooler Boost on.
+mode. A manager setup failure before it attempts service start disables the
+service and prefers factory auto with Cooler Boost on. Once service start has
+been attempted, the manager does not overwrite a failed service's runtime
+recovery: it stops any failure keeper, then returns Candidate 14 to the managed
+daemon. A runtime fault otherwise retains Candidate 14 in `advanced` mode with
+Cooler Boost on.
 
 ## Temporary maximum cooling
 
@@ -67,16 +71,39 @@ Run `apply-default` to return without rebooting.
 sudo journalctl -u msi-fan-profile.service -b --no-pager
 ```
 
-On a service failure, verify:
+On a runtime service failure, `ExecStopPost` first attempts the following state:
 
 ```text
-fan_mode=auto
-factory curve restored
+fan_mode=advanced
+Candidate 14 curve present
 cooler_boost=on
+both fans >= 3,000 RPM when valid WMI telemetry is available
 ```
 
-The service intentionally does not restart after failure. Inspect the cause,
-wait for cooldown, and use `apply-default` only after resolving it.
+The failed primary remains visible (`Restart=no`), but its `OnFailure` keeper
+then holds the shared fan lock and continuously reasserts the same Candidate
+14/`advanced`/Boost state. If the WMI RPM channels are invalid, it reports Boost
+requested without claiming physical verification. It does not deliberately
+restore the factory curve or release Boost for a runtime fault. Inspect both
+units before using `apply-default`:
+
+```bash
+sudo systemctl status msi-fan-profile.service msi-fan-profile-keeper.service
+```
+
+## Degraded telemetry
+
+Malformed, nonnumeric, or out-of-range temperature/RPM telemetry—including the
+EC CPU `255°C` sentinel—enters a non-expiring degraded state rather than a
+factory fallback or daemon failure. Candidate 14 stays in `advanced` mode,
+Cooler Boost is reasserted if switched off, and systemd status continues to show
+the elapsed degraded interval. The journal logs the transition immediately and
+rate-limits continuing warnings.
+
+One complete valid sample does not by itself resume release logic. Both physical
+fans must verify under Boost first; invalid RPM telemetry remains unverified and
+keeps maximum cooling latched. After that verification, the usual 30
+continuously valid, cool seconds are required before automatic release.
 
 ## Sustained high heat
 
@@ -84,8 +111,8 @@ After 15 seconds of an alarm with Cooler Boost physically verified, the service
 remains active rather than failing. `systemctl status msi-fan-profile.service`
 will report a sustained safety alarm, and the journal records the triggering
 temperature/fan condition. An automatically latched Cooler Boost releases only
-after the existing 30-second monitored cool interval; a manual Boost latch
-continues to use its separately requested, monitored release path.
+after 30 continuously valid, cool seconds; a manual Boost latch continues to
+use its separately requested, monitored release path.
 
 Stop or reduce the workload if this occurs. This fan-only controller cannot
 guarantee a CPU temperature below the mid-90s under every sustained workload;

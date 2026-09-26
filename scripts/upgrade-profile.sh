@@ -4,6 +4,7 @@ set -Eeuo pipefail
 
 repo=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 service=msi-fan-profile.service
+keeper=msi-fan-profile-keeper.service
 manager=/usr/local/sbin/msi-fan-profile
 marker=/run/msi-fan-profile.factory-auto
 base=/sys/devices/platform/msi-ec
@@ -26,6 +27,7 @@ source_files=(
   "$repo/src/msi-fan-profiled"
   "$repo/src/msi-gpu-recover"
   "$repo/systemd/msi-fan-profile.service"
+  "$repo/systemd/msi-fan-profile-keeper.service"
   "$repo/tmpfiles/msi-fan-profile.conf"
   "$repo/README.md"
   "$repo/docs/OPERATIONS.md"
@@ -36,13 +38,14 @@ target_files=(
   /usr/local/libexec/msi-fan-profiled
   /usr/local/libexec/msi-gpu-recover
   /etc/systemd/system/msi-fan-profile.service
+  /etc/systemd/system/msi-fan-profile-keeper.service
   /etc/tmpfiles.d/msi-fan-profile.conf
   /usr/local/share/doc/msi-fan-profile/README.md
   /usr/local/share/doc/msi-fan-profile/OPERATIONS.md
   /usr/local/share/doc/msi-fan-profile/SAFETY.md
 )
-modes=(0755 0755 0755 0644 0644 0644 0644 0644)
-must_exist=(yes yes yes yes yes no no no)
+modes=(0755 0755 0755 0644 0644 0644 0644 0644 0644)
+must_exist=(yes yes yes yes no yes no no no)
 record_target=/usr/local/share/doc/msi-fan-profile/INSTALL_RECORD
 
 for index in "${!source_files[@]}"; do
@@ -100,6 +103,8 @@ done
 # A reload clears stale manager metadata before the old manager takes the
 # controller to its guarded factory-auto state.
 systemctl daemon-reload
+systemctl stop "$keeper" 2>/dev/null || true
+systemctl reset-failed "$keeper" 2>/dev/null || true
 "$manager" factory-auto
 systemctl disable "$service"
 systemctl stop "$service" 2>/dev/null || true
@@ -137,7 +142,8 @@ done
 systemd-tmpfiles --create /etc/tmpfiles.d/msi-fan-profile.conf
 [[ $(stat -c '%U:%G:%a' /run/msi-fanctl.lock) == root:root:600 ]]
 [[ $(stat -c '%U:%G:%a' /run/msi-fan-profile-manager.lock) == root:root:600 ]]
-systemd-analyze verify /etc/systemd/system/msi-fan-profile.service
+systemd-analyze verify /etc/systemd/system/msi-fan-profile.service \
+  /etc/systemd/system/msi-fan-profile-keeper.service
 systemctl daemon-reload
 [[ $(systemctl show "$service" -p NeedDaemonReload --value) == no ]]
 
@@ -167,7 +173,7 @@ fi
 install -o root -g root -m 0644 "$stage/INSTALL_RECORD" "$record_target"
 
 # Activate only through the new manager, which verifies Candidate14's complete
-# invariant and returns to factory-auto/Boost-on if activation cannot be proved.
+# invariant and leaves post-start runtime recovery untouched if activation fails.
 systemctl enable "$service"
 [[ $(systemctl is-enabled "$service") == enabled ]]
 enabled_for_startup=1

@@ -40,9 +40,21 @@ firmware. Related model names alone are not sufficient evidence of compatibility
 - Holds physically verified Cooler Boost and remains active during a sustained
   safety alarm; it reports that degraded maximum-cooling state instead of
   treating high temperature alone as a service failure.
+- Treats malformed or implausible telemetry, including the EC's raw `255°C`
+  sentinel, as a non-expiring degraded-telemetry state: Candidate 14 stays
+  active, Cooler Boost is latched and reasserted, and release is blocked until
+  complete valid telemetry and physical fan verification return.
 - Preserves temporary Cooler Boost overrides.
 - Restores the captured factory curve and firmware `auto` mode on clean stop.
-- On failure, restores factory `auto` and deliberately leaves Cooler Boost on.
+- On a runtime fault with immutable identity still verified, retains Candidate 14
+  in `advanced` mode and deliberately leaves Cooler Boost on; a separate,
+  watchdog-protected failure keeper continues to reassert that state until an
+  operator starts the controller again. It records physical fan verification
+  only when valid WMI RPM telemetry is available.
+
+The factory curve is used only for an explicit `factory-auto` request, a clean
+service stop, a manager setup failure before it attempts service start, or an
+attended installation/upgrade transition. It is not the runtime-fault fallback.
 
 It does **not** expose arbitrary EC addresses, `ec_sys` write access, debug mode,
 generic custom curves, silent mode, or shift-mode changes.
@@ -115,7 +127,8 @@ Completed:
 - Driver and curve readback
 - Physical two-fan response
 - Clean start/stop and boot persistence
-- Forced process kill and factory recovery
+- Forced `SIGKILL` recovery to Candidate 14/`advanced` with Cooler Boost on
+  and both physical fans verified
 - Runtime factory override and start-race protection
 - Acknowledged Cooler Boost and 30-second cool release
 - Idle, CPU-only, GPU-only, combined, and 180-second soak tests
@@ -124,6 +137,8 @@ Pending:
 
 - One final attended suspend/resume validation of forced profile reapplication
   on the exact tested laptop. The daemon already implements and logs this path.
+- Attended EC-sentinel degraded-telemetry validation and a primary-fault keeper
+  handoff/restart validation.
 
 See [Validation status](docs/VALIDATION.md).
 

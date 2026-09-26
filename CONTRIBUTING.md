@@ -29,7 +29,7 @@ A support pull request should include:
 5. Transactional write/readback/rollback behavior.
 6. Physical two-fan RPM validation.
 7. Idle, CPU, GPU, and combined measurements.
-8. Failure injection and factory recovery.
+8. Failure injection and full-cooling runtime recovery.
 9. Reboot and suspend/resume validation.
 10. Documentation that clearly separates tested and untested variants.
 

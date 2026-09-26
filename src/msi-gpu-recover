@@ -1,14 +1,17 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
-"""Root-owned ExecStopPost fail-safe for MSI GPU calibration services."""
+"""Root-owned ExecStopPost recovery for the exact MSI Candidate14 service."""
 from __future__ import annotations
 
 import fcntl
 import os
 import pathlib
+import signal
+import socket
 import stat
 import sys
 import time
+from typing import Callable
 
 BASE = pathlib.Path("/sys/devices/platform/msi-ec")
 LOCK = pathlib.Path("/run/msi-fanctl.lock")
@@ -16,11 +19,25 @@ FACTORY = (
     "58 64 70 76 82 88 0 25 35 44 58 70 75 "
     "52 58 64 70 76 82 0 25 35 44 58 70 75"
 )
+DEFAULT = (
+    "50 60 70 76 82 88 20 30 40 50 60 80 110 "
+    "38 40 42 44 55 70 20 30 40 60 70 100 120"
+)
+FULL_COOLING_CURVES = {"candidate14": DEFAULT}
+STOP = False
+KEEPER_VERIFY_INTERVAL_SECONDS = 60.0
 
 
 def read(path: pathlib.Path) -> str:
     with path.open("r", encoding="ascii") as stream:
         return stream.read().strip()
+
+
+def read_uint(path: pathlib.Path) -> int:
+    value = read(path)
+    if not value.isascii() or not value.isdecimal():
+        raise RuntimeError(f"nonnumeric sensor {path}: {value!r}")
+    return int(value)
 
 
 def write(path: pathlib.Path, value: str) -> None:
@@ -29,6 +46,8 @@ def write(path: pathlib.Path, value: str) -> None:
     with path.open("w", encoding="ascii") as stream:
         stream.write(value + "\n")
         stream.flush()
+    if read(path) != value:
+        raise RuntimeError(f"recovery readback mismatch for {path.name}")
 
 
 def identity_safe_for_curve_write() -> bool:
@@ -43,25 +62,87 @@ def identity_safe_for_curve_write() -> bool:
     if pathlib.Path("/sys/module/ec_sys").exists():
         return False
     try:
-        return all(read(path) == wanted for path, wanted in expected.items()) and (BASE / "fan_curve").exists()
+        return (all(read(path) == wanted for path, wanted in expected.items()) and
+                (BASE / "fan_curve").exists())
     except Exception:
         return False
 
 
-def release_boost_if_cool() -> bool:
+def one_hwmon(name: str) -> pathlib.Path:
+    matches = []
+    for path in pathlib.Path("/sys/class/hwmon").glob("hwmon*"):
+        try:
+            if read(path / "name") == name:
+                matches.append(path)
+        except OSError:
+            continue
+    if len(matches) != 1:
+        raise RuntimeError(f"expected one {name} hwmon; found {len(matches)}")
+    return matches[0]
+
+
+def notify(message: str) -> None:
+    address = os.environ.get("NOTIFY_SOCKET")
+    if not address:
+        raise RuntimeError("NOTIFY_SOCKET is absent")
+    if address.startswith("@"):
+        address = "\0" + address[1:]
+    with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as sock:
+        sock.settimeout(0.5)
+        sock.connect(address)
+        sock.sendall(message.encode("utf-8"))
+
+
+def verify_boost(wmi: pathlib.Path,
+                 heartbeat: Callable[[str], None] | None = None) -> bool:
+    """Prove that both physical fans reached a plausible maximum RPM."""
+    last: str | None = None
+    for _ in range(12):
+        try:
+            fan1 = read_uint(wmi / "fan1_input")
+            fan2 = read_uint(wmi / "fan2_input")
+        except Exception as error:
+            last = f"invalid fan telemetry: {error}"
+            if heartbeat is not None:
+                heartbeat(f"Recovery keeper: {last}")
+            time.sleep(1)
+            continue
+        if not (0 <= fan1 <= 10000 and 0 <= fan2 <= 10000):
+            last = f"implausible fan telemetry: {fan1}/{fan2} RPM"
+            if heartbeat is not None:
+                heartbeat(f"Recovery keeper: {last}")
+            time.sleep(1)
+            continue
+        last = f"{fan1}/{fan2} RPM"
+        if heartbeat is not None:
+            heartbeat(f"Recovery keeper: verifying fans {last}")
+        if 3000 <= fan1 <= 10000 and 3000 <= fan2 <= 10000:
+            return True
+        time.sleep(1)
+    print(f"recovery Cooler Boost did not verify plausible RPM: {last}",
+          file=sys.stderr)
+    return False
+
+
+def request_boost_best_effort() -> None:
+    """Request full fan speed without ever bypassing identity validation."""
     try:
-        matches = []
-        for path in pathlib.Path("/sys/class/hwmon").glob("hwmon*"):
-            try:
-                if read(path / "name") == "coretemp":
-                    matches.append(path)
-            except OSError:
-                continue
-        if len(matches) != 1:
+        if read(BASE / "cooler_boost") != "on":
+            write(BASE / "cooler_boost", "on")
+    except Exception as error:
+        print(f"recovery could not request Cooler Boost: {error}", file=sys.stderr)
+
+
+def release_boost_if_cool() -> bool:
+    """Complete an intentional clean-stop factory transition only when cool."""
+    try:
+        core = one_hwmon("coretemp")
+        package = read_uint(core / "temp1_input")
+        ec_cpu = read_uint(BASE / "cpu/realtime_temperature")
+        gpu = read_uint(BASE / "gpu/realtime_temperature")
+        if not (0 <= package <= 110000 and 0 <= ec_cpu <= 110 and
+                0 <= gpu <= 110):
             return False
-        package = int(read(matches[0] / "temp1_input"))
-        ec_cpu = int(read(BASE / "cpu/realtime_temperature"))
-        gpu = int(read(BASE / "gpu/realtime_temperature"))
         if not (max(package, ec_cpu * 1000) < 85000 and
                 (gpu == 0 or gpu < 70)):
             return False
@@ -77,116 +158,233 @@ def release_boost_if_cool() -> bool:
         return False
     except Exception as error:
         print(f"Boost release failed: {error}", file=sys.stderr)
-        try:
-            write(BASE / "cooler_boost", "on")
-        except Exception:
-            pass
+        request_boost_best_effort()
         return False
 
 
-def attempt_all() -> bool:
-    success = True
-    for path, value in (
-        (BASE / "cooler_boost", "on"),
-        (BASE / "fan_mode", "auto"),
-        (BASE / "fan_curve", FACTORY),
-        (BASE / "cooler_boost", "on"),
-    ):
-        try:
-            write(path, value)
-        except Exception as error:
-            success = False
-            print(f"recovery write failed {path}: {error}", file=sys.stderr)
+def stage_full_cooling(profile: str) -> None:
+    """Establish Candidate14/advanced/Boost-on without depending on WMI RPM."""
+    curve = FULL_COOLING_CURVES.get(profile)
+    if curve is None:
+        raise RuntimeError(f"no exact full-cooling curve for profile {profile!r}")
+    if not identity_safe_for_curve_write():
+        raise RuntimeError("exact recovery identity/ABI check failed")
+    # Assert maximum cooling before WMI discovery. An unavailable RPM channel
+    # can limit physical verification, but must never delay the Boost request.
+    write(BASE / "cooler_boost", "on")
+    mode = read(BASE / "fan_mode")
+    current = read(BASE / "fan_curve")
+    if current == curve and mode == "advanced":
+        if read(BASE / "cooler_boost") != "on":
+            raise RuntimeError("full-cooling Boost readback failed")
+        return
+    # This is the same safe transactional ordering used by the daemon.
+    write(BASE / "fan_mode", "auto")
+    write(BASE / "fan_curve", curve)
+    if (read(BASE / "fan_mode") != "auto" or
+            read(BASE / "fan_curve") != curve or
+            read(BASE / "cooler_boost") != "on"):
+        raise RuntimeError("full-cooling curve transaction verification failed")
+    write(BASE / "fan_mode", "advanced")
+    if (read(BASE / "fan_mode") != "advanced" or
+            read(BASE / "fan_curve") != curve or
+            read(BASE / "cooler_boost") != "on"):
+        raise RuntimeError("full-cooling final readback failed")
+
+
+def attempt_full_cooling(profile: str) -> bool:
+    """Establish Candidate14/advanced/Boost-on after a non-clean service exit."""
     try:
-        success &= read(BASE / "fan_mode") == "auto"
-        success &= read(BASE / "fan_curve") == FACTORY
-        success &= read(BASE / "cooler_boost") == "on"
+        stage_full_cooling(profile)
+        wmi = one_hwmon("msi_wmi_platform")
+        if verify_boost(wmi):
+            return True
+        print("full-cooling RPM verification failed; retaining Boost request",
+              file=sys.stderr)
     except Exception as error:
-        success = False
-        print(f"recovery readback failed: {error}", file=sys.stderr)
-    return bool(success)
+        print(f"full-cooling recovery failed: {error}", file=sys.stderr)
+    # Even if WMI cannot prove RPM, never overwrite the selected curve with the
+    # factory curve on a runtime fault. Re-request Boost when that is safe.
+    request_boost_best_effort()
+    return False
 
 
-def main() -> int:
-    if os.geteuid() != 0:
-        print("root required", file=sys.stderr)
-        return 1
-    service_result = os.environ.get("SERVICE_RESULT", "unknown")
-    exit_code = os.environ.get("EXIT_CODE", "unknown")
-    exit_status = os.environ.get("EXIT_STATUS", "unknown")
-    if len(sys.argv) != 2 or sys.argv[1] not in ("auto", "candidate5b", "candidate12", "candidate13", "candidate14"):
-        print("FATAL: recovery requires a fixed enumerated profile argument", file=sys.stderr)
-        return 1
-    profile = sys.argv[1]
-    if os.environ.get("MSI_CALIBRATION_PROFILE") != profile:
-        print("FATAL: recovery profile argument/environment mismatch", file=sys.stderr)
-        return 1
-    print(
-        f"recovery invoked profile={profile} service_result={service_result} "
-        f"exit_code={exit_code} exit_status={exit_status}",
-        file=sys.stderr,
-    )
-    success_result = service_result == "success" and exit_code == "exited" and exit_status == "0"
+def acquire_lock(timeout_seconds: float = 12.0) -> int:
+    info = LOCK.stat()
+    if (not stat.S_ISREG(info.st_mode) or info.st_uid != 0 or
+            stat.S_IMODE(info.st_mode) != 0o600):
+        raise RuntimeError("unsafe fan-control lock")
+    descriptor = os.open(LOCK, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    deadline = time.monotonic() + timeout_seconds
     try:
-        info = LOCK.stat()
-        if not stat.S_ISREG(info.st_mode) or info.st_uid != 0:
-            raise RuntimeError("unsafe fan-control lock")
-        descriptor = os.open(LOCK, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
-        deadline = time.monotonic() + 12.0
         while True:
             try:
                 fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                break
+                return descriptor
             except BlockingIOError:
                 if time.monotonic() >= deadline:
                     raise TimeoutError("fan-control lock remained busy")
                 time.sleep(0.05)
-    except Exception as error:
-        print(f"FATAL: recovery lock unavailable; no unlocked write attempted: {error}", file=sys.stderr)
-        return 1
-    # No model-specific control operation is permitted before exact ABI and
-    # immutable hardware identity validation.
+    except Exception:
+        os.close(descriptor)
+        raise
+
+
+def keeper_heartbeat(status: str) -> None:
+    notify(f"WATCHDOG=1\nSTATUS={status}")
+
+
+def keeper_repair(profile: str) -> str:
+    """Reassert a drifted recovery state without needlessly rewriting its curve."""
+    curve = FULL_COOLING_CURVES[profile]
     if not identity_safe_for_curve_write():
-        print("FATAL: exact recovery identity/ABI check failed; no curve write attempted", file=sys.stderr)
+        raise RuntimeError("exact recovery identity/ABI check failed")
+    current_curve = read(BASE / "fan_curve")
+    mode = read(BASE / "fan_mode")
+    boost = read(BASE / "cooler_boost")
+    if current_curve != curve or mode != "advanced":
+        stage_full_cooling(profile)
+        return "Candidate14/advanced restaged with Cooler Boost on"
+    if boost != "on":
+        write(BASE / "cooler_boost", "on")
+        return "Cooler Boost reasserted"
+    return "Candidate14/advanced with Cooler Boost on"
+
+
+def run_keeper(profile: str) -> int:
+    """Keep full cooling asserted after a failed daemon until an operator restarts it."""
+    global STOP
+    try:
+        stage_full_cooling(profile)
+    except Exception as error:
+        print(f"FATAL: recovery keeper could not establish full cooling: {error}",
+              file=sys.stderr)
+        request_boost_best_effort()
         return 1
-    if success_result:
+    keeper_heartbeat("Candidate14 recovery keeper active; Cooler Boost requested")
+    notify("READY=1\nWATCHDOG=1\nSTATUS=Candidate14 recovery keeper active; Cooler Boost on")
+    print("recovery keeper active; Candidate14/advanced and Cooler Boost will remain asserted",
+          file=sys.stderr)
+    last_verify = float("-inf")
+    while not STOP:
+        started = time.monotonic()
         try:
-            if (read(BASE / "fan_mode") == "auto" and
-                    read(BASE / "fan_curve") == FACTORY and
-                    read(BASE / "cooler_boost") == "off"):
-                if release_boost_if_cool():
-                    print(f"successful {profile} service left thermally verified factory auto/off", file=sys.stderr)
-                    return 0
-                write(BASE / "cooler_boost", "on")
-                print("successful service ended factory auto/off while too hot; Boost re-enabled", file=sys.stderr)
-                return 1
+            state = keeper_repair(profile)
         except Exception as error:
-            print(f"success-state verification failed: {error}", file=sys.stderr)
+            print(f"FATAL: recovery keeper control repair failed: {error}",
+                  file=sys.stderr)
+            request_boost_best_effort()
+            return 1
+        keeper_heartbeat(state)
+        if started - last_verify >= KEEPER_VERIFY_INTERVAL_SECONDS:
             try:
-                write(BASE / "cooler_boost", "on")
-            except Exception:
-                pass
-    # Candidate success, failure, timeout, watchdog, signal, or state mismatch.
-    recovered = False
-    for attempt in range(1, 4):
-        if attempt_all():
-            print(f"recovery verified on attempt {attempt}; Boost remains on", file=sys.stderr)
-            recovered = True
-            break
-        time.sleep(0.2)
-    if not recovered:
-        print("FATAL: recovery could not be verified; Boost was repeatedly requested", file=sys.stderr)
-        return 1
-    if success_result and profile in ("candidate5b", "candidate12", "candidate13", "candidate14"):
-        if release_boost_if_cool():
-            print("successful candidate service restored verified factory auto/off", file=sys.stderr)
-            return 0
-        print("candidate restored to factory but Boost release was unsafe; marking service failed", file=sys.stderr)
-        return 1
-    if success_result:
-        print("post-success auto state mismatch mitigated; marking service failed", file=sys.stderr)
-        return 1
+                wmi = one_hwmon("msi_wmi_platform")
+            except Exception as error:
+                print(f"recovery keeper fan telemetry unavailable: {error}",
+                      file=sys.stderr)
+            else:
+                if verify_boost(wmi, keeper_heartbeat):
+                    print("recovery keeper physically verified Cooler Boost",
+                          file=sys.stderr)
+                else:
+                    print("recovery keeper retains Cooler Boost; physical RPM remains unverified",
+                          file=sys.stderr)
+            last_verify = time.monotonic()
+        delay = 1 - (time.monotonic() - started)
+        if delay > 0:
+            time.sleep(delay)
+    print("recovery keeper stopped by operator; leaving full-cooling state intact",
+          file=sys.stderr)
+    notify("STOPPING=1\nSTATUS=Recovery keeper stopped; full cooling retained")
     return 0
+
+
+def on_stop(_number: int, _frame: object) -> None:
+    global STOP
+    STOP = True
+
+
+def main() -> int:
+    global STOP
+    if os.geteuid() != 0:
+        print("root required", file=sys.stderr)
+        return 1
+    keeper_mode = len(sys.argv) == 3 and sys.argv[1] == "--keeper"
+    if keeper_mode:
+        profile = sys.argv[2]
+    elif len(sys.argv) == 2:
+        profile = sys.argv[1]
+    else:
+        print("FATAL: recovery requires candidate14 or --keeper candidate14",
+              file=sys.stderr)
+        return 1
+    if profile != "candidate14":
+        print("FATAL: recovery requires the exact candidate14 profile argument",
+              file=sys.stderr)
+        return 1
+    if os.environ.get("MSI_CALIBRATION_PROFILE") != profile:
+        print("FATAL: recovery profile argument/environment mismatch", file=sys.stderr)
+        return 1
+    if keeper_mode:
+        signal.signal(signal.SIGTERM, on_stop)
+        signal.signal(signal.SIGINT, on_stop)
+        signal.signal(signal.SIGHUP, on_stop)
+        STOP = False
+        print(f"recovery keeper invoked profile={profile}", file=sys.stderr)
+    else:
+        service_result = os.environ.get("SERVICE_RESULT", "unknown")
+        exit_code = os.environ.get("EXIT_CODE", "unknown")
+        exit_status = os.environ.get("EXIT_STATUS", "unknown")
+        print(
+            f"recovery invoked profile={profile} service_result={service_result} "
+            f"exit_code={exit_code} exit_status={exit_status}",
+            file=sys.stderr,
+        )
+    try:
+        descriptor = acquire_lock()
+    except Exception as error:
+        print("FATAL: recovery lock unavailable; no unlocked write attempted: "
+              f"{error}", file=sys.stderr)
+        return 1
+    try:
+        # No model-specific control operation is permitted before exact ABI and
+        # immutable hardware identity validation.
+        if not identity_safe_for_curve_write():
+            print("FATAL: exact recovery identity/ABI check failed; no curve write "
+                  "attempted", file=sys.stderr)
+            return 1
+        if keeper_mode:
+            return run_keeper(profile)
+
+        success_result = (service_result == "success" and
+                          exit_code == "exited" and exit_status == "0")
+        if success_result:
+            try:
+                if (read(BASE / "fan_mode") == "auto" and
+                        read(BASE / "fan_curve") == FACTORY and
+                        read(BASE / "cooler_boost") == "off"):
+                    if release_boost_if_cool():
+                        print(f"successful {profile} service left thermally verified "
+                              "factory auto/off", file=sys.stderr)
+                        return 0
+                    request_boost_best_effort()
+                    print("successful service ended factory auto/off while too hot; "
+                          "Boost re-enabled", file=sys.stderr)
+                    return 1
+            except Exception as error:
+                print(f"success-state verification failed: {error}", file=sys.stderr)
+
+        # A failure, timeout, watchdog, signal, or unexpected clean-stop state
+        # keeps the selected exact curve and maximum cooling instead of factory auto.
+        if attempt_full_cooling(profile):
+            print("runtime recovery verified Candidate14/advanced with Cooler Boost on",
+                  file=sys.stderr)
+            return 1 if success_result else 0
+        print("FATAL: full-cooling recovery could not be physically verified; "
+              "Cooler Boost was requested without a factory fallback", file=sys.stderr)
+        return 1
+    finally:
+        os.close(descriptor)
 
 
 if __name__ == "__main__":

@@ -26,12 +26,18 @@ else
 fi
 systemctl disable msi-fan-profile.service
 [[ $(systemctl is-enabled msi-fan-profile.service 2>/dev/null || true) == disabled ]]
+systemctl stop msi-fan-profile-keeper.service 2>/dev/null || true
+systemctl reset-failed msi-fan-profile-keeper.service 2>/dev/null || true
 systemctl stop msi-fan-profile.service 2>/dev/null || true
 systemctl reset-failed msi-fan-profile.service 2>/dev/null || true
 [[ $(systemctl show msi-fan-profile.service -p ActiveState --value) == inactive ]]
 [[ $(systemctl show msi-fan-profile.service -p SubState --value) == dead ]]
 [[ $(systemctl show msi-fan-profile.service -p MainPID --value) == 0 ]]
 [[ -z $(systemctl show msi-fan-profile.service -p Job --value) ]]
+[[ $(systemctl show msi-fan-profile-keeper.service -p ActiveState --value) == inactive ]]
+[[ $(systemctl show msi-fan-profile-keeper.service -p SubState --value) == dead ]]
+[[ $(systemctl show msi-fan-profile-keeper.service -p MainPID --value) == 0 ]]
+[[ -z $(systemctl show msi-fan-profile-keeper.service -p Job --value) ]]
 
 # The daemon has exited and released the fan lock.
 exec 8</run/msi-fanctl.lock
@@ -81,6 +87,7 @@ if [[ $(cat "$base/fan_mode" 2>/dev/null) != auto ||
 fi
 
 rm -f /etc/systemd/system/msi-fan-profile.service
+rm -f /etc/systemd/system/msi-fan-profile-keeper.service
 rm -f /etc/tmpfiles.d/msi-fan-profile.conf
 rm -f /usr/local/sbin/msi-fan-profile
 rm -f /usr/local/libexec/msi-fan-profiled

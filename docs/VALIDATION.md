@@ -15,7 +15,8 @@
 - 180-second combined Candidate 14 soak.
 - Clean service start/stop.
 - systemd watchdog progression.
-- Forced `SIGKILL` recovery to factory auto + Boost on.
+- Forced `SIGKILL` recovery to Candidate 14/`advanced` with Cooler Boost on
+  and both physical fans verified on 2026-09-26.
 - Runtime factory override and direct-start refusal.
 - Daemon detection of a marker appearing after service start.
 - Manager acknowledgement for Boost-on and 30-second cool release.
@@ -25,6 +26,11 @@
 
 - Final attended suspend/resume test confirming the daemon logs a resume event,
   forcibly reprograms Candidate 14, and preserves watchdog service health.
+- Attended EC telemetry-sentinel test confirming degraded mode remains active,
+  Boost stays latched, and valid telemetry resumes the physical-verification
+  path without a primary-service failure.
+- Attended primary-service fault test confirming the failure keeper reasserts
+  Candidate 14/`advanced`/Boost and yields cleanly to `apply-default`.
 
 The implementation already uses a suspend-time discontinuity between
 `CLOCK_BOOTTIME` and monotonic time and forces a full safe reapply. Until the

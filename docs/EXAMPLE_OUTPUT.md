@@ -71,18 +71,36 @@ $ systemctl status msi-fan-profile.service
 
 ## Failure behavior
 
-After a watchdog, identity, curve, fan-response, or service failure, the intended
-state is deliberately noisy:
+After a watchdog, curve, fan-response, or other service failure on an
+identity-verified system, the intended runtime-fault recovery state is
+deliberately noisy:
 
 ```text
 service:       failed (Restart=no)
-curve:         factory
-fan mode:      auto
+keeper:        active (full-cooling keeper)
+curve:         candidate14
+fan mode:      advanced
 Cooler Boost:  on
+fan RPM:       physically verified when valid WMI telemetry is available
 ```
+
+If WMI RPM telemetry is invalid, the recovery log says that it could not certify
+physical RPM; it still does not intentionally restore the factory curve for the
+runtime fault. An identity mismatch is different: recovery makes no
+model-specific write because it cannot safely establish the exact hardware.
 
 Inspect logs before releasing Boost:
 
 ```bash
 sudo journalctl -u msi-fan-profile.service -b --no-pager
 ```
+
+## Degraded telemetry
+
+An implausible temperature or RPM snapshot does not immediately select factory
+mode. It reports a non-expiring degraded-telemetry state, keeps Candidate
+14/`advanced`, and latches Cooler Boost until complete valid telemetry and
+physical fan verification return. An automatic latch still requires 30
+continuously valid, cool seconds before release. A separate keeper handles only
+genuine daemon faults and continues to reassert full cooling while the primary
+failure remains visible.
