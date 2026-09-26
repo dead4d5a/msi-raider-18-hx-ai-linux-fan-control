@@ -480,5 +480,156 @@ class SensorHoldMainLoopTests(unittest.TestCase):
                             for item in notifications))
 
 
+class RecoveryHandoffMainLoopTests(unittest.TestCase):
+    def run_startup(self, recovery_latched):
+        class Clock:
+            now = 0.0
+
+            def monotonic(self):
+                return self.now
+
+            def boottime(self, _clock_id):
+                return self.now
+
+            def sleep(self, seconds):
+                self.now += seconds
+                if self.now >= 33.0:
+                    DAEMON.STOP = True
+
+        class Lock:
+            @staticmethod
+            def stat():
+                return types.SimpleNamespace(
+                    st_mode=DAEMON.stat.S_IFREG | 0o600, st_uid=0, st_gid=0)
+
+        class MissingOverride:
+            @staticmethod
+            def lstat():
+                raise FileNotFoundError
+
+        clock = Clock()
+        state = {"curve": DAEMON.DEFAULT, "mode": "advanced", "boost": "on"}
+        writes = []
+        preserves = []
+        events = []
+
+        def fake_read(path):
+            text = str(path)
+            if text == "/proc/self/cgroup":
+                return "0::/system.slice/msi-fan-profile.service"
+            if text.endswith("fan_curve"):
+                return state["curve"]
+            if text.endswith("fan_mode"):
+                return state["mode"]
+            if text.endswith("cooler_boost"):
+                return state["boost"]
+            raise AssertionError(f"unexpected text read: {text}")
+
+        def fake_write(path, value):
+            self.assertTrue(str(path).endswith("cooler_boost"))
+            writes.append((clock.now, value))
+            state["boost"] = value
+
+        def fake_apply(_wmi, preserve_boost, _heartbeat):
+            events.append("apply")
+            preserves.append(preserve_boost)
+            state["curve"] = DAEMON.DEFAULT
+            state["mode"] = "advanced"
+            state["boost"] = "on" if preserve_boost else "off"
+            return True
+
+        original_stop = DAEMON.STOP
+        original_boost_request = DAEMON.BOOST_REQUEST
+        original_release_request = DAEMON.RELEASE_REQUEST
+        DAEMON.STOP = False
+        DAEMON.BOOST_REQUEST = False
+        DAEMON.RELEASE_REQUEST = False
+        try:
+            with contextlib.ExitStack() as stack:
+                stack.enter_context(
+                    mock.patch.object(DAEMON, "BASE", pathlib.Path("/fake/ec")))
+                stack.enter_context(mock.patch.object(DAEMON, "LOCK", Lock()))
+                stack.enter_context(
+                    mock.patch.object(DAEMON, "OVERRIDE", MissingOverride()))
+                stack.enter_context(
+                    mock.patch.object(
+                        DAEMON, "recovery_latch_present", return_value=recovery_latched))
+                def fake_consume():
+                    events.append("consume")
+                    return recovery_latched
+
+                consume = stack.enter_context(mock.patch.object(
+                    DAEMON, "consume_recovery_latch", side_effect=fake_consume))
+                stack.enter_context(
+                    mock.patch.object(DAEMON, "read", side_effect=fake_read))
+                stack.enter_context(
+                    mock.patch.object(DAEMON, "write", side_effect=fake_write))
+                stack.enter_context(mock.patch.object(DAEMON, "require_policy_identity"))
+                stack.enter_context(mock.patch.object(
+                    DAEMON, "one_hwmon", side_effect=(
+                        pathlib.Path("/fake/wmi"), pathlib.Path("/fake/core"))))
+                stack.enter_context(mock.patch.object(
+                    DAEMON, "force_apply_default", side_effect=fake_apply))
+                stack.enter_context(mock.patch.object(
+                    DAEMON, "read_runtime_sample", return_value=
+                    DAEMON.RuntimeSample(50000, 50, 40, 4400, 4400)))
+                stack.enter_context(mock.patch.object(
+                    DAEMON, "restore_factory_envelope", return_value=True))
+                stack.enter_context(mock.patch.object(
+                    DAEMON, "release_factory_if_cool", return_value=True))
+                stack.enter_context(mock.patch.object(DAEMON, "notify"))
+                stack.enter_context(mock.patch.object(
+                    DAEMON.os, "geteuid", return_value=0))
+                stack.enter_context(mock.patch.object(DAEMON.os, "open", return_value=9))
+                stack.enter_context(mock.patch.object(DAEMON.os, "close"))
+                stack.enter_context(mock.patch.object(DAEMON.fcntl, "flock"))
+                stack.enter_context(mock.patch.object(
+                    DAEMON.time, "monotonic", side_effect=clock.monotonic))
+                stack.enter_context(mock.patch.object(
+                    DAEMON.time, "clock_gettime", side_effect=clock.boottime))
+                stack.enter_context(mock.patch.object(
+                    DAEMON.time, "sleep", side_effect=clock.sleep))
+                with contextlib.redirect_stderr(io.StringIO()):
+                    self.assertEqual(DAEMON.main(), 0)
+        finally:
+            DAEMON.STOP = original_stop
+            DAEMON.BOOST_REQUEST = original_boost_request
+            DAEMON.RELEASE_REQUEST = original_release_request
+
+        return state, writes, preserves, consume, events
+
+    def test_recovery_handoff_becomes_an_automatic_cooldown_latch(self):
+        state, writes, preserves, consume, events = self.run_startup(recovery_latched=True)
+
+        self.assertEqual(preserves, [True])
+        consume.assert_called_once_with()
+        self.assertEqual(events[:2], ["apply", "consume"])
+        self.assertEqual(writes, [(30.0, "off")])
+        self.assertEqual(state["boost"], "off")
+
+    def test_existing_manual_boost_is_not_released_without_the_recovery_marker(self):
+        state, writes, preserves, consume, events = self.run_startup(recovery_latched=False)
+
+        self.assertEqual(preserves, [True])
+        consume.assert_not_called()
+        self.assertEqual(events, ["apply"])
+        self.assertEqual(writes, [])
+        self.assertEqual(state["boost"], "on")
+
+
+class RecoveryLatchValidationTests(unittest.TestCase):
+    def test_unsafe_recovery_marker_fails_closed_before_opening_it(self):
+        unsafe = mock.Mock()
+        unsafe.lstat.return_value = types.SimpleNamespace(
+            st_mode=DAEMON.stat.S_IFLNK | 0o777, st_uid=0, st_gid=0, st_nlink=1)
+
+        with mock.patch.object(DAEMON, "RECOVERY_LATCH", unsafe), \
+                mock.patch.object(DAEMON.os, "open") as open_latch:
+            with self.assertRaisesRegex(DAEMON.ProfileError, "unsafe recovery Boost latch"):
+                DAEMON.recovery_latch_present()
+
+        open_latch.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()

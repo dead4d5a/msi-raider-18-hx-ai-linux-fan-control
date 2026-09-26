@@ -15,6 +15,8 @@ from typing import Callable
 
 BASE = pathlib.Path("/sys/devices/platform/msi-ec")
 LOCK = pathlib.Path("/run/msi-fanctl.lock")
+RECOVERY_LATCH = pathlib.Path("/run/msi-fan-profile.recovery-boost")
+RECOVERY_LATCH_PAYLOAD = b"candidate14\n"
 FACTORY = (
     "58 64 70 76 82 88 0 25 35 44 58 70 75 "
     "52 58 64 70 76 82 0 25 35 44 58 70 75"
@@ -133,6 +135,65 @@ def request_boost_best_effort() -> None:
         print(f"recovery could not request Cooler Boost: {error}", file=sys.stderr)
 
 
+def recovery_latch_present() -> bool:
+    """Return whether a securely-created recovery Boost handoff is pending."""
+    try:
+        info = RECOVERY_LATCH.lstat()
+    except FileNotFoundError:
+        return False
+    if (not stat.S_ISREG(info.st_mode) or info.st_uid != 0 or
+            info.st_gid != 0 or stat.S_IMODE(info.st_mode) != 0o600 or
+            info.st_nlink != 1):
+        raise RuntimeError("unsafe recovery Boost latch")
+    descriptor = os.open(RECOVERY_LATCH, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    try:
+        pinned = os.fstat(descriptor)
+        if ((pinned.st_dev, pinned.st_ino) != (info.st_dev, info.st_ino) or
+                not stat.S_ISREG(pinned.st_mode) or pinned.st_uid != 0 or
+                pinned.st_gid != 0 or stat.S_IMODE(pinned.st_mode) != 0o600 or
+                pinned.st_nlink != 1):
+            raise RuntimeError("recovery Boost latch changed during validation")
+        payload = os.read(descriptor, len(RECOVERY_LATCH_PAYLOAD) + 1)
+    finally:
+        os.close(descriptor)
+    if payload != RECOVERY_LATCH_PAYLOAD:
+        raise RuntimeError("invalid recovery Boost latch payload")
+    return True
+
+
+def mark_recovery_latch(profile: str) -> None:
+    """Atomically record that a recovery-owned Boost must become automatic."""
+    payload = f"{profile}\n".encode("ascii")
+    if payload != RECOVERY_LATCH_PAYLOAD:
+        raise RuntimeError(f"unexpected recovery latch profile {profile!r}")
+    try:
+        descriptor = os.open(
+            RECOVERY_LATCH,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
+            0o600,
+        )
+    except FileExistsError:
+        if recovery_latch_present():
+            return
+        raise
+    try:
+        os.fchown(descriptor, 0, 0)
+        os.fchmod(descriptor, 0o600)
+        if os.write(descriptor, payload) != len(payload):
+            raise RuntimeError("short recovery Boost latch write")
+        os.fsync(descriptor)
+    except Exception:
+        try:
+            RECOVERY_LATCH.unlink()
+        except OSError:
+            pass
+        raise
+    finally:
+        os.close(descriptor)
+    if not recovery_latch_present():
+        raise RuntimeError("recovery Boost latch verification failed")
+
+
 def release_boost_if_cool() -> bool:
     """Complete an intentional clean-stop factory transition only when cool."""
     try:
@@ -196,6 +257,7 @@ def attempt_full_cooling(profile: str) -> bool:
     """Establish Candidate14/advanced/Boost-on after a non-clean service exit."""
     try:
         stage_full_cooling(profile)
+        mark_recovery_latch(profile)
         wmi = one_hwmon("msi_wmi_platform")
         if verify_boost(wmi):
             return True
@@ -256,6 +318,7 @@ def run_keeper(profile: str) -> int:
     global STOP
     try:
         stage_full_cooling(profile)
+        mark_recovery_latch(profile)
     except Exception as error:
         print(f"FATAL: recovery keeper could not establish full cooling: {error}",
               file=sys.stderr)

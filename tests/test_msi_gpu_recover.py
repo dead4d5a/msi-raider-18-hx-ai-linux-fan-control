@@ -54,9 +54,11 @@ class FullCoolingRecoveryTests(unittest.TestCase):
                     RECOVER, "identity_safe_for_curve_write", return_value=True), \
                 mock.patch.object(
                     RECOVER, "one_hwmon", return_value=pathlib.Path("/fake/wmi")), \
-                mock.patch.object(RECOVER, "verify_boost", side_effect=fake_verify):
+                mock.patch.object(RECOVER, "verify_boost", side_effect=fake_verify), \
+                mock.patch.object(RECOVER, "mark_recovery_latch") as latch:
             self.assertTrue(RECOVER.attempt_full_cooling("candidate14"))
 
+        latch.assert_called_once_with("candidate14")
         self.assertEqual(state["fan_curve"], RECOVER.DEFAULT)
         self.assertEqual(state["fan_mode"], "advanced")
         self.assertEqual(state["cooler_boost"], "on")
@@ -96,9 +98,11 @@ class FullCoolingRecoveryTests(unittest.TestCase):
                     RECOVER, "identity_safe_for_curve_write", return_value=True), \
                 mock.patch.object(
                     RECOVER, "one_hwmon", return_value=pathlib.Path("/fake/wmi")), \
-                mock.patch.object(RECOVER, "verify_boost", return_value=False):
+                mock.patch.object(RECOVER, "verify_boost", return_value=False), \
+                mock.patch.object(RECOVER, "mark_recovery_latch") as latch:
             self.assertFalse(RECOVER.attempt_full_cooling("candidate14"))
 
+        latch.assert_called_once_with("candidate14")
         self.assertEqual(state["fan_curve"], RECOVER.DEFAULT)
         self.assertEqual(state["fan_mode"], "advanced")
         self.assertEqual(state["cooler_boost"], "on")
@@ -122,9 +126,11 @@ class FullCoolingRecoveryTests(unittest.TestCase):
                 mock.patch.object(
                     RECOVER, "identity_safe_for_curve_write", return_value=True), \
                 mock.patch.object(
-                    RECOVER, "one_hwmon", side_effect=RuntimeError("WMI absent")):
+                    RECOVER, "one_hwmon", side_effect=RuntimeError("WMI absent")), \
+                mock.patch.object(RECOVER, "mark_recovery_latch") as latch:
             self.assertFalse(RECOVER.attempt_full_cooling("candidate14"))
 
+        latch.assert_called_once_with("candidate14")
         self.assertEqual(state["fan_curve"], RECOVER.DEFAULT)
         self.assertEqual(state["fan_mode"], "advanced")
         self.assertEqual(state["cooler_boost"], "on")
@@ -155,6 +161,43 @@ class FullCoolingRecoveryTests(unittest.TestCase):
         self.assertEqual(state["fan_curve"], RECOVER.DEFAULT)
         self.assertEqual(state["fan_mode"], "advanced")
         self.assertEqual(state["cooler_boost"], "on")
+
+    def test_failed_curve_staging_never_marks_a_recovery_handoff(self):
+        with mock.patch.object(
+                RECOVER, "stage_full_cooling", side_effect=RuntimeError("stage failed")), \
+                mock.patch.object(RECOVER, "mark_recovery_latch") as latch, \
+                mock.patch.object(RECOVER, "request_boost_best_effort"):
+            self.assertFalse(RECOVER.attempt_full_cooling("candidate14"))
+
+        latch.assert_not_called()
+
+    def test_keeper_marks_the_handoff_after_initial_full_cooling(self):
+        calls = []
+        original_stop = RECOVER.STOP
+        RECOVER.STOP = False
+
+        def repair(_profile):
+            RECOVER.STOP = True
+            return "Candidate14/advanced with Cooler Boost on"
+
+        try:
+            with mock.patch.object(
+                    RECOVER, "stage_full_cooling",
+                    side_effect=lambda _profile: calls.append("stage")), \
+                    mock.patch.object(
+                        RECOVER, "mark_recovery_latch",
+                        side_effect=lambda _profile: calls.append("latch")), \
+                    mock.patch.object(RECOVER, "keeper_heartbeat"), \
+                    mock.patch.object(RECOVER, "notify"), \
+                    mock.patch.object(RECOVER, "keeper_repair", side_effect=repair), \
+                    mock.patch.object(
+                        RECOVER, "one_hwmon", side_effect=RuntimeError("WMI absent")), \
+                    mock.patch.object(RECOVER.time, "sleep"):
+                self.assertEqual(RECOVER.run_keeper("candidate14"), 0)
+        finally:
+            RECOVER.STOP = original_stop
+
+        self.assertEqual(calls, ["stage", "latch"])
 
 
 if __name__ == "__main__":

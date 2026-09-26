@@ -31,6 +31,9 @@
   path without a primary-service failure.
 - Attended primary-service fault test confirming the failure keeper reasserts
   Candidate 14/`advanced`/Boost and yields cleanly to `apply-default`.
+- Automated recovery-marker handoff test confirming inherited recovery Boost
+  stays on until 30 continuously valid, cool seconds, while a normal manual
+  Boost remains latched until explicitly released.
 
 The implementation already uses a suspend-time discontinuity between
 `CLOCK_BOOTTIME` and monotonic time and forces a full safe reapply. Until the

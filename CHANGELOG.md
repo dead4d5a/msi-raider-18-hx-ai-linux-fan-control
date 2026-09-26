@@ -18,6 +18,10 @@
 - Add an `OnFailure` full-cooling keeper that holds the fan lock and continuously
   reasserts Candidate 14/`advanced`/Boost after any genuine daemon fault, while
   keeping the primary failure visible and avoiding a primary-service restart loop.
+- Carry a verified, root-only recovery-Boost handoff marker from the recovery
+  helper/keeper into the next managed start, so recovery cooling becomes an
+  automatic 30-second-cooldown latch rather than an accidental permanent manual
+  override.
 - Prevent a post-start `apply-default` failure from overwriting that runtime
   recovery with the factory curve.
 

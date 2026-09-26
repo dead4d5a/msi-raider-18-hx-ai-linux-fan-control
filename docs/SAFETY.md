@@ -114,14 +114,23 @@ bounded restart policy makes a keeper failure visible. A sustained, physically
 verified safety alarm and degraded telemetry are active cooling states, not
 primary-service faults.
 
+After verified recovery cooling is staged, the helper or keeper records a
+root-owned, mode-`0600`, same-boot recovery-Boost marker. The daemon validates
+and consumes it only after it has successfully reapplied Candidate 14 during a
+guarded handoff. The inherited Boost is then an automatic latch: it remains on
+until telemetry is valid and cool continuously for 30 seconds. The keeper itself
+never releases Boost, and a marker that is absent, malformed, or unsafe is never
+treated as permission to release cooling.
+
 ## Cooler Boost overrides
 
 - Boost-on requires daemon acknowledgement and both fans above 3,000 RPM.
 - Release requires 30 continuously valid, cool seconds.
 - A thermal automatic latch cannot be defeated by an external off toggle.
 - Failure recovery and its keeper retain Candidate 14/`advanced` and leave Boost
-  on until attended inspection; physical verification is reported only for valid
-  RPM telemetry.
+  on until a guarded daemon handoff; the verified recovery marker then makes it
+  an automatic, 30-second-cooldown latch. Physical verification is reported only
+  for valid RPM telemetry.
 
 Explicit `factory-auto`, a clean service stop, manager setup errors before a
 service start is attempted, and installation or upgrade staging remain

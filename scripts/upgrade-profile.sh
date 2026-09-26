@@ -7,6 +7,7 @@ service=msi-fan-profile.service
 keeper=msi-fan-profile-keeper.service
 manager=/usr/local/sbin/msi-fan-profile
 marker=/run/msi-fan-profile.factory-auto
+recovery_latch=/run/msi-fan-profile.recovery-boost
 base=/sys/devices/platform/msi-ec
 factory='58 64 70 76 82 88 0 25 35 44 58 70 75 52 58 64 70 76 82 0 25 35 44 58 70 75'
 
@@ -118,6 +119,11 @@ systemctl reset-failed "$service" 2>/dev/null || true
 [[ $(cat "$base/fan_curve") == "$factory" ]]
 [[ $(cat "$base/fan_mode") == auto ]]
 [[ $(cat "$base/cooler_boost") == off ]]
+if [[ -e $recovery_latch || -L $recovery_latch ]]; then
+  [[ ! -L $recovery_latch ]]
+  [[ $(stat -c '%F:%U:%G:%a:%h' "$recovery_latch") == 'regular file:root:root:600:1' ]]
+  rm -f -- "$recovery_latch"
+fi
 safe_state=1
 
 # Retain a root-only rollback snapshot, but never auto-restore it: a failed

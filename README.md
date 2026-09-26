@@ -49,8 +49,10 @@ firmware. Related model names alone are not sufficient evidence of compatibility
 - On a runtime fault with immutable identity still verified, retains Candidate 14
   in `advanced` mode and deliberately leaves Cooler Boost on; a separate,
   watchdog-protected failure keeper continues to reassert that state until an
-  operator starts the controller again. It records physical fan verification
-  only when valid WMI RPM telemetry is available.
+  operator starts the controller again. A root-only same-boot handoff marker
+  makes that recovery Boost an automatic latch on restart, releasing it only
+  after 30 continuously valid, cool seconds. It records physical fan
+  verification only when valid WMI RPM telemetry is available.
 
 The factory curve is used only for an explicit `factory-auto` request, a clean
 service stop, a manager setup failure before it attempts service start, or an

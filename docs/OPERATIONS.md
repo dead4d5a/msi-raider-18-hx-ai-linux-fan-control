@@ -25,6 +25,13 @@ recovery: it stops any failure keeper, then returns Candidate 14 to the managed
 daemon. A runtime fault otherwise retains Candidate 14 in `advanced` mode with
 Cooler Boost on.
 
+When `apply-default` takes over from a failure keeper, it keeps the recovery
+Boost asserted through the guarded handoff. The daemon consumes a root-only
+same-boot recovery marker only after it has reapplied Candidate 14, then treats
+that inherited Boost as an automatic latch. It releases only after 30
+continuously valid, cool seconds; a keyboard or `boost-on` request made after
+the handoff remains a separate manual override.
+
 ## Temporary maximum cooling
 
 ```bash
@@ -84,8 +91,9 @@ The failed primary remains visible (`Restart=no`), but its `OnFailure` keeper
 then holds the shared fan lock and continuously reasserts the same Candidate
 14/`advanced`/Boost state. If the WMI RPM channels are invalid, it reports Boost
 requested without claiming physical verification. It does not deliberately
-restore the factory curve or release Boost for a runtime fault. Inspect both
-units before using `apply-default`:
+restore the factory curve or release Boost for a runtime fault. On the next
+guarded `apply-default`, its root-only recovery marker makes the inherited Boost
+an automatic latch, not a manual override. Inspect both units before taking over:
 
 ```bash
 sudo systemctl status msi-fan-profile.service msi-fan-profile-keeper.service

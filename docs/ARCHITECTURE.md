@@ -64,5 +64,9 @@ restarting the controller. Its `OnFailure` handoff starts a separate,
 watchdog-protected keeper only after the post-stop helper completes. That keeper
 holds the shared lock and continuously repairs Candidate 14/`advanced`/Boost
 drift without interpreting incomplete telemetry as permission to release Boost.
-The guarded manager stops the keeper before it starts the primary daemon or
-performs a factory transition.
+The recovery path also creates a root-only, same-boot recovery-Boost marker.
+The guarded manager stops the keeper before it starts the primary daemon; after
+the daemon has reapplied and verified Candidate 14, it consumes the marker and
+treats the inherited Boost as an automatic latch. It may then release only after
+30 continuously valid, cool seconds. A verified `factory-auto` transition clears
+the marker instead.

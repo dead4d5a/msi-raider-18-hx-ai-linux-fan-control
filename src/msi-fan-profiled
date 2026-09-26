@@ -18,6 +18,8 @@ BASE = pathlib.Path("/sys/devices/platform/msi-ec")
 LOCK = pathlib.Path("/run/msi-fanctl.lock")
 OVERRIDE = pathlib.Path("/run/msi-fan-profile.factory-auto")
 ACK = pathlib.Path("/run/msi-fan-profile.ack")
+RECOVERY_LATCH = pathlib.Path("/run/msi-fan-profile.recovery-boost")
+RECOVERY_LATCH_PAYLOAD = b"candidate14\n"
 FACTORY = (
     "58 64 70 76 82 88 0 25 35 44 58 70 75 "
     "52 58 64 70 76 82 0 25 35 44 58 70 75"
@@ -405,6 +407,42 @@ def acknowledge(action: str) -> None:
     os.replace(temporary, ACK)
 
 
+def recovery_latch_present() -> bool:
+    """Validate a one-shot, root-owned full-cooling handoff marker."""
+    try:
+        info = RECOVERY_LATCH.lstat()
+    except FileNotFoundError:
+        return False
+    if (not stat.S_ISREG(info.st_mode) or info.st_uid != 0 or
+            info.st_gid != 0 or stat.S_IMODE(info.st_mode) != 0o600 or
+            info.st_nlink != 1):
+        raise ProfileError("unsafe recovery Boost latch")
+    descriptor = os.open(RECOVERY_LATCH, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    try:
+        pinned = os.fstat(descriptor)
+        if ((pinned.st_dev, pinned.st_ino) != (info.st_dev, info.st_ino) or
+                not stat.S_ISREG(pinned.st_mode) or pinned.st_uid != 0 or
+                pinned.st_gid != 0 or stat.S_IMODE(pinned.st_mode) != 0o600 or
+                pinned.st_nlink != 1):
+            raise ProfileError("recovery Boost latch changed during validation")
+        payload = os.read(descriptor, len(RECOVERY_LATCH_PAYLOAD) + 1)
+    finally:
+        os.close(descriptor)
+    if payload != RECOVERY_LATCH_PAYLOAD:
+        raise ProfileError("invalid recovery Boost latch payload")
+    return True
+
+
+def consume_recovery_latch() -> bool:
+    """Remove a validated handoff only after Candidate14 has been re-applied."""
+    if not recovery_latch_present():
+        return False
+    RECOVERY_LATCH.unlink()
+    if recovery_latch_present():
+        raise ProfileError("recovery Boost latch remained after consumption")
+    return True
+
+
 def on_stop(_number: int, _frame: object) -> None:
     global STOP
     STOP = True
@@ -455,16 +493,22 @@ def main() -> int:
         require_policy_identity()
         wmi = one_hwmon("msi_wmi_platform")
         core = one_hwmon("coretemp")
+        recovery_latched = recovery_latch_present()
         existing_boost = read(BASE / "cooler_boost") == "on"
         initial_physical_verification = force_apply_default(
-            wmi, existing_boost, heartbeat)
-        print(f"Candidate14 applied; preserved_boost={existing_boost}",
+            wmi, existing_boost or recovery_latched, heartbeat)
+        if recovery_latched:
+            consume_recovery_latch()
+        print(
+            "Candidate14 applied; "
+            f"preserved_boost={existing_boost or recovery_latched} "
+            f"recovery_latch={recovery_latched}",
               file=sys.stderr, flush=True)
         notify("READY=1\nWATCHDOG=1\nSTATUS=Candidate14 active")
 
         safety = Safety()
-        manual_boost = existing_boost
-        automatic_boost = False
+        manual_boost = existing_boost and not recovery_latched
+        automatic_boost = recovery_latched
         release_pending = False
         release_cool_since: float | None = None
         alarm = AlarmHold()

@@ -23,6 +23,7 @@ paths=(
   /run/msi-fan-profile-manager.lock
   /run/msi-fan-profile.factory-auto
   /run/msi-fan-profile.ack
+  /run/msi-fan-profile.recovery-boost
 )
 for path in "${paths[@]}"; do
   [[ ! -e $path && ! -L $path ]] || {
@@ -55,7 +56,7 @@ rollback() {
     rm -f /usr/local/libexec/msi-fan-profiled
     rm -f /usr/local/libexec/msi-gpu-recover
     rm -rf /usr/local/share/doc/msi-fan-profile
-    rm -f /run/msi-fan-profile.factory-auto /run/msi-fan-profile.ack
+    rm -f /run/msi-fan-profile.factory-auto /run/msi-fan-profile.ack /run/msi-fan-profile.recovery-boost
     rm -f /run/msi-fan-profile-manager.lock /run/msi-fanctl.lock
     systemctl daemon-reload >/dev/null 2>&1 || true
   fi
