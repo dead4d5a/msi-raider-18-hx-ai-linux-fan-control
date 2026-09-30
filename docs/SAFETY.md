@@ -21,6 +21,14 @@ DMI/BIOS/EC combination. It:
 - attempts every original byte and verifies rollback on failure;
 - exposes no arbitrary EC address.
 
+The new pinned snapshot build also exposes a read-only, versioned control
+snapshot. It freshly checks firmware and serializes curve/control/temperature
+reads under the driver's existing control mutex. It does not replace write
+checks or transaction rollback. User space accepts only the two documented
+source hashes, and the new build must provide a valid snapshot; errors never
+silently fall back to another ABI. Firmware itself can update telemetry during
+the serialized read, so a snapshot is not claimed to freeze the entire EC.
+
 ### 2. EC-resident control
 
 After activation, the EC follows Candidate 14 itself. The daemon does not poll
@@ -31,6 +39,8 @@ and rewrite fan values. This avoids a user-space controller fighting firmware.
 The daemon holds `/run/msi-fanctl.lock` throughout its lifetime. The manager
 uses `/run/msi-fan-profile-manager.lock` for command serialization. Both are
 root-owned mode `0600` and recreated by `tmpfiles.d` after boot.
+The manager releases its lock after enqueuing a Boost request, before waiting
+for acknowledgement or cooldown; waiting never blocks later operator actions.
 
 ### 4. Read-only runtime monitoring
 
@@ -74,12 +84,20 @@ only lose monitoring during a persistent high-heat condition. The daemon still
 fails and invokes full-cooling recovery for an invalid identity, curve/state
 drift, a write/readback error, watchdog failure, or a plausible-but-low physical
 fan response. Invalid telemetry instead enters the degraded state below.
+The response floor is 3,000 RPM per fan, not proof of maximum physical speed.
+Runtime response evidence is checked once per monitoring pass, separately for
+each healthy fan channel. A failure requires the 12-second response allowance
+plus at least three recent, continuously valid low readings spanning two seconds.
+Missing RPM resets that channel's low evidence rather than proving failure.
 
 ### 6. Degraded telemetry
 
 One nonnumeric, out-of-range, or otherwise implausible temperature/RPM snapshot
 does not immediately put the EC back into factory mode or fail the daemon. The
 raw EC CPU value `255°C` is explicitly recognized as an unavailable sentinel.
+The exact firmware meaning of `255` remains unconfirmed; it is never accepted as
+a plausible temperature. Channels are sampled independently, so other valid
+RPM observations remain usable even when one temperature is invalid.
 The daemon enters a non-expiring degraded-telemetry state: it keeps Candidate 14
 in `advanced` mode, latches and reasserts Cooler Boost, clears cooldown progress,
 and continues watchdog heartbeats. The journal logs the transition immediately
@@ -90,6 +108,27 @@ fans must first verify under Cooler Boost; invalid WMI RPM telemetry remains
 unverified and keeps maximum cooling asserted. Only then can the existing
 30-continuously-valid-and-cool-second release timer begin. Plausible but
 persistently low RPM after a Boost request remains a genuine fan-response fault.
+An observation gap or a sensor acquisition taking over two seconds resets
+cooldown and RPM-response evidence and reasserts Boost before release eligibility.
+Time without sufficiently continuous monitoring cannot satisfy the cool timer.
+Health records the earliest acquisition time, not the later publication time;
+an overdue acquisition does not refresh the last-valid timestamp.
+An atomic, root-owned `0644` health snapshot exposes valid-channel data, failures,
+sample freshness, latch ownership, response verification, and cooldown progress.
+Failure to publish diagnostics is reported but does not stop working cooling;
+the manager reports missing/stale health as unsuccessful status.
+
+On the combined ABI, any kernel snapshot I/O error makes the entire control
+result unavailable; a temperature-byte read failure cannot be distinguished from
+a firmware/curve/control failure. It therefore invokes the full-cooling keeper
+rather than using the legacy per-channel degraded path. A successfully read raw
+`255` remains a per-channel sensor fault and retains the normal degraded latch.
+This conservative distinction is not permission to use an unchecked fallback.
+
+Optional timing diagnostics are disabled by default and do not determine policy.
+Enabling them for testing adds bounded counters only, with no extra hardware
+reads. Disabling them does not disable safety clocks, the two-second acquisition
+budget, one-second monitoring, the watchdog or the 30-second cooldown.
 
 ### 7. systemd watchdog and recovery
 
@@ -113,6 +152,9 @@ incomplete telemetry. It yields before a guarded manager start, and its own
 bounded restart policy makes a keeper failure visible. A sustained, physically
 verified safety alarm and degraded telemetry are active cooling states, not
 primary-service faults.
+Keeper RPM verification is incremental and never stalls control repair. An
+upgrade failure after activation begins likewise leaves runtime recovery and
+boot enablement intact instead of invoking factory rollback.
 
 After verified recovery cooling is staged, the helper or keeper records a
 root-owned, mode-`0600`, same-boot recovery-Boost marker. The daemon validates

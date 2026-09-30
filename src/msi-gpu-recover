@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import fcntl
+import json
 import os
 import pathlib
 import signal
@@ -11,7 +12,16 @@ import socket
 import stat
 import sys
 import time
+from dataclasses import dataclass
 from typing import Callable
+
+# Repository commands use the sibling helper; installed recovery uses the same
+# fixed, root-owned libexec directory as the other controller commands.
+_source_directory = pathlib.Path(__file__).resolve().parent
+_helper_directory = (_source_directory if (_source_directory / "msi_fan_control.py").is_file()
+                     else pathlib.Path("/usr/local/libexec"))
+sys.path.insert(0, str(_helper_directory))
+import msi_fan_control as fan_control
 
 BASE = pathlib.Path("/sys/devices/platform/msi-ec")
 LOCK = pathlib.Path("/run/msi-fanctl.lock")
@@ -27,7 +37,12 @@ DEFAULT = (
 )
 FULL_COOLING_CURVES = {"candidate14": DEFAULT}
 STOP = False
-KEEPER_VERIFY_INTERVAL_SECONDS = 60.0
+FAN_RESPONSE_FLOOR_RPM = 3000
+FAN_PLAUSIBILITY_LIMIT_RPM = 10000
+FAN_RESPONSE_ALLOWANCE_SECONDS = 12.0
+KEEPER_REPORT_INTERVAL_SECONDS = 60.0
+POLL_INTERVAL_SECONDS = 1.0
+MAX_OBSERVATION_GAP_SECONDS = 2.0
 
 
 def read(path: pathlib.Path) -> str:
@@ -52,20 +67,18 @@ def write(path: pathlib.Path, value: str) -> None:
         raise RuntimeError(f"recovery readback mismatch for {path.name}")
 
 
+def recovery_identity(*, monitoring: bool = False) -> dict[pathlib.Path, str]:
+    values = fan_control.identity(read, BASE, monitoring=monitoring)
+    if not (BASE / "fan_curve").exists():
+        raise RuntimeError("required fan-curve ABI is absent")
+    return values
+
+
 def identity_safe_for_curve_write() -> bool:
-    expected = {
-        pathlib.Path("/sys/class/dmi/id/product_name"): "Raider 18 HX AI A2XWIG",
-        pathlib.Path("/sys/class/dmi/id/board_name"): "MS-1824",
-        pathlib.Path("/sys/class/dmi/id/bios_version"): "E1824IMS.310",
-        pathlib.Path("/sys/module/msi_ec/version"): "0.13.1",
-        pathlib.Path("/sys/module/msi_ec/srcversion"): "AB0BFAE2391B5ADD66E01BD",
-        BASE / "fw_version": "1824EMS1.108",
-    }
-    if pathlib.Path("/sys/module/ec_sys").exists():
-        return False
     try:
-        return (all(read(path) == wanted for path, wanted in expected.items()) and
-                (BASE / "fan_curve").exists())
+        # Mutations never use monitoring's snapshot-based firmware shortcut.
+        recovery_identity()
+        return True
     except Exception:
         return False
 
@@ -95,35 +108,177 @@ def notify(message: str) -> None:
         sock.sendall(message.encode("utf-8"))
 
 
+@dataclass(frozen=True)
+class FanResponse:
+    classification: str
+    detail: str
+
+    @property
+    def verified(self) -> bool:
+        return self.classification == "verified"
+
+    @property
+    def status(self) -> str:
+        if self.verified:
+            return f"fan response verified: {self.detail}"
+        return f"fan response unverified: {self.classification}; {self.detail}"
+
+
+def read_fan_response(wmi: pathlib.Path) -> FanResponse:
+    """Sample response once; a response floor is not proof of maximum speed."""
+    try:
+        fan1 = read_uint(wmi / "fan1_input")
+        fan2 = read_uint(wmi / "fan2_input")
+    except OSError as error:
+        return FanResponse("unavailable", f"fan telemetry unavailable: {error}")
+    except Exception as error:
+        return FanResponse("invalid", f"invalid fan telemetry: {error}")
+    if not (0 <= fan1 <= FAN_PLAUSIBILITY_LIMIT_RPM and
+            0 <= fan2 <= FAN_PLAUSIBILITY_LIMIT_RPM):
+        return FanResponse("invalid", f"implausible fan telemetry: {fan1}/{fan2} RPM")
+    detail = f"{fan1}/{fan2} RPM; response floor {FAN_RESPONSE_FLOOR_RPM} RPM"
+    if fan1 >= FAN_RESPONSE_FLOOR_RPM and fan2 >= FAN_RESPONSE_FLOOR_RPM:
+        return FanResponse("verified", detail)
+    return FanResponse("low", detail)
+
+
 def verify_boost(wmi: pathlib.Path,
                  heartbeat: Callable[[str], None] | None = None) -> bool:
-    """Prove that both physical fans reached a plausible maximum RPM."""
-    last: str | None = None
+    """Bounded one-shot verification of plausible fan response to Boost."""
+    last = "fan response unverified: no telemetry sampled"
     for _ in range(12):
-        try:
-            fan1 = read_uint(wmi / "fan1_input")
-            fan2 = read_uint(wmi / "fan2_input")
-        except Exception as error:
-            last = f"invalid fan telemetry: {error}"
-            if heartbeat is not None:
-                heartbeat(f"Recovery keeper: {last}")
-            time.sleep(1)
-            continue
-        if not (0 <= fan1 <= 10000 and 0 <= fan2 <= 10000):
-            last = f"implausible fan telemetry: {fan1}/{fan2} RPM"
-            if heartbeat is not None:
-                heartbeat(f"Recovery keeper: {last}")
-            time.sleep(1)
-            continue
-        last = f"{fan1}/{fan2} RPM"
+        # An external owner may switch Boost off between attempts. Reassert it
+        # without ever bypassing the fresh identity guard in write().
+        request_boost_best_effort()
+        response = read_fan_response(wmi)
+        last = response.status
         if heartbeat is not None:
-            heartbeat(f"Recovery keeper: verifying fans {last}")
-        if 3000 <= fan1 <= 10000 and 3000 <= fan2 <= 10000:
+            heartbeat(f"Recovery: {last}")
+        if response.verified:
             return True
         time.sleep(1)
-    print(f"recovery Cooler Boost did not verify plausible RPM: {last}",
-          file=sys.stderr)
+    request_boost_best_effort()
+    print(f"recovery Cooler Boost {last}", file=sys.stderr)
     return False
+
+
+@dataclass
+class KeeperFanVerification:
+    """Track response incrementally without interrupting control repair."""
+    low_since: float | None = None
+    unverified_since: float | None = None
+    reported_classification: str | None = None
+    last_report: float = float("-inf")
+
+    def observe(self, response: FanResponse, now: float) -> tuple[str, bool]:
+        classification = response.classification
+        status = response.status
+        if response.verified:
+            self.low_since = None
+            self.unverified_since = None
+        else:
+            if self.unverified_since is None:
+                self.unverified_since = now
+            status += f"; unverified for {now - self.unverified_since:.0f}s"
+            if classification == "low":
+                if self.low_since is None:
+                    self.low_since = now
+                low_elapsed = now - self.low_since
+                if low_elapsed >= FAN_RESPONSE_ALLOWANCE_SECONDS:
+                    classification = "low-sustained"
+                    status += f"; below response floor for {low_elapsed:.0f}s"
+                else:
+                    status += f"; awaiting fan response for {low_elapsed:.0f}s"
+            else:
+                # Missing or invalid readings are not evidence of a stalled fan.
+                self.low_since = None
+        report = (classification != self.reported_classification or
+                  (not response.verified and
+                   now - self.last_report >= KEEPER_REPORT_INTERVAL_SECONDS))
+        if report:
+            self.reported_classification = classification
+            self.last_report = now
+        return status, report
+
+
+@dataclass
+class KeeperTimingMetrics:
+    """Opt-in bounded diagnostics, independent of repair and response policy."""
+    completed_loops: int = 0
+    rpm_reads: int = 0
+    deadline_misses: int = 0
+    slow_rpm_reads: int = 0
+    observation_gap_misses: int = 0
+    last_loop_duration_ms: float | None = None
+    max_loop_duration_ms: float = 0.0
+    last_rpm_read_duration_ms: float | None = None
+    max_rpm_read_duration_ms: float = 0.0
+    last_observation_gap_seconds: float | None = None
+    max_observation_gap_seconds: float = 0.0
+    loop_started_ns: int | None = None
+    rpm_started_ns: int | None = None
+    previous_observation: float | None = None
+    last_report: float | None = None
+
+    def begin_loop(self) -> None:
+        self.loop_started_ns = time.perf_counter_ns()
+
+    def begin_rpm(self, observed_at: float) -> None:
+        self.rpm_started_ns = time.perf_counter_ns()
+        if self.previous_observation is not None:
+            gap = max(0.0, observed_at - self.previous_observation)
+            self.last_observation_gap_seconds = gap
+            self.max_observation_gap_seconds = max(self.max_observation_gap_seconds, gap)
+            self.observation_gap_misses += int(gap > MAX_OBSERVATION_GAP_SECONDS)
+        self.previous_observation = observed_at
+
+    def finish_rpm(self) -> None:
+        assert self.rpm_started_ns is not None
+        elapsed_ms = (time.perf_counter_ns() - self.rpm_started_ns) / 1_000_000
+        self.last_rpm_read_duration_ms = elapsed_ms
+        self.max_rpm_read_duration_ms = max(self.max_rpm_read_duration_ms, elapsed_ms)
+        self.rpm_reads += 1
+        self.slow_rpm_reads += int(elapsed_ms > MAX_OBSERVATION_GAP_SECONDS * 1000)
+
+    def finish_loop(self) -> None:
+        assert self.loop_started_ns is not None
+        elapsed_ms = (time.perf_counter_ns() - self.loop_started_ns) / 1_000_000
+        self.last_loop_duration_ms = elapsed_ms
+        self.max_loop_duration_ms = max(self.max_loop_duration_ms, elapsed_ms)
+        self.completed_loops += 1
+        self.deadline_misses += int(elapsed_ms > POLL_INTERVAL_SECONDS * 1000)
+
+    def report(self, now: float) -> None:
+        if self.last_report is not None and now - self.last_report < KEEPER_REPORT_INTERVAL_SECONDS:
+            return
+        self.last_report = now
+        payload = {
+            "schema": 1,
+            "pid": os.getpid(),
+            "completed_loops": self.completed_loops,
+            "rpm_reads": self.rpm_reads,
+            "deadline_misses": self.deadline_misses,
+            "slow_rpm_reads": self.slow_rpm_reads,
+            "observation_gap_misses": self.observation_gap_misses,
+            "last_loop_duration_ms": self.last_loop_duration_ms,
+            "max_loop_duration_ms": self.max_loop_duration_ms,
+            "last_rpm_read_duration_ms": self.last_rpm_read_duration_ms,
+            "max_rpm_read_duration_ms": self.max_rpm_read_duration_ms,
+            "last_observation_gap_seconds": self.last_observation_gap_seconds,
+            "max_observation_gap_seconds": self.max_observation_gap_seconds,
+        }
+        print("TIMING keeper " + json.dumps(payload, sort_keys=True, allow_nan=False),
+              file=sys.stderr, flush=True)
+
+
+def configured_timing_metrics() -> KeeperTimingMetrics | None:
+    value = os.environ.get("MSI_FAN_TIMING_METRICS", "0")
+    if value == "1":
+        return KeeperTimingMetrics()
+    if value != "0":
+        print(f"WARNING invalid MSI_FAN_TIMING_METRICS={value!r}; timing metrics disabled",
+              file=sys.stderr, flush=True)
+    return None
 
 
 def request_boost_best_effort() -> None:
@@ -299,11 +454,19 @@ def keeper_heartbeat(status: str) -> None:
 def keeper_repair(profile: str) -> str:
     """Reassert a drifted recovery state without needlessly rewriting its curve."""
     curve = FULL_COOLING_CURVES[profile]
-    if not identity_safe_for_curve_write():
-        raise RuntimeError("exact recovery identity/ABI check failed")
-    current_curve = read(BASE / "fan_curve")
-    mode = read(BASE / "fan_mode")
-    boost = read(BASE / "cooler_boost")
+    try:
+        identity = recovery_identity(monitoring=True)
+        if identity[fan_control.SOURCE_PATH] == fan_control.SNAPSHOT_SRCVERSION:
+            # The pinned new ABI provides a fresh firmware/control snapshot in
+            # one transaction; malformed or absent snapshots never fall back.
+            control = fan_control.snapshot(read, BASE)
+            current_curve, mode, boost = control.curve, control.mode, control.boost
+        else:
+            current_curve = read(BASE / "fan_curve")
+            mode = read(BASE / "fan_mode")
+            boost = read(BASE / "cooler_boost")
+    except Exception as error:
+        raise RuntimeError(f"exact recovery identity/ABI check failed: {error}") from error
     if current_curve != curve or mode != "advanced":
         stage_full_cooling(profile)
         return "Candidate14/advanced restaged with Cooler Boost on"
@@ -316,6 +479,7 @@ def keeper_repair(profile: str) -> str:
 def run_keeper(profile: str) -> int:
     """Keep full cooling asserted after a failed daemon until an operator restarts it."""
     global STOP
+    timing = configured_timing_metrics()
     try:
         stage_full_cooling(profile)
         mark_recovery_latch(profile)
@@ -324,13 +488,23 @@ def run_keeper(profile: str) -> int:
               file=sys.stderr)
         request_boost_best_effort()
         return 1
-    keeper_heartbeat("Candidate14 recovery keeper active; Cooler Boost requested")
-    notify("READY=1\nWATCHDOG=1\nSTATUS=Candidate14 recovery keeper active; Cooler Boost on")
+    initial_status = ("Candidate14 recovery keeper active; Cooler Boost on; "
+                      "fan response unverified: awaiting telemetry")
+    keeper_heartbeat(initial_status)
+    notify(f"READY=1\nWATCHDOG=1\nSTATUS={initial_status}")
     print("recovery keeper active; Candidate14/advanced and Cooler Boost will remain asserted",
           file=sys.stderr)
-    last_verify = float("-inf")
+    verification = KeeperFanVerification()
+    wmi: pathlib.Path | None = None
+    suspend_offset = time.clock_gettime(time.CLOCK_BOOTTIME) - time.monotonic()
     while not STOP:
         started = time.monotonic()
+        if timing is not None:
+            timing.begin_loop()
+        current_offset = time.clock_gettime(time.CLOCK_BOOTTIME) - started
+        if current_offset - suspend_offset > 2:
+            wmi = None
+        suspend_offset = current_offset
         try:
             state = keeper_repair(profile)
         except Exception as error:
@@ -338,22 +512,33 @@ def run_keeper(profile: str) -> int:
                   file=sys.stderr)
             request_boost_best_effort()
             return 1
-        keeper_heartbeat(state)
-        if started - last_verify >= KEEPER_VERIFY_INTERVAL_SECONDS:
-            try:
-                wmi = one_hwmon("msi_wmi_platform")
-            except Exception as error:
-                print(f"recovery keeper fan telemetry unavailable: {error}",
-                      file=sys.stderr)
-            else:
-                if verify_boost(wmi, keeper_heartbeat):
-                    print("recovery keeper physically verified Cooler Boost",
-                          file=sys.stderr)
-                else:
-                    print("recovery keeper retains Cooler Boost; physical RPM remains unverified",
-                          file=sys.stderr)
-            last_verify = time.monotonic()
-        delay = 1 - (time.monotonic() - started)
+        if timing is not None:
+            timing.begin_rpm(time.monotonic())
+        try:
+            if wmi is None:
+                # Pin the discovered symlink target instead of rediscovering
+                # every hwmon device each second. Resume/read failure invalidates it.
+                wmi = one_hwmon("msi_wmi_platform").resolve()
+        except Exception as error:
+            response = FanResponse("unavailable", f"fan telemetry unavailable: {error}")
+        else:
+            response = read_fan_response(wmi)
+            if response.classification == "unavailable":
+                wmi = None
+        if timing is not None:
+            timing.finish_rpm()
+        # Exactly one RPM sample follows each completed control repair. Failed
+        # telemetry never creates a multi-second verification sleep, and each
+        # heartbeat describes both completed repair and current fan response.
+        response_status, report = verification.observe(response, time.monotonic())
+        keeper_heartbeat(f"{state}; {response_status}")
+        if report:
+            print(f"recovery keeper retains Cooler Boost; {response_status}",
+                  file=sys.stderr)
+        if timing is not None:
+            timing.finish_loop()
+            timing.report(time.monotonic())
+        delay = POLL_INTERVAL_SECONDS - (time.monotonic() - started)
         if delay > 0:
             time.sleep(delay)
     print("recovery keeper stopped by operator; leaving full-cooling state intact",
@@ -443,7 +628,7 @@ def main() -> int:
             print("runtime recovery verified Candidate14/advanced with Cooler Boost on",
                   file=sys.stderr)
             return 1 if success_result else 0
-        print("FATAL: full-cooling recovery could not be physically verified; "
+        print("FATAL: full-cooling fan response could not be verified; "
               "Cooler Boost was requested without a factory fallback", file=sys.stderr)
         return 1
     finally:

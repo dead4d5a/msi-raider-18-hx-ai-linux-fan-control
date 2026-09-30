@@ -12,17 +12,27 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-      - name: Python syntax
-        run: python3 -m py_compile src/msi-fan-profile src/msi-fan-profiled src/msi-gpu-recover
-      - name: Runtime policy tests
-        run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -p 'test_*.py'
-      - name: Shell syntax
-        run: bash -n scripts/*.sh
       - name: Install ShellCheck
         run: sudo apt-get update && sudo apt-get install -y shellcheck
-      - name: ShellCheck
-        run: shellcheck scripts/*.sh
-      - name: JSON
-        run: python3 -m json.tool data/results.json >/dev/null
-      - name: Release integrity
+      - name: Syntax, policies, compiled snapshot harness, ShellCheck and integrity
         run: ./scripts/verify-release.sh
+
+  driver-build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Pinned upstream driver
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: BeardOverflow/msi-ec
+          ref: d7fbbd88e6831e56801b860e46475cbf8ddbc7c1
+          path: .driver-build-source
+          persist-credentials: false
+      - name: Build prerequisites
+        run: sudo apt-get update && sudo apt-get install -y build-essential linux-headers-generic kmod
+      - name: Verify patch and build without installing or loading
+        shell: bash
+        run: |
+          kernel_build=$(find /lib/modules -mindepth 2 -maxdepth 2 -name build -printf '%h\n' | sort -V | tail -n1)
+          test -n "$kernel_build"
+          ./scripts/verify-driver-build.sh .driver-build-source "${kernel_build##*/}"

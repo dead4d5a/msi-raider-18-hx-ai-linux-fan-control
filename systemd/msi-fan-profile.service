@@ -11,6 +11,7 @@ OnFailure=msi-fan-profile-keeper.service
 Type=notify
 NotifyAccess=main
 Environment=MSI_CALIBRATION_PROFILE=candidate14
+Environment=MSI_FAN_TIMING_METRICS=0
 ExecStart=/usr/local/libexec/msi-fan-profiled
 ExecStopPost=+/usr/local/libexec/msi-gpu-recover candidate14
 WatchdogSec=5s

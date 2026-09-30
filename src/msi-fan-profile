@@ -3,171 +3,633 @@
 """Exact-command manager for the persistent MSI Candidate14 fan profile."""
 from __future__ import annotations
 
-import fcntl,json,os,pathlib,signal,stat,subprocess,sys,time
+import fcntl
+import json
+import math
+import os
+import pathlib
+import signal
+import stat
+import subprocess
+import sys
+import time
+from typing import TypedDict
 
-BASE=pathlib.Path('/sys/devices/platform/msi-ec');SERVICE='msi-fan-profile.service';KEEPER='msi-fan-profile-keeper.service'
-OVERRIDE=pathlib.Path('/run/msi-fan-profile.factory-auto');ACK=pathlib.Path('/run/msi-fan-profile.ack');RECOVERY_LATCH=pathlib.Path('/run/msi-fan-profile.recovery-boost');RECOVERY_LATCH_PAYLOAD=b'candidate14\n'
-MANAGER_LOCK=pathlib.Path('/run/msi-fan-profile-manager.lock');FAN_LOCK=pathlib.Path('/run/msi-fanctl.lock')
-FACTORY='58 64 70 76 82 88 0 25 35 44 58 70 75 52 58 64 70 76 82 0 25 35 44 58 70 75'
-DEFAULT='50 60 70 76 82 88 20 30 40 50 60 80 110 38 40 42 44 55 70 20 30 40 60 70 100 120'
-COMMANDS=('status','apply-default','factory-auto','boost-on','boost-release')
-class ManagerError(RuntimeError):pass
 
-def read(p):
- with pathlib.Path(p).open('r',encoding='ascii') as f:return f.read().strip()
-def run(*a,check=True,timeout=45):return subprocess.run(a,stdin=subprocess.DEVNULL,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True,timeout=timeout,check=check,env={'PATH':'/usr/sbin:/usr/bin:/sbin:/bin','LC_ALL':'C'})
-def ctl(*a,check=True,timeout=45):return run('/usr/bin/systemctl',*a,check=check,timeout=timeout)
-def identity():
- e={pathlib.Path('/sys/class/dmi/id/product_name'):'Raider 18 HX AI A2XWIG',pathlib.Path('/sys/class/dmi/id/board_name'):'MS-1824',pathlib.Path('/sys/class/dmi/id/bios_version'):'E1824IMS.310',pathlib.Path('/sys/module/msi_ec/version'):'0.13.1',pathlib.Path('/sys/module/msi_ec/srcversion'):'AB0BFAE2391B5ADD66E01BD',BASE/'fw_version':'1824EMS1.108'}
- if pathlib.Path('/sys/module/ec_sys').exists():raise ManagerError('ec_sys is loaded')
- for p,w in e.items():
-  v=read(p)
-  if v!=w:raise ManagerError(f'identity mismatch {p}={v!r}')
-def write(p,v):
- identity()
- with pathlib.Path(p).open('w',encoding='ascii') as f:f.write(v+'\n');f.flush()
- if read(p)!=v:raise ManagerError(f'readback mismatch {p}')
-def lock(p,blocking=False):
- i=p.stat()
- if not stat.S_ISREG(i.st_mode) or i.st_uid or i.st_gid or stat.S_IMODE(i.st_mode)!=0o600:raise ManagerError(f'unsafe lock {p}')
- fd=os.open(p,os.O_RDONLY|os.O_NOFOLLOW|os.O_CLOEXEC);op=fcntl.LOCK_EX|(0 if blocking else fcntl.LOCK_NB)
- try:fcntl.flock(fd,op)
- except BlockingIOError as e:os.close(fd);raise ManagerError(f'lock busy {p}') from e
- return fd
+# Repository commands use the sibling module. The installed manager lives in
+# sbin, so its shared, root-owned helper is resolved from the fixed libexec path.
+_source_directory = pathlib.Path(__file__).resolve().parent
+_helper_directory = (_source_directory if (_source_directory / 'msi_fan_control.py').is_file()
+                     else pathlib.Path('/usr/local/libexec'))
+sys.path.insert(0, str(_helper_directory))
+import msi_fan_control as fan_control
+
+
+BASE = pathlib.Path('/sys/devices/platform/msi-ec')
+SERVICE = 'msi-fan-profile.service'
+KEEPER = 'msi-fan-profile-keeper.service'
+OVERRIDE = pathlib.Path('/run/msi-fan-profile.factory-auto')
+ACK = pathlib.Path('/run/msi-fan-profile.ack')
+HEALTH = pathlib.Path('/run/msi-fan-profile.health.json')
+HEALTH_MAX_AGE_SECONDS = 5.0
+RECOVERY_LATCH = pathlib.Path('/run/msi-fan-profile.recovery-boost')
+RECOVERY_LATCH_PAYLOAD = b'candidate14\n'
+MANAGER_LOCK = pathlib.Path('/run/msi-fan-profile-manager.lock')
+FAN_LOCK = pathlib.Path('/run/msi-fanctl.lock')
+FACTORY = '58 64 70 76 82 88 0 25 35 44 58 70 75 52 58 64 70 76 82 0 25 35 44 58 70 75'
+DEFAULT = '50 60 70 76 82 88 20 30 40 50 60 80 110 38 40 42 44 55 70 20 30 40 60 70 100 120'
+COMMANDS = ('status', 'apply-default', 'factory-auto', 'boost-on', 'boost-release')
+UNIT_PROPERTIES = ('Id', 'ActiveState', 'SubState', 'MainPID', 'Job', 'UnitFileState')
+
+
+class ManagerError(RuntimeError):
+    pass
+
+
+class UnitState(TypedDict):
+    Id: str
+    ActiveState: str
+    SubState: str
+    MainPID: str
+    Job: str
+    UnitFileState: str
+
+
+def read(path):
+    with pathlib.Path(path).open('r', encoding='ascii') as stream:
+        return stream.read().strip()
+
+
+def run(*args, check=True, timeout=45):
+    return subprocess.run(
+        args, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE, text=True, timeout=timeout, check=check,
+        env={'PATH': '/usr/sbin:/usr/bin:/sbin:/bin', 'LC_ALL': 'C'})
+
+
+def ctl(*args, check=True, timeout=45):
+    return run('/usr/bin/systemctl', *args, check=check, timeout=timeout)
+
+
+def identity(*, monitoring=False) -> dict[pathlib.Path, str]:
+    try:
+        return fan_control.identity(read, BASE, monitoring=monitoring)
+    except fan_control.ControlABIError as error:
+        raise ManagerError(str(error)) from error
+
+
+def write(path, value):
+    identity()
+    with pathlib.Path(path).open('w', encoding='ascii') as stream:
+        stream.write(value + '\n')
+        stream.flush()
+    if read(path) != value:
+        raise ManagerError(f'readback mismatch {path}')
+
+
+def lock(path, blocking=False):
+    info = path.stat()
+    if (not stat.S_ISREG(info.st_mode) or info.st_uid or info.st_gid or
+            stat.S_IMODE(info.st_mode) != 0o600):
+        raise ManagerError(f'unsafe lock {path}')
+    descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    operation = fcntl.LOCK_EX | (0 if blocking else fcntl.LOCK_NB)
+    try:
+        fcntl.flock(descriptor, operation)
+    except BlockingIOError as error:
+        os.close(descriptor)
+        raise ManagerError(f'lock busy {path}') from error
+    return descriptor
+
+
 def marker():
- try:i=OVERRIDE.lstat()
- except FileNotFoundError:return False
- if not stat.S_ISREG(i.st_mode) or i.st_uid or i.st_gid or stat.S_IMODE(i.st_mode)!=0o600:raise ManagerError('unsafe override marker')
- return True
+    try:
+        info = OVERRIDE.lstat()
+    except FileNotFoundError:
+        return False
+    if (not stat.S_ISREG(info.st_mode) or info.st_uid or info.st_gid or
+            stat.S_IMODE(info.st_mode) != 0o600):
+        raise ManagerError('unsafe override marker')
+    return True
+
+
 def make_marker():
- if marker():return
- fd=os.open(OVERRIDE,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW|os.O_CLOEXEC,0o600);os.fchown(fd,0,0);os.fchmod(fd,0o600);os.close(fd)
- if not marker():raise ManagerError('marker verification failed')
+    if marker():
+        return
+    descriptor = os.open(
+        OVERRIDE, os.O_WRONLY | os.O_CREAT | os.O_EXCL |
+        os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+    try:
+        os.fchown(descriptor, 0, 0)
+        os.fchmod(descriptor, 0o600)
+    finally:
+        os.close(descriptor)
+    if not marker():
+        raise ManagerError('marker verification failed')
+
+
+def private_file_bytes(path, label, maximum_bytes, mode=0o600):
+    """Pin an atomic daemon publication without following another pathname."""
+    info = path.lstat()
+
+    def safe(metadata):
+        return (stat.S_ISREG(metadata.st_mode) and metadata.st_uid == 0 and
+                metadata.st_gid == 0 and stat.S_IMODE(metadata.st_mode) == mode and
+                metadata.st_nlink == 1)
+
+    if not safe(info):
+        raise ManagerError(f'unsafe {label}')
+    descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    try:
+        pinned = os.fstat(descriptor)
+        if ((pinned.st_dev, pinned.st_ino) != (info.st_dev, info.st_ino) or
+                not safe(pinned)):
+            raise ManagerError(f'{label} changed during validation')
+        payload = os.read(descriptor, maximum_bytes + 1)
+    finally:
+        os.close(descriptor)
+    if len(payload) > maximum_bytes:
+        raise ManagerError(f'oversized {label}')
+    return payload
+
+
+def published_file_bytes(path, label, maximum_bytes, mode=0o600):
+    """Retry one concurrent atomic replacement; retain all ownership checks."""
+    for attempt in range(2):
+        try:
+            return private_file_bytes(path, label, maximum_bytes, mode=mode)
+        except ManagerError as error:
+            if attempt == 0 and str(error) == f'{label} changed during validation':
+                continue
+            raise
+
+
 def recovery_latch():
- try:i=RECOVERY_LATCH.lstat()
- except FileNotFoundError:return False
- if not stat.S_ISREG(i.st_mode) or i.st_uid or i.st_gid or stat.S_IMODE(i.st_mode)!=0o600 or i.st_nlink!=1:raise ManagerError('unsafe recovery Boost latch')
- fd=os.open(RECOVERY_LATCH,os.O_RDONLY|os.O_NOFOLLOW|os.O_CLOEXEC)
- try:
-  p=os.fstat(fd)
-  if (p.st_dev,p.st_ino)!=(i.st_dev,i.st_ino) or not stat.S_ISREG(p.st_mode) or p.st_uid or p.st_gid or stat.S_IMODE(p.st_mode)!=0o600 or p.st_nlink!=1:raise ManagerError('recovery Boost latch changed during validation')
-  payload=os.read(fd,len(RECOVERY_LATCH_PAYLOAD)+1)
- finally:os.close(fd)
- if payload!=RECOVERY_LATCH_PAYLOAD:raise ManagerError('invalid recovery Boost latch payload')
- return True
+    try:
+        payload = private_file_bytes(
+            RECOVERY_LATCH, 'recovery Boost latch', len(RECOVERY_LATCH_PAYLOAD))
+    except FileNotFoundError:
+        return False
+    if payload != RECOVERY_LATCH_PAYLOAD:
+        raise ManagerError('invalid recovery Boost latch payload')
+    return True
+
+
+def recovery_latch_metadata():
+    """Report an existing private marker without requiring its payload to be readable.
+
+    Status can run unprivileged. Presence already prevents a healthy managed
+    configuration; privileged clear and daemon handoff still validate payloads.
+    """
+    try:
+        info = RECOVERY_LATCH.lstat()
+    except FileNotFoundError:
+        return False
+    if (not stat.S_ISREG(info.st_mode) or info.st_uid != 0 or info.st_gid != 0 or
+            stat.S_IMODE(info.st_mode) != 0o600 or info.st_nlink != 1):
+        raise ManagerError('unsafe recovery Boost latch')
+    return True
+
+
 def clear_recovery_latch():
- if not recovery_latch():return
- RECOVERY_LATCH.unlink()
- if recovery_latch():raise ManagerError('recovery Boost latch remained after factory handoff')
+    if not recovery_latch():
+        return
+    RECOVERY_LATCH.unlink()
+    if recovery_latch():
+        raise ManagerError('recovery Boost latch remained after factory handoff')
+
+
+def unit_states(*services) -> dict[str, UnitState]:
+    """Query related service properties in one systemctl invocation."""
+    result = ctl('show', *services,
+                 '--property=' + ','.join(UNIT_PROPERTIES), timeout=8)
+    states = {}
+    for block in result.stdout.strip().split('\n\n'):
+        values = dict(line.split('=', 1) for line in block.splitlines() if '=' in line)
+        if not set(UNIT_PROPERTIES).issubset(values):
+            raise ManagerError('incomplete systemd unit properties')
+        name = values['Id']
+        if name in states:
+            raise ManagerError(f'duplicate systemd unit properties: {name}')
+        states[name] = values
+    if any(service not in states for service in services):
+        raise ManagerError('missing systemd unit properties')
+    return states
+
+
 def unit_state(service=SERVICE):
- vals={k:ctl('show',service,f'-p{k}','--value',timeout=8).stdout.strip() for k in ('ActiveState','SubState','MainPID','Job')}
- return vals
+    return unit_states(service)[service]
+
+
 def inactive_dead(service=SERVICE):
- s=unit_state(service);return s['ActiveState']=='inactive' and s['SubState']=='dead' and s['MainPID']=='0' and not s['Job']
+    state = unit_state(service)
+    return (state['ActiveState'] == 'inactive' and state['SubState'] == 'dead' and
+            state['MainPID'] == '0' and not state['Job'])
+
+
 def stop_keeper():
- ctl('stop',KEEPER,check=False,timeout=50);ctl('reset-failed',KEEPER,check=False,timeout=10)
- if not inactive_dead(KEEPER):raise ManagerError('recovery keeper did not become inactive/dead')
+    ctl('stop', KEEPER, check=False, timeout=50)
+    ctl('reset-failed', KEEPER, check=False, timeout=10)
+    if not inactive_dead(KEEPER):
+        raise ManagerError('recovery keeper did not become inactive/dead')
+
+
+def validated_enable_state(state):
+    if state not in ('enabled', 'disabled'):
+        raise ManagerError(f'unknown service enable state: {state!r}')
+    return state
+
+
 def enable_state():
- r=ctl('is-enabled',SERVICE,check=False,timeout=8);state=r.stdout.strip()
- if state not in ('enabled','disabled'):raise ManagerError(f'unknown service enable state: {state!r} rc={r.returncode}')
- return state
-def enabled():return enable_state()=='enabled'
-def active():return ctl('is-active','--quiet',SERVICE,check=False,timeout=8).returncode==0
+    result = ctl('is-enabled', SERVICE, check=False, timeout=8)
+    return validated_enable_state(result.stdout.strip())
+
+
+def enabled():
+    return enable_state() == 'enabled'
+
+
+def active():
+    return ctl('is-active', '--quiet', SERVICE, check=False, timeout=8).returncode == 0
+
+
 def hw():
- c=read(BASE/'fan_curve');return {'curve':'candidate14' if c==DEFAULT else 'factory' if c==FACTORY else 'unknown','raw':c,'mode':read(BASE/'fan_mode'),'boost':read(BASE/'cooler_boost')}
+    curve = read(BASE / 'fan_curve')
+    return {
+        'curve': 'candidate14' if curve == DEFAULT else 'factory' if curve == FACTORY else 'unknown',
+        'raw': curve,
+        'mode': read(BASE / 'fan_mode'),
+        'boost': read(BASE / 'cooler_boost'),
+    }
+
+
 def restore_factory_locked(release=True):
- for p,v in ((BASE/'cooler_boost','on'),(BASE/'fan_mode','auto'),(BASE/'fan_curve',FACTORY),(BASE/'cooler_boost','on')):write(p,v)
- h=hw()
- if h['raw']!=FACTORY or h['mode']!='auto' or h['boost']!='on':raise ManagerError('factory envelope verification failed')
- if release:
-  core=[p for p in pathlib.Path('/sys/class/hwmon').glob('hwmon*') if (p/'name').exists() and read(p/'name')=='coretemp']
-  if len(core)!=1:raise ManagerError('coretemp discovery failed')
-  pkg=int(read(core[0]/'temp1_input'));cpu=int(read(BASE/'cpu/realtime_temperature'));gpu=int(read(BASE/'gpu/realtime_temperature'))
-  if max(pkg,cpu*1000)>=85000 or not (gpu==0 or gpu<70):raise ManagerError('factory restored but too hot to release Boost')
-  write(BASE/'fan_mode','auto');write(BASE/'cooler_boost','off')
-  h=hw()
-  if h['raw']!=FACTORY or h['mode']!='auto' or h['boost']!='off':write(BASE/'cooler_boost','on');raise ManagerError('factory auto/off verification failed')
+    for path, value in (
+            (BASE / 'cooler_boost', 'on'), (BASE / 'fan_mode', 'auto'),
+            (BASE / 'fan_curve', FACTORY), (BASE / 'cooler_boost', 'on')):
+        write(path, value)
+    hardware = hw()
+    if (hardware['raw'] != FACTORY or hardware['mode'] != 'auto' or
+            hardware['boost'] != 'on'):
+        raise ManagerError('factory envelope verification failed')
+    if not release:
+        return
+    core = [path for path in pathlib.Path('/sys/class/hwmon').glob('hwmon*')
+            if (path / 'name').exists() and read(path / 'name') == 'coretemp']
+    if len(core) != 1:
+        raise ManagerError('coretemp discovery failed')
+    package = int(read(core[0] / 'temp1_input'))
+    cpu = int(read(BASE / 'cpu/realtime_temperature'))
+    gpu = int(read(BASE / 'gpu/realtime_temperature'))
+    if not (0 <= package <= 110000 and 0 <= cpu <= 110 and 0 <= gpu <= 110):
+        raise ManagerError('factory restored but telemetry is invalid; Boost retained')
+    if max(package, cpu * 1000) >= 85000 or not (gpu == 0 or gpu < 70):
+        raise ManagerError('factory restored but too hot to release Boost')
+    write(BASE / 'fan_mode', 'auto')
+    write(BASE / 'cooler_boost', 'off')
+    hardware = hw()
+    if (hardware['raw'] != FACTORY or hardware['mode'] != 'auto' or
+            hardware['boost'] != 'off'):
+        write(BASE / 'cooler_boost', 'on')
+        raise ManagerError('factory auto/off verification failed')
+
+
 def disable_and_safe_factory():
- marker_error=None
- try:make_marker()
- except Exception as e:marker_error=e
- stop_keeper()
- ctl('disable',SERVICE,check=False,timeout=20);ctl('stop',SERVICE,check=False,timeout=45);ctl('reset-failed',SERVICE,check=False,timeout=10)
- if not inactive_dead():raise ManagerError('service not inactive/dead during fail-safe')
- if enabled():raise ManagerError('service remained persistently enabled during fail-safe')
- fd=lock(FAN_LOCK)
- try:restore_factory_locked(release=False)
- finally:os.close(fd)
- if marker_error is not None:raise ManagerError(f'unsafe override marker prevented verified boot block: {marker_error}')
+    marker_error = None
+    try:
+        make_marker()
+    except Exception as error:
+        marker_error = error
+    stop_keeper()
+    ctl('disable', SERVICE, check=False, timeout=20)
+    ctl('stop', SERVICE, check=False, timeout=45)
+    ctl('reset-failed', SERVICE, check=False, timeout=10)
+    if not inactive_dead():
+        raise ManagerError('service not inactive/dead during fail-safe')
+    if enabled():
+        raise ManagerError('service remained persistently enabled during fail-safe')
+    descriptor = lock(FAN_LOCK)
+    try:
+        restore_factory_locked(release=False)
+    finally:
+        os.close(descriptor)
+    if marker_error is not None:
+        raise ManagerError(
+            'unsafe override marker prevented verified boot block: ' + str(marker_error))
+
+
 def full_status():
- identity();s=unit_state();k=unit_state(KEEPER);h=hw();return {'service_enabled':enabled(),'service_active_state':s['ActiveState'],'service_sub_state':s['SubState'],'service_main_pid':int(s['MainPID'] or 0),'service_job':s['Job'],'keeper_active_state':k['ActiveState'],'keeper_sub_state':k['SubState'],'keeper_main_pid':int(k['MainPID'] or 0),'keeper_job':k['Job'],'factory_override':marker(),'recovery_boost_latched':recovery_latch(),'curve':h['curve'],'fan_mode':h['mode'],'cooler_boost':h['boost'],'shift_mode':read(BASE/'shift_mode'),'ec_firmware':read(BASE/'fw_version'),'driver_version':read('/sys/module/msi_ec/version'),'driver_srcversion':read('/sys/module/msi_ec/srcversion')}
+    """Configuration snapshot only; live telemetry must not affect activation."""
+    validated_identity = identity(monitoring=True)
+    units = unit_states(SERVICE, KEEPER)
+    primary, keeper = units[SERVICE], units[KEEPER]
+    if validated_identity[fan_control.SOURCE_PATH] == fan_control.SNAPSHOT_SRCVERSION:
+        try:
+            controls = fan_control.snapshot(read, BASE)
+        except fan_control.ControlABIError as error:
+            raise ManagerError(str(error)) from error
+        curve = ('candidate14' if controls.curve == DEFAULT
+                 else 'factory' if controls.curve == FACTORY else 'unknown')
+        hardware = {'curve': curve, 'mode': controls.mode, 'boost': controls.boost}
+        shift, firmware = controls.shift, controls.firmware
+    else:
+        hardware = hw()
+        shift = read(BASE / 'shift_mode')
+        firmware = validated_identity[BASE / 'fw_version']
+    return {
+        'service_enabled': validated_enable_state(primary['UnitFileState']) == 'enabled',
+        'service_active_state': primary['ActiveState'],
+        'service_sub_state': primary['SubState'],
+        'service_main_pid': int(primary['MainPID'] or 0),
+        'service_job': primary['Job'],
+        'keeper_active_state': keeper['ActiveState'],
+        'keeper_sub_state': keeper['SubState'],
+        'keeper_main_pid': int(keeper['MainPID'] or 0),
+        'keeper_job': keeper['Job'],
+        'factory_override': marker(),
+        'recovery_boost_latched': recovery_latch_metadata(),
+        'curve': hardware['curve'],
+        'fan_mode': hardware['mode'],
+        'cooler_boost': hardware['boost'],
+        'shift_mode': shift,
+        'ec_firmware': firmware,
+        'driver_version': validated_identity[pathlib.Path('/sys/module/msi_ec/version')],
+        'driver_srcversion': validated_identity[pathlib.Path('/sys/module/msi_ec/srcversion')],
+    }
+
+
+def unit_inactive(snapshot, prefix):
+    return (snapshot[prefix + '_active_state'] == 'inactive' and
+            snapshot[prefix + '_sub_state'] == 'dead' and
+            snapshot[prefix + '_main_pid'] == 0 and not snapshot[prefix + '_job'])
+
+
+def managed_default(snapshot, require_boost=True):
+    return (snapshot['service_enabled'] and
+            snapshot['service_active_state'] == 'active' and
+            snapshot['service_sub_state'] == 'running' and
+            snapshot['service_main_pid'] > 0 and not snapshot['service_job'] and
+            unit_inactive(snapshot, 'keeper') and not snapshot['factory_override'] and
+            not snapshot['recovery_boost_latched'] and
+            snapshot['curve'] == 'candidate14' and snapshot['fan_mode'] == 'advanced' and
+            (not require_boost or snapshot['cooler_boost'] in ('on', 'off')))
+
+
+def factory_override(snapshot):
+    return (snapshot['service_enabled'] and unit_inactive(snapshot, 'service') and
+            unit_inactive(snapshot, 'keeper') and snapshot['factory_override'] and
+            not snapshot['recovery_boost_latched'] and snapshot['curve'] == 'factory' and
+            snapshot['fan_mode'] == 'auto' and snapshot['cooler_boost'] == 'off')
+
+
+def health_snapshot(pid):
+    """Report freshness independently of the stable configuration comparison."""
+    try:
+        health = json.loads(published_file_bytes(
+            HEALTH, 'controller health file', 65536, mode=0o644))
+        required = {
+            'schema', 'pid', 'sampled_monotonic_ns', 'last_valid_monotonic_ns',
+            'state', 'reason', 'manual_boost', 'automatic_boost', 'release_pending',
+            'physical_response_verified', 'cooldown_elapsed_seconds', 'telemetry',
+            'channel_errors',
+        }
+        if (not isinstance(health, dict) or not required.issubset(health) or
+                type(health.get('schema')) is not int or health['schema'] != 1):
+            raise ManagerError('unsupported controller health schema')
+        for key in ('pid', 'sampled_monotonic_ns'):
+            if type(health.get(key)) is not int or health[key] < 0:
+                raise ManagerError(f'invalid controller health {key}')
+        if health['pid'] != pid or pid <= 0:
+            raise ManagerError('controller health belongs to a different daemon PID')
+        if health.get('state') not in ('normal', 'cooling', 'degraded'):
+            raise ManagerError('invalid controller health state')
+        if health['reason'] is not None and not isinstance(health['reason'], str):
+            raise ManagerError('invalid controller health reason')
+        for key in ('manual_boost', 'automatic_boost', 'release_pending',
+                    'physical_response_verified'):
+            if type(health.get(key)) is not bool:
+                raise ManagerError(f'invalid controller health {key}')
+        elapsed = health.get('cooldown_elapsed_seconds')
+        if (type(elapsed) not in (int, float) or not math.isfinite(elapsed) or elapsed < 0):
+            raise ManagerError('invalid controller health cooldown')
+        errors = health.get('channel_errors')
+        if (not isinstance(errors, dict) or
+                any(not isinstance(key, str) or not isinstance(value, str)
+                    for key, value in errors.items())):
+            raise ManagerError('invalid controller health channel errors')
+        telemetry = health.get('telemetry')
+        ranges = {'package_millidegrees': 110000, 'ec_cpu_celsius': 110,
+                  'ec_gpu_celsius': 110, 'fan1_rpm': 10000, 'fan2_rpm': 10000}
+        if telemetry is not None:
+            if not isinstance(telemetry, dict) or not set(ranges).issubset(telemetry):
+                raise ManagerError('invalid controller health telemetry')
+            for key, maximum in ranges.items():
+                value = telemetry[key]
+                if value is not None and (type(value) is not int or not 0 <= value <= maximum):
+                    raise ManagerError(f'invalid controller health telemetry {key}')
+        now = time.monotonic_ns()
+        sampled = health['sampled_monotonic_ns']
+        if sampled > now:
+            raise ManagerError('controller health timestamp is in the future')
+        last_valid = health.get('last_valid_monotonic_ns')
+        if last_valid is not None and (
+                type(last_valid) is not int or not 0 <= last_valid <= sampled):
+            raise ManagerError('invalid controller health last-valid timestamp')
+        age = (now - sampled) / 1e9
+        health['age_seconds'] = round(age, 3)
+        health['last_valid_age_seconds'] = (
+            None if last_valid is None else round((now - last_valid) / 1e9, 3))
+        health['status'] = 'fresh' if age <= HEALTH_MAX_AGE_SECONDS else 'stale'
+        return health
+    except FileNotFoundError:
+        return {'status': 'missing', 'reason': 'controller health file is not published'}
+    except (ManagerError, OSError, ValueError, TypeError) as error:
+        return {'status': 'invalid', 'reason': str(error)}
+
+
 def status():
- first=full_status();time.sleep(.05);second=full_status();stable=first==second;second['snapshot_stable']=stable;print(json.dumps(second,indent=2,sort_keys=True));s=second;keeper_inactive=s['keeper_active_state']=='inactive' and s['keeper_sub_state']=='dead' and s['keeper_main_pid']==0 and not s['keeper_job'];default=stable and s['service_enabled'] and s['service_active_state']=='active' and s['service_sub_state']=='running' and s['service_main_pid']>0 and not s['service_job'] and keeper_inactive and not s['factory_override'] and not s['recovery_boost_latched'] and s['curve']=='candidate14' and s['fan_mode']=='advanced' and s['cooler_boost'] in ('on','off');override=stable and s['service_enabled'] and s['service_active_state']=='inactive' and s['service_sub_state']=='dead' and s['service_main_pid']==0 and not s['service_job'] and keeper_inactive and s['factory_override'] and not s['recovery_boost_latched'] and s['curve']=='factory' and s['fan_mode']=='auto' and s['cooler_boost']=='off';return 0 if default or override else 1
+    """Exit 0 for valid normal/cooling or factory override; 1 for degraded/stale."""
+    first = full_status()
+    time.sleep(.05)
+    second = full_status()
+    stable = first == second
+    report = dict(second)
+    report['snapshot_stable'] = stable
+    default = managed_default(second)
+    override = factory_override(second)
+    report['configuration_valid'] = stable and (default or override)
+    if second['service_main_pid'] > 0:
+        health = health_snapshot(second['service_main_pid'])
+    else:
+        health = {'status': 'not-applicable', 'reason': 'primary controller is not running'}
+    report['health'] = health
+    healthy = (health['status'] == 'fresh' and health.get('state') in ('normal', 'cooling'))
+    print(json.dumps(report, indent=2, sort_keys=True))
+    return 0 if stable and (override or (default and healthy)) else 1
+
+
 def root():
- if os.geteuid():raise ManagerError('root required; use sudo')
+    if os.geteuid():
+        raise ManagerError('root required; use sudo')
+
+
 def apply_default():
- root();identity();fd=lock(MANAGER_LOCK);start_attempted=False
- try:
-  if marker():OVERRIDE.unlink()
-  stop_keeper();ctl('reset-failed',SERVICE,check=False,timeout=10);ctl('enable',SERVICE,timeout=20);start_attempted=True;ctl('start',SERVICE,timeout=50)
-  s=full_status()
-  ok=s['service_enabled'] and s['service_active_state']=='active' and s['service_sub_state']=='running' and s['service_main_pid']>0 and not s['service_job'] and s['keeper_active_state']=='inactive' and s['keeper_sub_state']=='dead' and s['keeper_main_pid']==0 and not s['keeper_job'] and not s['factory_override'] and not s['recovery_boost_latched'] and s['curve']=='candidate14' and s['fan_mode']=='advanced'
-  if not ok:raise ManagerError('default invariant failed')
-  print('Candidate14 is active and enabled for future boots.')
- except Exception as e:
-  if start_attempted:raise ManagerError(f'apply-default activation failed after start was attempted: {e}; left service state and runtime full-cooling recovery untouched') from e
-  try:disable_and_safe_factory()
-  except Exception as r:raise ManagerError(f'apply-default failed: {e}; fail-safe failed: {r}') from e
-  raise ManagerError(f'apply-default failed: {e}; service disabled, factory auto with Boost on') from e
- finally:os.close(fd)
+    root()
+    identity()
+    descriptor = lock(MANAGER_LOCK)
+    start_attempted = False
+    try:
+        if marker():
+            OVERRIDE.unlink()
+        stop_keeper()
+        ctl('reset-failed', SERVICE, check=False, timeout=10)
+        ctl('enable', SERVICE, timeout=20)
+        start_attempted = True
+        ctl('start', SERVICE, timeout=50)
+        if not managed_default(full_status(), require_boost=False):
+            raise ManagerError('default invariant failed')
+        print('Candidate14 is active and enabled for future boots.')
+    except Exception as error:
+        if start_attempted:
+            raise ManagerError(
+                f'apply-default activation failed after start was attempted: {error}; '
+                'left service state and runtime full-cooling recovery untouched') from error
+        try:
+            disable_and_safe_factory()
+        except Exception as recovery:
+            raise ManagerError(
+                f'apply-default failed: {error}; fail-safe failed: {recovery}') from error
+        raise ManagerError(
+            f'apply-default failed: {error}; service disabled, factory auto with Boost on') from error
+    finally:
+        os.close(descriptor)
+
+
 def factory_auto():
- root();identity();fd=lock(MANAGER_LOCK)
- try:
-  make_marker();stop_keeper();ctl('stop',SERVICE,check=False,timeout=50);ctl('reset-failed',SERVICE,check=False,timeout=10)
-  if not inactive_dead():raise ManagerError('service did not become inactive/dead')
-  fan=lock(FAN_LOCK)
-  try:
-   restore_factory_locked(release=True);clear_recovery_latch()
-  finally:os.close(fan)
-  s=full_status();ok=s['service_enabled'] and s['service_active_state']=='inactive' and s['service_sub_state']=='dead' and s['service_main_pid']==0 and not s['service_job'] and s['keeper_active_state']=='inactive' and s['keeper_sub_state']=='dead' and s['keeper_main_pid']==0 and not s['keeper_job'] and s['factory_override'] and not s['recovery_boost_latched'] and s['curve']=='factory' and s['fan_mode']=='auto' and s['cooler_boost']=='off'
-  if not ok:raise ManagerError('factory override invariant failed')
-  print('Factory auto/off is active until apply-default or reboot.')
- except Exception as e:
-  try:disable_and_safe_factory()
-  except Exception as r:raise ManagerError(f'factory-auto failed: {e}; fail-safe failed: {r}') from e
-  raise ManagerError(f'factory-auto failed: {e}; service disabled, factory auto with Boost on') from e
- finally:os.close(fd)
-def ack(action,pid,after):
- if not ACK.exists():return False
- i=ACK.lstat()
- if not stat.S_ISREG(i.st_mode) or i.st_uid or i.st_gid or stat.S_IMODE(i.st_mode)!=0o600:raise ManagerError('unsafe ack file')
- parts=dict(x.split('=',1) for x in read(ACK).split())
- return parts.get('pid')==str(pid) and parts.get('action')==action and int(parts.get('monotonic_ns','0'))>=after
-def signal_action(action,sig,timeout_s):
- root();identity();fd=lock(MANAGER_LOCK)
- try:
-  s=full_status()
-  if not(s['service_enabled'] and s['service_active_state']=='active' and s['service_sub_state']=='running' and s['service_main_pid']>0 and s['keeper_active_state']=='inactive' and s['keeper_sub_state']=='dead' and s['keeper_main_pid']==0 and not s['keeper_job'] and not s['factory_override'] and s['curve']=='candidate14' and s['fan_mode']=='advanced'):raise ManagerError('active default invariant missing')
-  if action=='boost-release' and s['cooler_boost']=='off':print('Cooler Boost is already off.');return
-  before=time.monotonic_ns();ctl('kill','--kill-whom=main',f'--signal={sig.name}',SERVICE,timeout=10);deadline=None if timeout_s is None else time.monotonic()+timeout_s
-  while deadline is None or time.monotonic()<deadline:
-   if not active():raise ManagerError('service failed while processing request')
-   h=hw()
-   if ack(action,s['service_main_pid'],before):
-    if action=='boost-on' and h['boost']=='on':print('Cooler Boost enabled and physically verified.');return
-    if action=='boost-release' and h['boost']=='off':print('Cooler Boost released after monitored cooldown.');return
-   time.sleep(.25)
-  raise ManagerError(f'{action} was not acknowledged before timeout')
- finally:os.close(fd)
+    root()
+    identity()
+    descriptor = lock(MANAGER_LOCK)
+    try:
+        make_marker()
+        stop_keeper()
+        ctl('stop', SERVICE, check=False, timeout=50)
+        ctl('reset-failed', SERVICE, check=False, timeout=10)
+        if not inactive_dead():
+            raise ManagerError('service did not become inactive/dead')
+        fan_descriptor = lock(FAN_LOCK)
+        try:
+            restore_factory_locked(release=True)
+            clear_recovery_latch()
+        finally:
+            os.close(fan_descriptor)
+        if not factory_override(full_status()):
+            raise ManagerError('factory override invariant failed')
+        print('Factory auto/off is active until apply-default or reboot.')
+    except Exception as error:
+        try:
+            disable_and_safe_factory()
+        except Exception as recovery:
+            raise ManagerError(
+                f'factory-auto failed: {error}; fail-safe failed: {recovery}') from error
+        raise ManagerError(
+            f'factory-auto failed: {error}; service disabled, factory auto with Boost on') from error
+    finally:
+        os.close(descriptor)
+
+
+def acknowledgement():
+    try:
+        payload = published_file_bytes(ACK, 'ack file', 1024).decode('ascii')
+    except FileNotFoundError:
+        return None
+    try:
+        parts = dict(item.split('=', 1) for item in payload.split())
+        return {'pid': int(parts['pid']), 'action': parts['action'],
+                'monotonic_ns': int(parts['monotonic_ns'])}
+    except (KeyError, ValueError) as error:
+        raise ManagerError('invalid ack payload') from error
+
+
+def ack(action, pid, after):
+    response = acknowledgement()
+    return bool(response and response['pid'] == pid and response['action'] == action and
+                response['monotonic_ns'] >= after)
+
+
+def wait_for_request(action, pid, after, timeout_s):
+    deadline = None if timeout_s is None else time.monotonic() + timeout_s
+    while deadline is None or time.monotonic() < deadline:
+        state = unit_state()
+        if (state['ActiveState'] != 'active' or state['SubState'] != 'running' or
+                int(state['MainPID'] or 0) != pid):
+            raise ManagerError('service failed or was replaced while processing request')
+        response = acknowledgement()
+        fresh_response = bool(response and response['pid'] == pid and
+                              response['monotonic_ns'] >= after)
+        if fresh_response and response['action'] == action:
+            # Pending requests need no EC traffic. After a matching terminal
+            # acknowledgement only the final Boost bit needs a direct readback.
+            boost = read(BASE / 'cooler_boost')
+            if action == 'boost-on' and boost == 'on':
+                print('Cooler Boost enabled and fan response verified.')
+                return
+            if action == 'boost-release' and boost == 'off':
+                print('Cooler Boost released after monitored cooldown.')
+                return
+        if fresh_response and action == 'boost-release' and response['action'] == 'boost-on':
+            # A deferred Boost acknowledgement may coexist with a newer queued
+            # release. Confirm current daemon state before reporting cancellation.
+            health = health_snapshot(pid)
+            if (health['status'] == 'fresh' and not health['release_pending'] and
+                    health['sampled_monotonic_ns'] >= response['monotonic_ns']):
+                raise ManagerError('boost-release cancelled by a newer boost-on request')
+        time.sleep(.25)
+    raise ManagerError(f'{action} was not acknowledged before timeout')
+
+
+def signal_action(action, sig, timeout_s):
+    root()
+    identity()
+    descriptor = lock(MANAGER_LOCK)
+    try:
+        snapshot = full_status()
+        if not managed_default(snapshot):
+            raise ManagerError('active default invariant missing')
+        if action == 'boost-release' and snapshot['cooler_boost'] == 'off':
+            print('Cooler Boost is already off.')
+            return
+        before = time.monotonic_ns()
+        ctl('kill', '--kill-whom=main', f'--signal={sig.name}', SERVICE, timeout=10)
+        pid = snapshot['service_main_pid']
+    finally:
+        # Serialize only enqueue: sustained heat must not block a later Boost
+        # request or a guarded controller handoff while this caller waits.
+        os.close(descriptor)
+    wait_for_request(action, pid, before, timeout_s)
+
+
 def main():
- if len(sys.argv)!=2 or sys.argv[1] not in COMMANDS:print('Usage: msi-fan-profile {status|apply-default|factory-auto|boost-on|boost-release}',file=sys.stderr);return 2
- c=sys.argv[1]
- if c=='status':return status()
- if c=='apply-default':apply_default()
- elif c=='factory-auto':factory_auto()
- elif c=='boost-on':signal_action(c,signal.SIGUSR1,25)
- elif c=='boost-release':signal_action(c,signal.SIGUSR2,None)
- return 0
-if __name__=='__main__':
- try:raise SystemExit(main())
- except (ManagerError,subprocess.SubprocessError,OSError,ValueError) as e:print(f'ERROR: {e}',file=sys.stderr);raise SystemExit(1)
+    if len(sys.argv) != 2 or sys.argv[1] not in COMMANDS:
+        print('Usage: msi-fan-profile {status|apply-default|factory-auto|boost-on|boost-release}',
+              file=sys.stderr)
+        return 2
+    command = sys.argv[1]
+    if command == 'status':
+        return status()
+    if command == 'apply-default':
+        apply_default()
+    elif command == 'factory-auto':
+        factory_auto()
+    elif command == 'boost-on':
+        signal_action(command, signal.SIGUSR1, 25)
+    elif command == 'boost-release':
+        signal_action(command, signal.SIGUSR2, None)
+    return 0
+
+
+if __name__ == '__main__':
+    try:
+        raise SystemExit(main())
+    except (ManagerError, subprocess.SubprocessError, OSError, ValueError) as error:
+        print(f'ERROR: {error}', file=sys.stderr)
+        raise SystemExit(1)

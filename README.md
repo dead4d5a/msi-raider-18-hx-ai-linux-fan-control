@@ -23,7 +23,7 @@ fan curve.
 | OS | Ubuntu 24.04.4 LTS |
 | Kernel tested | `7.0.0-31-generic` |
 | Secure Boot | Enabled |
-| Local driver | `msi_ec 0.13.1`, srcversion `AB0BFAE2391B5ADD66E01BD` |
+| Local driver | `msi_ec 0.13.1`; pinned legacy `AB0BFAE2391B5ADD66E01BD` or snapshot `9086C45007CBB7FA1264430` |
 
 The upstream firmware comment names the RTX 5090 A2XWJG variant. This repository
 was measured on the **A2XWIG RTX 5080 variant** with the same board and exact EC
@@ -45,6 +45,9 @@ firmware. Related model names alone are not sufficient evidence of compatibility
   active, Cooler Boost is latched and reasserted, and release is blocked until
   complete valid telemetry and physical fan verification return.
 - Preserves temporary Cooler Boost overrides.
+- Reports fresh normal/cooling versus degraded/stale health, with per-channel
+  telemetry, latch ownership, and cooldown progress; missing temperatures do not
+  suppress monitoring of healthy fan channels.
 - Restores the captured factory curve and firmware `auto` mode on clean stop.
 - On a runtime fault with immutable identity still verified, retains Candidate 14
   in `advanced` mode and deliberately leaves Cooler Boost on; a separate,
@@ -143,6 +146,9 @@ Pending:
   handoff/restart validation.
 
 See [Validation status](docs/VALIDATION.md).
+Mocked policy/request/upgrade checks, isolated user-systemd lifecycle tests, and
+a pinned-source driver build check are described in [Contributing](CONTRIBUTING.md).
+These do not replace attended hardware validation or prove thermal optimality.
 
 ## Documentation
 

@@ -4,20 +4,31 @@
 from __future__ import annotations
 
 import fcntl
+import json
 import os
 import pathlib
 import signal
 import socket
 import stat
 import sys
+import tempfile
 import time
 from dataclasses import dataclass
 from typing import Callable
+
+# Source checkouts keep the shared ABI helper beside this script; installed
+# programs use the fixed root-owned libexec directory, never the working directory.
+_ABI_DIR = pathlib.Path(__file__).resolve().parent
+if not (_ABI_DIR / "msi_fan_control.py").is_file():
+    _ABI_DIR = pathlib.Path("/usr/local/libexec")
+sys.path.insert(0, str(_ABI_DIR))
+import msi_fan_control as fan_control
 
 BASE = pathlib.Path("/sys/devices/platform/msi-ec")
 LOCK = pathlib.Path("/run/msi-fanctl.lock")
 OVERRIDE = pathlib.Path("/run/msi-fan-profile.factory-auto")
 ACK = pathlib.Path("/run/msi-fan-profile.ack")
+HEALTH = pathlib.Path("/run/msi-fan-profile.health.json")
 RECOVERY_LATCH = pathlib.Path("/run/msi-fan-profile.recovery-boost")
 RECOVERY_LATCH_PAYLOAD = b"candidate14\n"
 FACTORY = (
@@ -34,6 +45,11 @@ RELEASE_REQUEST = False
 SUSTAINED_ALARM_SECONDS = 15.0
 SUSTAINED_ALARM_REPORT_SECONDS = 60.0
 SENSOR_DEGRADED_REPORT_SECONDS = 60.0
+BOOST_RESPONSE_SECONDS = 12.0
+BOOST_LOW_EVIDENCE_SECONDS = 2.0
+BOOST_RESPONSE_RPM = 3000
+MAX_OBSERVATION_GAP_SECONDS = 2.0
+POLL_INTERVAL_SECONDS = 1.0
 
 
 class ProfileError(RuntimeError):
@@ -47,6 +63,12 @@ class SensorSampleError(ProfileError):
     deglitched while keeping maximum cooling asserted, whereas control,
     identity, and write failures must still fail immediately.
     """
+
+    def __init__(self, message: str, partial: RuntimeSample | None = None,
+                 channel_errors: dict[str, str] | None = None):
+        super().__init__(message)
+        self.partial = partial
+        self.channel_errors = channel_errors or {}
 
 
 def read(path: pathlib.Path) -> str:
@@ -98,19 +120,10 @@ def notify(message: str) -> None:
 
 
 def immutable_identity_valid() -> bool:
-    expected = {
-        pathlib.Path("/sys/class/dmi/id/product_name"): "Raider 18 HX AI A2XWIG",
-        pathlib.Path("/sys/class/dmi/id/board_name"): "MS-1824",
-        pathlib.Path("/sys/class/dmi/id/bios_version"): "E1824IMS.310",
-        pathlib.Path("/sys/module/msi_ec/version"): "0.13.1",
-        pathlib.Path("/sys/module/msi_ec/srcversion"): "AB0BFAE2391B5ADD66E01BD",
-        BASE / "fw_version": "1824EMS1.108",
-    }
-    if pathlib.Path("/sys/module/ec_sys").exists():
-        return False
     try:
-        return all(read(path) == wanted for path, wanted in expected.items())
-    except OSError:
+        fan_control.identity(read, BASE)
+        return True
+    except (OSError, fan_control.ControlABIError):
         return False
 
 
@@ -119,17 +132,44 @@ def require_immutable_identity() -> None:
         raise ProfileError("immutable hardware/driver/EC identity validation failed")
 
 
-def require_policy_identity() -> None:
-    require_immutable_identity()
-    if read(BASE / "shift_mode") != "comfort":
+@dataclass(frozen=True)
+class MonitorControl:
+    state: fan_control.ControlSnapshot
+    acquisition_started: float
+
+
+def require_policy_identity(*, monitoring: bool = False,
+                            timing: TimingMetrics | None = None) -> MonitorControl | None:
+    if not monitoring:
+        require_immutable_identity()
+        shift = read(BASE / "shift_mode")
+        control = None
+    else:
+        try:
+            identity = fan_control.identity(read, BASE, monitoring=True)
+            if identity[fan_control.SOURCE_PATH] == fan_control.SNAPSHOT_SRCVERSION:
+                acquisition_started = time.monotonic()
+                if timing is not None:
+                    timing.begin_sensor(acquisition_started)
+                state = fan_control.snapshot(read, BASE)
+                control = MonitorControl(state, acquisition_started)
+                shift = state.shift
+            else:
+                control = None
+                shift = read(BASE / "shift_mode")
+        except (OSError, fan_control.ControlABIError) as error:
+            raise ProfileError(f"monitoring identity/ABI validation failed: {error}") from error
+    if shift != "comfort":
         raise ProfileError("EC shift mode is no longer comfort")
+    return control
 
 
 def verify_boost(wmi: pathlib.Path, heartbeat: Callable[[str], None]) -> None:
-    write(BASE / "cooler_boost", "on")
     last_sensor_error: SensorSampleError | None = None
-    saw_plausible_rpm = False
+    consecutive_low_samples = 0
     for _ in range(12):
+        # Startup verification must also keep the commanded state asserted.
+        write(BASE / "cooler_boost", "on")
         try:
             fan1 = read_uint(wmi / "fan1_input")
             fan2 = read_uint(wmi / "fan2_input")
@@ -137,22 +177,23 @@ def verify_boost(wmi: pathlib.Path, heartbeat: Callable[[str], None]) -> None:
                 raise SensorSampleError(
                     f"implausible physical fan telemetry: fan1={fan1}RPM "
                     f"fan2={fan2}RPM")
-        except SensorSampleError as error:
+        except (SensorSampleError, OSError) as error:
             # A WMI sentinel or malformed read must not be mistaken for RPM,
             # but a single transient must not defeat a commanded Boost state.
-            last_sensor_error = error
+            last_sensor_error = SensorSampleError(str(error))
+            consecutive_low_samples = 0
             heartbeat(f"Verifying Cooler Boost: invalid fan telemetry: {error}")
             time.sleep(1)
             continue
-        saw_plausible_rpm = True
+        consecutive_low_samples += 1
         heartbeat(f"Verifying Cooler Boost: fans {fan1}/{fan2} RPM")
-        if 3000 <= fan1 <= 10000 and 3000 <= fan2 <= 10000:
+        if BOOST_RESPONSE_RPM <= fan1 <= 10000 and BOOST_RESPONSE_RPM <= fan2 <= 10000:
             return
         time.sleep(1)
-    if not saw_plausible_rpm and last_sensor_error is not None:
+    if consecutive_low_samples < 3:
         raise SensorSampleError(
-            "physical Cooler Boost verification deferred: "
-            f"{last_sensor_error}")
+            "physical Cooler Boost verification deferred: insufficient recent "
+            f"continuous valid RPM evidence; {last_sensor_error}")
     detail = f"; last sensor error: {last_sensor_error}" if last_sensor_error else ""
     raise ProfileError("both physical fans did not verify under Cooler Boost" + detail)
 
@@ -257,39 +298,183 @@ def release_factory_if_cool(core: pathlib.Path) -> bool:
 
 @dataclass(frozen=True)
 class RuntimeSample:
-    package: int
-    ec_cpu: int
-    ec_gpu: int
-    fan1: int
-    fan2: int
+    package: int | None
+    ec_cpu: int | None
+    ec_gpu: int | None
+    fan1: int | None
+    fan2: int | None
 
     @property
     def cpu(self) -> int:
+        if self.package is None or self.ec_cpu is None:
+            raise SensorSampleError("CPU temperature is unavailable")
         return max(self.package, self.ec_cpu * 1000)
 
+    def as_health(self) -> dict[str, int | None]:
+        return dict(zip(
+            ("package_millidegrees", "ec_cpu_celsius", "ec_gpu_celsius",
+             "fan1_rpm", "fan2_rpm"),
+            (self.package, self.ec_cpu, self.ec_gpu, self.fan1, self.fan2)))
 
-def read_runtime_sample(core: pathlib.Path, wmi: pathlib.Path) -> RuntimeSample:
-    """Read one complete plausibility-checked runtime telemetry sample."""
-    sample = RuntimeSample(
-        package=read_uint(core / "temp1_input"),
-        ec_cpu=read_uint(BASE / "cpu/realtime_temperature"),
-        ec_gpu=read_uint(BASE / "gpu/realtime_temperature"),
-        fan1=read_uint(wmi / "fan1_input"),
-        fan2=read_uint(wmi / "fan2_input"),
-    )
-    if sample.ec_cpu == 255:
-        # msi_ec exposes the raw u8 EC read. 0xff is an unavailable/sentinel
-        # byte on this platform, never a plausible CPU temperature.
-        raise SensorSampleError("EC CPU temperature sentinel 255C")
-    if not (0 <= sample.package <= 110000 and 0 <= sample.ec_cpu <= 110 and
-            0 <= sample.ec_gpu <= 110 and 0 <= sample.fan1 <= 10000 and
-            0 <= sample.fan2 <= 10000):
-        raise SensorSampleError(
-            "implausible thermal/fan sensor: "
-            f"package={sample.package}mC ec_cpu={sample.ec_cpu}C "
-            f"ec_gpu={sample.ec_gpu}C fan1={sample.fan1}RPM "
-            f"fan2={sample.fan2}RPM")
+
+def read_runtime_sample(core: pathlib.Path, wmi: pathlib.Path, *,
+                        ec_temperatures: tuple[int, int] | None = None) -> RuntimeSample:
+    """Read every channel, retaining healthy values when another one fails."""
+    values: dict[str, int | None] = {}
+    errors: dict[str, str] = {}
+    for name, path, ceiling, unit in (
+        ("package", core / "temp1_input", 110000, "mC"),
+        ("ec_cpu", BASE / "cpu/realtime_temperature", 110, "C"),
+        ("ec_gpu", BASE / "gpu/realtime_temperature", 110, "C"),
+        ("fan1", wmi / "fan1_input", 10000, "RPM"),
+        ("fan2", wmi / "fan2_input", 10000, "RPM"),
+    ):
+        try:
+            if ec_temperatures is not None and name in ("ec_cpu", "ec_gpu"):
+                value = ec_temperatures[0 if name == "ec_cpu" else 1]
+            else:
+                value = read_uint(path)
+            if name == "ec_cpu" and value == 255:
+                # The exact meaning of the raw firmware byte is unconfirmed;
+                # 255C is certainly unavailable/implausible temperature data.
+                raise SensorSampleError("EC CPU temperature sentinel 255C")
+            if not 0 <= value <= ceiling:
+                raise SensorSampleError(f"implausible {name}={value}{unit}")
+            values[name] = value
+        except (SensorSampleError, OSError) as error:
+            values[name] = None
+            errors[name] = str(error)
+    sample = RuntimeSample(**values)
+    if errors:
+        raise SensorSampleError("; ".join(errors.values()), sample, errors)
     return sample
+
+
+@dataclass
+class BoostResponse:
+    """Incremental per-fan response evidence, independent of temperatures."""
+    started: float
+    fan1_low_since: float | None = None
+    fan2_low_since: float | None = None
+    fan1_low_samples: int = 0
+    fan2_low_samples: int = 0
+    last_observed: float | None = None
+
+    def observe(self, fan1: int | None, fan2: int | None, now: float) -> bool:
+        if self.last_observed is not None and now - self.last_observed > 2:
+            self.fan1_low_since = self.fan2_low_since = None
+            self.fan1_low_samples = self.fan2_low_samples = 0
+        self.last_observed = now
+        for name, rpm in (("fan1", fan1), ("fan2", fan2)):
+            attribute = f"{name}_low_since"
+            count_attribute = f"{name}_low_samples"
+            low = rpm is not None and 0 <= rpm < BOOST_RESPONSE_RPM
+            since = Safety.update_since(getattr(self, attribute), low, now)
+            setattr(self, attribute, since)
+            count = getattr(self, count_attribute) + 1 if low else 0
+            setattr(self, count_attribute, count)
+            if (now - self.started >= BOOST_RESPONSE_SECONDS and since is not None
+                    and count >= 3 and now - since >= BOOST_LOW_EVIDENCE_SECONDS):
+                raise ProfileError(f"{name} did not respond under Cooler Boost: {rpm} RPM")
+        return (fan1 is not None and fan2 is not None and
+                BOOST_RESPONSE_RPM <= fan1 <= 10000 and
+                BOOST_RESPONSE_RPM <= fan2 <= 10000)
+
+
+@dataclass
+class TimingMetrics:
+    """Opt-in bounded diagnostic counters; never determine cooling policy."""
+    completed_loops: int = 0
+    sensor_reads: int = 0
+    deadline_misses: int = 0
+    slow_sensor_reads: int = 0
+    last_loop_duration_ms: float | None = None
+    max_loop_duration_ms: float = 0.0
+    last_sensor_read_duration_ms: float | None = None
+    max_sensor_read_duration_ms: float = 0.0
+    last_observation_gap_seconds: float | None = None
+    max_observation_gap_seconds: float = 0.0
+    loop_started_ns: int | None = None
+    sensor_started_ns: int | None = None
+    previous_observation: float | None = None
+
+    def begin_loop(self) -> None:
+        self.loop_started_ns = time.perf_counter_ns()
+
+    def begin_sensor(self, observed_at: float) -> None:
+        self.sensor_started_ns = time.perf_counter_ns()
+        if self.previous_observation is not None:
+            gap = max(0.0, observed_at - self.previous_observation)
+            self.last_observation_gap_seconds = gap
+            self.max_observation_gap_seconds = max(self.max_observation_gap_seconds, gap)
+        self.previous_observation = observed_at
+
+    def finish_sensor(self, slow: bool) -> None:
+        assert self.sensor_started_ns is not None
+        elapsed_ms = (time.perf_counter_ns() - self.sensor_started_ns) / 1_000_000
+        self.last_sensor_read_duration_ms = elapsed_ms
+        self.max_sensor_read_duration_ms = max(self.max_sensor_read_duration_ms, elapsed_ms)
+        self.sensor_reads += 1
+        self.slow_sensor_reads += int(slow)
+
+    def finish_loop(self) -> None:
+        assert self.loop_started_ns is not None
+        elapsed_ms = (time.perf_counter_ns() - self.loop_started_ns) / 1_000_000
+        self.last_loop_duration_ms = elapsed_ms
+        self.max_loop_duration_ms = max(self.max_loop_duration_ms, elapsed_ms)
+        self.completed_loops += 1
+        self.deadline_misses += int(elapsed_ms > POLL_INTERVAL_SECONDS * 1000)
+
+    def snapshot(self) -> dict[str, int | float | None]:
+        # Loop work includes health publication/notify and excludes cadence sleep.
+        # A snapshot carries the last completed loop, plus this cycle's sensor read.
+        return {
+            "schema": 1,
+            "completed_loops": self.completed_loops,
+            "sensor_reads": self.sensor_reads,
+            "deadline_misses": self.deadline_misses,
+            "slow_sensor_reads": self.slow_sensor_reads,
+            "last_loop_duration_ms": self.last_loop_duration_ms,
+            "max_loop_duration_ms": self.max_loop_duration_ms,
+            "last_sensor_read_duration_ms": self.last_sensor_read_duration_ms,
+            "max_sensor_read_duration_ms": self.max_sensor_read_duration_ms,
+            "last_observation_gap_seconds": self.last_observation_gap_seconds,
+            "max_observation_gap_seconds": self.max_observation_gap_seconds,
+        }
+
+
+def configured_timing_metrics() -> TimingMetrics | None:
+    value = os.environ.get("MSI_FAN_TIMING_METRICS", "0")
+    if value == "1":
+        return TimingMetrics()
+    if value != "0":
+        print(f"WARNING invalid MSI_FAN_TIMING_METRICS={value!r}; timing metrics disabled",
+              file=sys.stderr, flush=True)
+    return None
+
+
+def publish_health(payload: dict[str, object]) -> None:
+    """Atomically publish an unprivileged-readable, root-owned runtime snapshot."""
+    try:
+        info = HEALTH.lstat()
+    except FileNotFoundError:
+        pass
+    else:
+        if (not stat.S_ISREG(info.st_mode) or info.st_uid != 0 or info.st_gid != 0
+                or stat.S_IMODE(info.st_mode) != 0o644 or info.st_nlink != 1):
+            raise ProfileError("unsafe runtime health file")
+    descriptor, temporary = tempfile.mkstemp(
+        prefix=".msi-fan-profile.health.", dir=HEALTH.parent)
+    try:
+        with os.fdopen(descriptor, "w", encoding="ascii") as stream:
+            os.fchown(stream.fileno(), 0, 0)
+            os.fchmod(stream.fileno(), 0o644)
+            json.dump(payload, stream, sort_keys=True, allow_nan=False)
+            stream.write("\n")
+            stream.flush()
+        os.replace(temporary, HEALTH)
+    finally:
+        pathlib.Path(temporary).unlink(missing_ok=True)
 
 
 @dataclass
@@ -449,8 +634,10 @@ def on_stop(_number: int, _frame: object) -> None:
 
 
 def on_boost(_number: int, _frame: object) -> None:
-    global BOOST_REQUEST
+    global BOOST_REQUEST, RELEASE_REQUEST
     BOOST_REQUEST = True
+    # A newer manual-on intent supersedes an older unprocessed release.
+    RELEASE_REQUEST = False
 
 
 def on_release(_number: int, _frame: object) -> None:
@@ -464,6 +651,7 @@ def main() -> int:
         raise ProfileError("root required")
     if read(pathlib.Path("/proc/self/cgroup")) != "0::/system.slice/msi-fan-profile.service":
         raise ProfileError("unexpected service cgroup")
+    timing = configured_timing_metrics()
     info = LOCK.stat()
     if (not stat.S_ISREG(info.st_mode) or info.st_uid != 0 or
             stat.S_IMODE(info.st_mode) != 0o600):
@@ -504,8 +692,6 @@ def main() -> int:
             f"preserved_boost={existing_boost or recovery_latched} "
             f"recovery_latch={recovery_latched}",
               file=sys.stderr, flush=True)
-        notify("READY=1\nWATCHDOG=1\nSTATUS=Candidate14 active")
-
         safety = Safety()
         manual_boost = existing_boost and not recovery_latched
         automatic_boost = recovery_latched
@@ -513,6 +699,71 @@ def main() -> int:
         release_cool_since: float | None = None
         alarm = AlarmHold()
         sensor_hold = SensorHold()
+        response: BoostResponse | None = None
+        boost_ack_pending = False
+        last_valid_monotonic_ns: int | None = None
+        last_runtime_poll: float | None = None
+        observed_monotonic_ns: int | None = None
+        ready = False
+        last_health_error: float | None = None
+
+        def observe_response(sample: RuntimeSample | None, now: float) -> bool:
+            nonlocal response
+            if read(BASE / "cooler_boost") != "on":
+                response = None
+                return False
+            if response is None:
+                response = BoostResponse(now)
+            return response.observe(
+                sample.fan1 if sample else None,
+                sample.fan2 if sample else None, now)
+
+        def runtime_heartbeat(status: str, sample: RuntimeSample | None,
+                              errors: dict[str, str], reason: str | None,
+                              verified: bool, degraded: bool) -> None:
+            nonlocal ready, last_health_error
+            now = time.monotonic()
+            since = release_cool_since if release_pending and manual_boost else safety.cool_since
+            payload = {
+                "schema": 1,
+                "pid": os.getpid(),
+                # Publication time is not observation time: the first channel
+                # may already be old when a later sysfs read finally returns.
+                "sampled_monotonic_ns": observed_monotonic_ns,
+                "state": "degraded" if degraded else (
+                    "cooling" if manual_boost or automatic_boost else "normal"),
+                "reason": reason,
+                "last_valid_monotonic_ns": last_valid_monotonic_ns,
+                "manual_boost": manual_boost,
+                "automatic_boost": automatic_boost,
+                "release_pending": release_pending,
+                "physical_response_verified": verified,
+                "cooldown_elapsed_seconds": 0.0 if since is None else max(0.0, now - since),
+                "telemetry": sample.as_health() if sample else None,
+                "channel_errors": errors,
+            }
+            if timing is not None:
+                payload["timing_metrics"] = timing.snapshot()
+            try:
+                publish_health(payload)
+            except (OSError, ProfileError, ValueError) as error:
+                # Loss of diagnostics must not stop otherwise working cooling.
+                if last_health_error is None or now - last_health_error >= 60:
+                    print(f"WARNING runtime health publication failed: {error}",
+                          file=sys.stderr, flush=True)
+                    last_health_error = now
+            if not ready:
+                notify(f"READY=1\nWATCHDOG=1\nSTATUS={status}")
+                ready = True
+            else:
+                heartbeat(status)
+
+        def complete_iteration(started: float) -> None:
+            if timing is not None:
+                timing.finish_loop()
+            delay = POLL_INTERVAL_SECONDS - (time.monotonic() - started)
+            if delay > 0:
+                time.sleep(delay)
         if initial_physical_verification is False:
             sensor_hold.record(time.monotonic())
             if not manual_boost:
@@ -527,13 +778,18 @@ def main() -> int:
 
         while not STOP:
             started = time.monotonic()
+            if timing is not None:
+                timing.begin_loop()
             try:
                 OVERRIDE.lstat()
             except FileNotFoundError:
                 pass
             else:
                 raise ProfileError("factory-auto runtime override pathname appeared")
-            require_policy_identity()
+            control = require_policy_identity(monitoring=True, timing=timing)
+            # Legacy mocked/real policy checks return no combined acquisition.
+            if not isinstance(control, MonitorControl):
+                control = None
             suspend_offset = (time.clock_gettime(time.CLOCK_BOOTTIME) -
                               time.monotonic())
             if suspend_offset - last_suspend_offset > 2:
@@ -542,6 +798,7 @@ def main() -> int:
                       flush=True)
                 reapply_physical_verification = force_apply_default(
                     wmi, preserve, heartbeat)
+                response = None
                 safety = Safety()
                 release_cool_since = None
                 alarm.clear()
@@ -551,16 +808,21 @@ def main() -> int:
                         automatic_boost = True
                 else:
                     sensor_hold.clear()
+                # Resume/reapply invalidates previously acquired EC temperatures.
+                control = require_policy_identity(monitoring=True, timing=timing)
+                if not isinstance(control, MonitorControl):
+                    control = None
             last_suspend_offset = suspend_offset
 
-            curve = read(BASE / "fan_curve")
-            mode = read(BASE / "fan_mode")
-            boost = read(BASE / "cooler_boost")
+            curve = control.state.curve if control else read(BASE / "fan_curve")
+            mode = control.state.mode if control else read(BASE / "fan_mode")
+            boost = control.state.boost if control else read(BASE / "cooler_boost")
             if curve != DEFAULT or mode != "advanced" or boost not in ("on", "off"):
                 if curve == FACTORY and mode == "auto" and boost in ("on", "off"):
                     preserve = manual_boost or automatic_boost or boost == "on"
                     reapply_physical_verification = force_apply_default(
                         wmi, preserve, heartbeat)
+                    response = None
                     safety = Safety()
                     release_cool_since = None
                     alarm.clear()
@@ -570,12 +832,87 @@ def main() -> int:
                             automatic_boost = True
                     else:
                         sensor_hold.clear()
-                    boost = read(BASE / "cooler_boost")
+                    if control is not None:
+                        control = require_policy_identity(monitoring=True, timing=timing)
+                    boost = control.state.boost if control else read(BASE / "cooler_boost")
                 else:
                     raise ProfileError(f"unexpected runtime state: {mode}/{boost}/{curve!r}")
 
+            # Process requests even while a thermal channel is unavailable.
+            # A new Boost-on cancels a previous release; its acknowledgement
+            # waits for actual fan response, not merely the control bit.
+            if BOOST_REQUEST:
+                write(BASE / "cooler_boost", "on")
+                manual_boost = True
+                automatic_boost = False
+                boost_ack_pending = True
+                release_pending = False
+                release_cool_since = None
+                safety.cool_since = None
+                alarm.clear()
+                BOOST_REQUEST = False
+                boost = "on"
+            if RELEASE_REQUEST:
+                if read(BASE / "cooler_boost") == "on":
+                    release_pending = True
+                    release_cool_since = None
+                    acknowledge("boost-release-queued")
+                    print("explicit Cooler Boost release queued", file=sys.stderr,
+                          flush=True)
+                else:
+                    release_pending = False
+                    release_cool_since = None
+                    acknowledge("boost-release")
+                RELEASE_REQUEST = False
+
+            slow_acquisition = False
             try:
-                sample = read_runtime_sample(core, wmi)
+                sampled_at = control.acquisition_started if control else time.monotonic()
+                if (last_runtime_poll is not None and
+                        sampled_at - last_runtime_poll > MAX_OBSERVATION_GAP_SECONDS):
+                    safety = Safety()
+                    release_cool_since = None
+                    alarm.clear()
+                    response = None
+                    sensor_hold.record(sampled_at)
+                    if not manual_boost:
+                        automatic_boost = True
+                    if read(BASE / "cooler_boost") != "on":
+                        write(BASE / "cooler_boost", "on")
+                    print("WARNING monitoring gap; Boost latched and cooldown reset",
+                          file=sys.stderr, flush=True)
+                acquisition_started = (control.acquisition_started if control else
+                                       time.monotonic())
+                observed_monotonic_ns = int(acquisition_started * 1_000_000_000)
+                last_runtime_poll = acquisition_started
+                if timing is not None and control is None:
+                    timing.begin_sensor(acquisition_started)
+                sensor_error: SensorSampleError | None = None
+                try:
+                    if control is None:
+                        sample = read_runtime_sample(core, wmi)
+                    else:
+                        sample = read_runtime_sample(
+                            core, wmi, ec_temperatures=(control.state.ec_cpu,
+                                                       control.state.ec_gpu))
+                except SensorSampleError as error:
+                    sample = error.partial
+                    sensor_error = error
+                acquisition_finished = time.monotonic()
+                slow_acquisition = (acquisition_finished - acquisition_started >
+                                    MAX_OBSERVATION_GAP_SECONDS)
+                if timing is not None:
+                    timing.finish_sensor(slow_acquisition)
+                if slow_acquisition:
+                    response = None
+                    errors = dict(sensor_error.channel_errors) if sensor_error else {}
+                    detail = ("slow sensor acquisition "
+                              f"{acquisition_finished - acquisition_started:.3f}s "
+                              f"exceeded {MAX_OBSERVATION_GAP_SECONDS:.0f}s observation budget")
+                    errors["acquisition"] = detail
+                    raise SensorSampleError(detail, sample, errors)
+                if sensor_error is not None:
+                    raise sensor_error
             except SensorSampleError as error:
                 # A malformed EC/WMI sample must never convert an active
                 # full-cooling state into an unattended service failure. Keep
@@ -585,11 +922,18 @@ def main() -> int:
                 safety = Safety()
                 release_cool_since = None
                 alarm.clear()
-                transition = sensor_hold.record(started)
-                if boost != "on":
+                transition = sensor_hold.record(acquisition_finished)
+                if read(BASE / "cooler_boost") != "on":
                     write(BASE / "cooler_boost", "on")
                 if not manual_boost:
                     automatic_boost = True
+                # Old RPM from a stalled acquisition is not fresh response
+                # evidence, even when its numeric values are plausible.
+                verified = (False if slow_acquisition else
+                            observe_response(error.partial, acquisition_finished))
+                if boost_ack_pending and verified:
+                    acknowledge("boost-on")
+                    boost_ack_pending = False
                 if transition == "established":
                     print(
                         "WARNING sensor telemetry degraded; "
@@ -600,77 +944,61 @@ def main() -> int:
                         "WARNING sensor telemetry remains degraded; "
                         f"Candidate14 and Cooler Boost remain latched: {error}",
                         file=sys.stderr, flush=True)
-                elapsed = sensor_hold.elapsed(started)
-                heartbeat(
+                elapsed = sensor_hold.elapsed(acquisition_finished)
+                runtime_heartbeat(
                     f"Sensor telemetry degraded {elapsed:.0f}s; Candidate14 active; "
-                    f"Cooler Boost latched; awaiting valid telemetry; {error}")
-                delay = 1 - (time.monotonic() - started)
-                if delay > 0:
-                    time.sleep(delay)
+                    f"Cooler Boost latched; fan response "
+                    f"{'verified' if verified else 'unverified'}; {error}",
+                    error.partial, error.channel_errors or {"sample": str(error)},
+                    str(error), verified, True)
+                complete_iteration(started)
                 continue
+
+            last_valid_monotonic_ns = observed_monotonic_ns
+            cpu = sample.cpu
+            ec_gpu = sample.ec_gpu
+            fan1 = sample.fan1
+            fan2 = sample.fan2
+            reason = safety.update(cpu, ec_gpu, fan1, fan2, acquisition_started)
+            if reason or automatic_boost or boost_ack_pending or sensor_hold.started is not None:
+                if read(BASE / "cooler_boost") != "on":
+                    write(BASE / "cooler_boost", "on")
+                if reason and not manual_boost:
+                    automatic_boost = True
+            verified = observe_response(sample, acquisition_finished)
+            if boost_ack_pending and verified:
+                acknowledge("boost-on")
+                boost_ack_pending = False
+                print("explicit Cooler Boost enabled and fan response verified",
+                      file=sys.stderr, flush=True)
 
             if sensor_hold.started is not None:
                 # A complete sample alone is insufficient to leave degraded
                 # mode: first prove that the commanded Boost still reaches both
                 # physical fans. Invalid RPM telemetry keeps the latch active;
                 # plausibly low RPM remains a genuine fan-response failure.
-                try:
-                    verify_boost(wmi, heartbeat)
-                except SensorSampleError as error:
+                if not verified:
                     transition = sensor_hold.record(time.monotonic())
                     if read(BASE / "cooler_boost") != "on":
                         write(BASE / "cooler_boost", "on")
                     if transition == "ongoing":
                         print(
                             "WARNING physical fan telemetry remains invalid; "
-                            f"Candidate14 and Cooler Boost remain latched: {error}",
+                            "Candidate14 and Cooler Boost remain latched; "
+                            "fan response is unverified",
                             file=sys.stderr, flush=True)
                     elapsed = sensor_hold.elapsed(time.monotonic())
-                    heartbeat(
+                    runtime_heartbeat(
                         f"Sensor telemetry degraded {elapsed:.0f}s; Candidate14 active; "
-                        f"Cooler Boost latched; physical RPM unverified; {error}")
-                    delay = 1 - (time.monotonic() - started)
-                    if delay > 0:
-                        time.sleep(delay)
+                        "Cooler Boost latched; fan response unverified",
+                        sample, {}, "fan response unverified", False, True)
+                    complete_iteration(started)
                     continue
                 sensor_hold.clear()
                 print(
                     "sensor telemetry recovered; Cooler Boost remains latched "
                     "until monitored cooldown completes",
                     file=sys.stderr, flush=True)
-
-            cpu = sample.cpu
-            ec_gpu = sample.ec_gpu
-            fan1 = sample.fan1
-            fan2 = sample.fan2
-            reason = safety.update(cpu, ec_gpu, fan1, fan2, started)
-
-            if BOOST_REQUEST:
-                write(BASE / "cooler_boost", "on")
-                verify_boost(wmi, heartbeat)
-                manual_boost = True
-                automatic_boost = False
-                release_pending = False
-                release_cool_since = None
-                alarm.clear()
-                BOOST_REQUEST = False
-                acknowledge("boost-on")
-                print("explicit Cooler Boost enabled and physically verified",
-                      file=sys.stderr, flush=True)
-            if RELEASE_REQUEST:
-                # Queue release only for an existing manual/automatic Boost latch.
-                if read(BASE / "cooler_boost") == "on":
-                    release_pending = True
-                    release_cool_since = None
-                    print("explicit Cooler Boost release queued", file=sys.stderr,
-                          flush=True)
-                else:
-                    release_pending = False
-                    release_cool_since = None
-                    acknowledge("boost-release")
-                    print("explicit Cooler Boost release acknowledged; Boost is off",
-                          file=sys.stderr, flush=True)
-                RELEASE_REQUEST = False
 
             boost = read(BASE / "cooler_boost")
             if reason:
@@ -680,9 +1008,7 @@ def main() -> int:
                 safety.cool_since = None
                 if boost != "on":
                     write(BASE / "cooler_boost", "on")
-                verify_boost(wmi, heartbeat)
-                verified_at = time.monotonic()
-                transition = alarm.record_verification(verified_at)
+                transition = alarm.record_verification(acquisition_finished) if verified else None
                 if transition == "established":
                     print(f"Cooler Boost established for alarm: {reason}",
                           file=sys.stderr, flush=True)
@@ -712,7 +1038,7 @@ def main() -> int:
                     is_cool = cpu < 85000 and (ec_gpu == 0 or ec_gpu < 70)
                     safety.cool_since = Safety.update_since(
                         safety.cool_since, is_cool, timer_now)
-                    if (safety.cool_since is not None and
+                    if (verified and safety.cool_since is not None and
                             timer_now - safety.cool_since >= 30):
                         write(BASE / "cooler_boost", "off")
                         automatic_boost = False
@@ -721,6 +1047,8 @@ def main() -> int:
                         release_pending = False
                         release_cool_since = None
                         safety.cool_since = None
+                        response = None
+                        verified = False
                         print("automatic Cooler Boost released after 30-second cooldown",
                               file=sys.stderr, flush=True)
                 else:
@@ -738,12 +1066,14 @@ def main() -> int:
                     is_cool = cpu < 85000 and (ec_gpu == 0 or ec_gpu < 70)
                     release_cool_since = Safety.update_since(
                         release_cool_since, is_cool, timer_now)
-                    if (release_cool_since is not None and
+                    if (verified and release_cool_since is not None and
                             timer_now - release_cool_since >= 30):
                         write(BASE / "cooler_boost", "off")
                         manual_boost = False
                         release_pending = False
                         release_cool_since = None
+                        response = None
+                        verified = False
                         acknowledge("boost-release")
                         print("explicit Cooler Boost released after 30-second cooldown",
                               file=sys.stderr, flush=True)
@@ -754,16 +1084,17 @@ def main() -> int:
                       f"boost={read(BASE/'cooler_boost')}{alarm_note}", file=sys.stderr,
                       flush=True)
                 last_log = started
-            if alarm.sustained:
-                heartbeat(
+            if alarm.sustained and verified:
+                runtime_heartbeat(
                     f"Sustained safety alarm: {reason}; Cooler Boost verified; "
-                    f"CPU {cpu//1000}C GPU {ec_gpu}C fans {fan1}/{fan2}")
+                    f"CPU {cpu//1000}C GPU {ec_gpu}C fans {fan1}/{fan2}",
+                    sample, {}, reason, verified, False)
             else:
-                heartbeat(
-                    f"Candidate14 CPU {cpu//1000}C GPU {ec_gpu}C fans {fan1}/{fan2}")
-            delay = 1 - (time.monotonic() - started)
-            if delay > 0:
-                time.sleep(delay)
+                runtime_heartbeat(
+                    f"Candidate14 CPU {cpu//1000}C GPU {ec_gpu}C fans {fan1}/{fan2}; "
+                    f"fan response {'verified' if verified else 'unverified'}",
+                    sample, {}, reason, verified, False)
+            complete_iteration(started)
 
         print("clean stop requested; restoring factory auto", file=sys.stderr,
               flush=True)

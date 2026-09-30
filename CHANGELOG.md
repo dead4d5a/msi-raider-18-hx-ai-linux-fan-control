@@ -2,6 +2,33 @@
 
 ## Unreleased
 
+- Reject overdue same-poll telemetry before cooldown release and report actual
+  observation freshness; retain Boost without an off/on flicker after slow reads.
+- Add default-off, explicitly enabled timing diagnostics for validation, with no
+  diagnostic clock calls/counter accumulation on the disabled path.
+- Eliminate hardware scans while awaiting acknowledgements, reuse validated
+  status identity values, and query enablement with batched systemd properties.
+- Cache keeper WMI discovery with read-failure/resume invalidation, and keep
+  one-shot recovery Boost asserted between RPM verification attempts.
+- Add a fresh read-only driver control snapshot, shared exact legacy/snapshot
+  build validation, and compiled mocked-I/O coverage for every snapshot read
+  failure position. The new driver is not yet deployed/hardware-validated.
+- Package the shared ABI helper with guarded upgrades and consolidate duplicate
+  CI checks into the release verifier.
+- Prevent mixed low/unavailable RPM spin-up samples from falsely proving a fan
+  response failure; keep per-channel fan monitoring during temperature faults.
+- Use incremental runtime/keeper response checks without blocking one-second
+  control repair, and distinguish response-floor verification from maximum RPM.
+- Publish atomic, PID-bound health with freshness, channel errors, Boost ownership,
+  pending release, and cooldown progress; make degraded/stale status unsuccessful.
+- Release the manager lock before cooldown waits, batch systemd property queries,
+  and preserve latest manual-on intent when cancelling a queued release.
+- Preserve runtime recovery after upgrade activation/status failures and reject
+  implausible temperatures before an explicit factory Boost release.
+- Reset cooldown on monitoring gaps; add resume, interrupted-cooldown, request,
+  health-contract, upgrade-failure, and opt-in isolated systemd integration tests.
+- Add a pinned-source, unprivileged driver patch/build verifier and CI job; retain
+  explicit limits on hardware validation and thermal optimality claims.
 - Keep Candidate 14 active with physically verified Cooler Boost during
   sustained safety alarms instead of failing after 15 seconds of high heat.
 - Report sustained maximum-cooling and degraded-telemetry states through systemd

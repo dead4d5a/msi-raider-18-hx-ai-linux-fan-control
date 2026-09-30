@@ -11,7 +11,7 @@ cleanup() {
 trap cleanup EXIT
 
 PYTHONPYCACHEPREFIX="$verify_cache" python3 -m py_compile \
-    src/msi-fan-profile src/msi-fan-profiled src/msi-gpu-recover
+    src/msi-fan-profile src/msi-fan-profiled src/msi-gpu-recover src/msi_fan_control.py
 PYTHONDONTWRITEBYTECODE=1 PYTHONPYCACHEPREFIX="$verify_cache" \
     python3 -m unittest discover -s tests -p 'test_*.py'
 bash -n scripts/*.sh
@@ -25,7 +25,7 @@ if git apply --check --reverse \
     exit 1
 fi
 
-expected_patch=16b421b04dd40a3b26f14438a8f95f83c2602692ac8700d40ccc5c6e5bb14a2d
+expected_patch=0b27ad8fb03613fe3bdbdc39598dc59c438c30f78c311eb125076f7562069f37
 actual_patch=$(sha256sum patches/msi-ec-0.13.1-exact-fan-curve.patch | awk '{print $1}')
 [[ $actual_patch == "$expected_patch" ]]
 
@@ -68,6 +68,21 @@ assert ast.literal_eval(recovery_curve_map.keys[0]) == "candidate14"
 assert isinstance(recovery_curve_map.values[0], ast.Name)
 assert recovery_curve_map.values[0].id == "DEFAULT"
 print("profile constants: OK")
+
+builds = {"LEGACY_SRCVERSION": "AB0BFAE2391B5ADD66E01BD",
+          "SNAPSHOT_SRCVERSION": "9086C45007CBB7FA1264430"}
+tree = ast.parse(Path("src/msi_fan_control.py").read_text())
+actual = {target.id: ast.literal_eval(node.value)
+          for node in tree.body if isinstance(node, ast.Assign)
+          for target in node.targets
+          if isinstance(target, ast.Name) and target.id in builds}
+assert actual == builds, actual
+for filename in ("scripts/preflight.sh", "scripts/uninstall-profile.sh"):
+    script = Path(filename).read_text()
+    assert all(source in script for source in builds.values()), filename
+    assert "fan_control_snapshot" in script, filename
+assert builds["SNAPSHOT_SRCVERSION"] in Path("scripts/verify-driver-build.sh").read_text()
+print("exact driver ABI pins: OK")
 PY
 
 python3 - <<'PY'

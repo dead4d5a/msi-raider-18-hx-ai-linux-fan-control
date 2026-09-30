@@ -3,6 +3,32 @@
 This guide installs the exact local `msi_ec` extension required by the profile
 service while keeping Ubuntu Secure Boot enabled.
 
+The current patch adds a read-only `fan_control_snapshot` and builds to
+srcversion `9086C45007CBB7FA1264430`. It is implemented and offline-built, but
+not yet deployed or hardware-validated. The new user-space release also retains
+the known legacy `AB0BFAE2391B5ADD66E01BD` build. Neither pin relaxes BIOS/EC gates.
+
+For an **existing legacy installation**, do not overwrite its DKMS registration
+or hot-load the new module using the fresh-install steps below. First deploy and
+verify the complete new user-space release, including the shared helper, while
+the legacy module remains loaded. Retain the original source/module/signing
+configuration. Then plan an attended, separately authorized driver transition:
+
+1. Build/sign and stage the exact new module for the target kernel; verify its
+   source version, vermagic and signer before changing the registered build.
+2. While safely cool, use guarded `factory-auto` and persistently disable the
+   primary service before the module-switch reboot. A `/run` override alone does
+   not survive reboot. Leave the new compatible user-space helpers installed.
+3. After reboot, validate loaded source version, BIOS/EC, snapshot framing and
+   fresh control/temperature values before re-enabling/applying Candidate 14.
+4. Attend fan-response, runtime fault, resume and thermal validation before
+   declaring the new driver production-validated.
+
+Both builds retain DKMS version `0.13.1`, so replacing that exact registration
+requires a protected backup and deliberate staging, not a broad `remove --all`.
+Old daemon/keeper releases reject the new source version. These notes describe
+the required sequence, not an instruction to perform it unattended.
+
 > [!CAUTION]
 > Stop if any identity differs. Never use the driver's `firmware=` override,
 > `debug=1`, `ec_sys write_support=1`, or raw EC tools to force compatibility.
@@ -182,7 +208,7 @@ git apply "$PATCH"
 Patch SHA-256:
 
 ```text
-16b421b04dd40a3b26f14438a8f95f83c2602692ac8700d40ccc5c6e5bb14a2d
+0b27ad8fb03613fe3bdbdc39598dc59c438c30f78c311eb125076f7562069f37
 ```
 
 Verify before applying:
@@ -203,7 +229,7 @@ Required module metadata:
 ```text
 name:       msi_ec
 version:    0.13.1
-srcversion: AB0BFAE2391B5ADD66E01BD
+srcversion: 9086C45007CBB7FA1264430
 ```
 
 `vermagic` must begin with the current `uname -r`. Only `firmware` and `debug`
@@ -269,7 +295,7 @@ Required values:
 
 ```text
 0.13.1
-AB0BFAE2391B5ADD66E01BD
+9086C45007CBB7FA1264430
 1824EMS1.108
 58 64 70 76 82 88 0 25 35 44 58 70 75 52 58 64 70 76 82 0 25 35 44 58 70 75
 ```
@@ -287,6 +313,12 @@ sudo chmod 0644 /etc/modules-load.d/90-msi-ec-local.conf
 Reboot and repeat all version, signer, firmware, curve, and Secure Boot checks.
 
 ## 8. Targeted driver rollback
+
+The removal-only steps below apply to a standalone fresh installation, not to
+the legacy-to-snapshot transition described at the start of this guide. That
+transition reuses the same DKMS version and requires a protected backup/restore
+plan for the existing registration and each installed kernel. Do not use these
+`--all` removal steps to replace or roll back that shared registration.
 
 First stop/remove the profile service using
 [Rollback](ROLLBACK.md). Ensure factory `auto/off` is active.

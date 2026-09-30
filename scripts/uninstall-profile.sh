@@ -48,7 +48,12 @@ flock -x 8
 [[ $(cat /sys/class/dmi/id/board_name) == 'MS-1824' ]]
 [[ $(cat /sys/class/dmi/id/bios_version) == 'E1824IMS.310' ]]
 [[ $(cat /sys/module/msi_ec/version) == '0.13.1' ]]
-[[ $(cat /sys/module/msi_ec/srcversion) == 'AB0BFAE2391B5ADD66E01BD' ]]
+module_source=$(cat /sys/module/msi_ec/srcversion)
+case "$module_source" in
+  AB0BFAE2391B5ADD66E01BD) ;;
+  9086C45007CBB7FA1264430) [[ -r $base/fan_control_snapshot ]] ;;
+  *) echo 'Refusing uninstall recovery on an unsupported driver build.' >&2; exit 1 ;;
+esac
 [[ $(cat "$base/fw_version") == '1824EMS1.108' ]]
 if [[ -e /sys/module/ec_sys ]]; then
   echo 'Refusing uninstall recovery while ec_sys is loaded.' >&2
@@ -92,8 +97,9 @@ rm -f /etc/tmpfiles.d/msi-fan-profile.conf
 rm -f /usr/local/sbin/msi-fan-profile
 rm -f /usr/local/libexec/msi-fan-profiled
 rm -f /usr/local/libexec/msi-gpu-recover
+rm -f /usr/local/libexec/msi_fan_control.py
 rm -rf /usr/local/share/doc/msi-fan-profile
-rm -f /run/msi-fan-profile.factory-auto /run/msi-fan-profile.ack /run/msi-fan-profile.recovery-boost
+rm -f /run/msi-fan-profile.factory-auto /run/msi-fan-profile.ack /run/msi-fan-profile.recovery-boost /run/msi-fan-profile.health.json
 rm -f /run/msi-fan-profile-manager.lock /run/msi-fanctl.lock
 systemctl daemon-reload
 

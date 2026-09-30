@@ -12,6 +12,13 @@ ROOT = pathlib.Path(__file__).parents[1]
 
 
 class FailureKeeperUnitTests(unittest.TestCase):
+    def test_diagnostic_timing_defaults_off_for_both_services(self):
+        for filename in ('msi-fan-profile.service', 'msi-fan-profile-keeper.service'):
+            with self.subTest(filename=filename):
+                unit = (ROOT / 'systemd' / filename).read_text()
+                self.assertIn('Environment=MSI_FAN_TIMING_METRICS=0', unit)
+                self.assertNotIn('Environment=MSI_FAN_TIMING_METRICS=1', unit)
+
     def test_failed_controller_starts_the_separate_full_cooling_keeper(self):
         primary = (ROOT / "systemd" / "msi-fan-profile.service").read_text(
             encoding="utf-8")

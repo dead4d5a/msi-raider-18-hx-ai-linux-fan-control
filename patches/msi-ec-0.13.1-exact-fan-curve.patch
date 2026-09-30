@@ -1,9 +1,9 @@
 diff --git a/LOCAL_FAN_CURVE.md b/LOCAL_FAN_CURVE.md
 new file mode 100644
-index 0000000..14794fe
+index 0000000..bb0e4b6
 --- /dev/null
 +++ b/LOCAL_FAN_CURVE.md
-@@ -0,0 +1,29 @@
+@@ -0,0 +1,36 @@
 +# Local exact-platform fan-curve extension 0.13.1
 +
 +Base: BeardOverflow/msi-ec commit `d7fbbd88e6831e56801b860e46475cbf8ddbc7c1`.
@@ -33,6 +33,13 @@ index 0000000..14794fe
 +
 +The interface exposes no arbitrary EC address access. Debug mode remains disabled.
 +Raw `ec_sys` write support remains disabled.
++
++The read-only `fan_control_snapshot` attribute adds a schema-1, 33-token ASCII
++control observation on this same exact platform. It checks firmware once, reads
++all 26 curve bytes plus shift/mode/Boost and raw CPU/GPU temperature bytes under
++the existing control mutex (43 fresh EC reads), and fails on any read error or
++unknown control mode. It adds no caching or control writes. Temperature bytes
++such as 255 stay raw so userspace can classify unavailable telemetry explicitly.
 diff --git a/Makefile.vars b/Makefile.vars
 index bb65738..8c563da 100644
 --- a/Makefile.vars
@@ -44,10 +51,10 @@ index bb65738..8c563da 100644
 +VERSION := 0.13.1
 \ No newline at end of file
 diff --git a/docs/sysfs-platform-msi-ec b/docs/sysfs-platform-msi-ec
-index 78cd276..e83528b 100644
+index 78cd276..397dfe3 100644
 --- a/docs/sysfs-platform-msi-ec
 +++ b/docs/sysfs-platform-msi-ec
-@@ -63,6 +63,22 @@ Description:
+@@ -63,6 +63,37 @@ Description:
  		Valid values: the values present in the available_fan_modes
  		list.
  
@@ -67,11 +74,26 @@ index 78cd276..e83528b 100644
 +		must explicitly select advanced mode or safely release Cooler
 +		Boost after independent physical-RPM verification.
 +
++What:		/sys/devices/platform/<platform>/fan_control_snapshot
++Description:
++		Read-only fresh control observation on the same exact validated
++		DMI/BIOS/EC platform as fan_curve, with verified shift and CPU/GPU
++		temperature addresses. One ASCII line has exactly 33 tokens:
++		1, verified EC firmware, shift name, fan-mode name, on/off Boost,
++		raw CPU and GPU temperature bytes, then the 26 fan_curve values.
++
++		Firmware identity is freshly checked once and all EC bytes are
++		read under the fan-curve control mutex (43 EC reads total).
++		Unknown control modes or read failures return an error without
++		partial output. Temperature sentinels remain raw unsigned bytes.
++		No cached state, WMI fan RPM, package temperature, or writes are
++		included. Driver serialization cannot freeze autonomous firmware.
++
  What:		/sys/devices/platform/<platform>/fw_version
  Description:
  		Read-only, returns the version of the EC firmware.
 diff --git a/msi-ec.c b/msi-ec.c
-index ff33729..a572ff2 100644
+index ff33729..48550e0 100644
 --- a/msi-ec.c
 +++ b/msi-ec.c
 @@ -32,6 +32,7 @@
@@ -111,7 +133,7 @@ index ff33729..a572ff2 100644
  
  static bool charge_control_supported = false;
  
-@@ -2147,6 +2163,383 @@ static struct acpi_battery_hook battery_hook = {
+@@ -2147,6 +2163,470 @@ static struct acpi_battery_hook battery_hook = {
  	.name = MSI_EC_DRIVER_NAME,
  };
  
@@ -379,6 +401,93 @@ index ff33729..a572ff2 100644
 +	return count;
 +}
 +
++static bool fan_control_snapshot_configuration_matches(void)
++{
++	return fan_curve_configuration_matches() &&
++	       conf.shift_mode.address == 0xd2 &&
++	       conf.cpu.rt_temp_address == 0x68 &&
++	       conf.gpu.rt_temp_address == 0x80;
++}
++
++static const char *fan_control_snapshot_mode_name(const struct msi_ec_mode *modes,
++						u8 value)
++{
++	for (size_t i = 0; modes[i].name; i++) {
++		if (modes[i].value == value)
++			return modes[i].name;
++	}
++	return NULL;
++}
++
++/*
++ * One fresh read-only observation of the exact-platform fan control state.
++ * Firmware identity, all curve bytes, and the five control/temperature bytes
++ * are read under the same mutex as curve, mode, shift, and Boost writes.  This
++ * serializes this driver's callers; it cannot freeze autonomous EC firmware.
++ * Raw temperature bytes, including unavailable values, remain uninterpreted.
++ */
++static ssize_t fan_control_snapshot_show(struct device *device,
++					struct device_attribute *attr, char *buf)
++{
++	u8 values[FAN_CURVE_TOTAL_VALUES];
++	u8 shift;
++	u8 mode;
++	u8 boost;
++	u8 cpu_temp;
++	u8 gpu_temp;
++	const char *shift_name;
++	const char *mode_name;
++	int count;
++	int result;
++
++	if (!fan_curve_supported || !fan_control_snapshot_configuration_matches())
++		return -EOPNOTSUPP;
++
++	mutex_lock(&fan_curve_mutex);
++	result = fan_curve_check_firmware();
++	if (result < 0)
++		goto unlock;
++	result = fan_curve_read_values(values);
++	if (result < 0)
++		goto unlock;
++	result = ec_read(conf.shift_mode.address, &shift);
++	if (result < 0)
++		goto unlock;
++	result = ec_read(conf.fan_mode.address, &mode);
++	if (result < 0)
++		goto unlock;
++	result = ec_read(conf.cooler_boost.address, &boost);
++	if (result < 0)
++		goto unlock;
++	result = ec_read(conf.cpu.rt_temp_address, &cpu_temp);
++	if (result < 0)
++		goto unlock;
++	result = ec_read(conf.gpu.rt_temp_address, &gpu_temp);
++	if (result < 0)
++		goto unlock;
++
++	shift_name = shift == 0x80 ? "unspecified" :
++		fan_control_snapshot_mode_name(conf.shift_mode.modes, shift);
++	mode_name = fan_control_snapshot_mode_name(conf.fan_mode.modes, mode);
++	if (!shift_name || !mode_name) {
++		result = -EIO;
++		goto unlock;
++	}
++
++	/* The successful fresh check above proves this exact firmware text. */
++	count = sysfs_emit(buf, "1 1824EMS1.108 %s %s %s %u %u",
++			   shift_name, mode_name,
++			   str_on_off(boost & BIT(conf.cooler_boost.bit)),
++			   cpu_temp, gpu_temp);
++	for (size_t i = 0; i < ARRAY_SIZE(values); i++)
++		count += sysfs_emit_at(buf, count, " %u", values[i]);
++	count += sysfs_emit_at(buf, count, "\n");
++	result = count;
++unlock:
++	mutex_unlock(&fan_curve_mutex);
++	return result;
++}
++
 +static int fan_curve_parse(const char *buf,
 +			   u8 requested[FAN_CURVE_TOTAL_VALUES])
 +{
@@ -495,7 +604,7 @@ index ff33729..a572ff2 100644
  // ============================================================ //
  // Sysfs platform device attributes (root)
  // ============================================================ //
-@@ -2306,7 +2699,9 @@ static ssize_t cooler_boost_store(struct device *dev,
+@@ -2306,7 +2786,9 @@ static ssize_t cooler_boost_store(struct device *dev,
  	if (result)
  		return result;
  
@@ -505,7 +614,7 @@ index ff33729..a572ff2 100644
  	if (result < 0)
  		return result;
  
-@@ -2367,8 +2762,10 @@ static ssize_t shift_mode_store(struct device *dev,
+@@ -2367,8 +2849,10 @@ static ssize_t shift_mode_store(struct device *dev,
  		// NULL entries have NULL name
  
  		if (sysfs_streq(conf.shift_mode.modes[i].name, buf)) {
@@ -516,7 +625,7 @@ index ff33729..a572ff2 100644
  			if (result < 0)
  				return result;
  
-@@ -2467,8 +2864,10 @@ static ssize_t fan_mode_store(struct device *dev, struct device_attribute *attr,
+@@ -2467,8 +2951,10 @@ static ssize_t fan_mode_store(struct device *dev, struct device_attribute *attr,
  		// NULL entries have NULL name
  
  		if (sysfs_streq(conf.fan_mode.modes[i].name, buf)) {
@@ -527,33 +636,38 @@ index ff33729..a572ff2 100644
  			if (result < 0)
  				return result;
  
-@@ -2537,6 +2936,7 @@ static DEVICE_ATTR_RW(shift_mode);
+@@ -2537,6 +3023,8 @@ static DEVICE_ATTR_RW(shift_mode);
  static DEVICE_ATTR_RW(super_battery);
  static DEVICE_ATTR_RO(available_fan_modes);
  static DEVICE_ATTR_RW(fan_mode);
 +static DEVICE_ATTR_RW(fan_curve);
++static DEVICE_ATTR_RO(fan_control_snapshot);
  static DEVICE_ATTR_RO(fw_version);
  static DEVICE_ATTR_RO(fw_release_date);
  
-@@ -2551,6 +2951,7 @@ static struct attribute *msi_root_attrs[] = {
+@@ -2551,6 +3039,8 @@ static struct attribute *msi_root_attrs[] = {
  	&dev_attr_super_battery.attr,
  	&dev_attr_available_fan_modes.attr,
  	&dev_attr_fan_mode.attr,
 +	&dev_attr_fan_curve.attr,
++	&dev_attr_fan_control_snapshot.attr,
  	&dev_attr_fw_version.attr,
  	&dev_attr_fw_release_date.attr,
  	NULL
-@@ -2904,6 +3305,9 @@ static umode_t msi_ec_is_visible(struct kobject *kobj,
+@@ -2904,6 +3394,12 @@ static umode_t msi_ec_is_visible(struct kobject *kobj,
  		 attr == &dev_attr_fan_mode.attr)
  		address = conf.fan_mode.address;
  
 +	else if (attr == &dev_attr_fan_curve.attr)
 +		return fan_curve_supported ? attr->mode : 0;
++	else if (attr == &dev_attr_fan_control_snapshot.attr)
++		return fan_curve_supported && fan_control_snapshot_configuration_matches() ?
++			attr->mode : 0;
 +
  	/* cpu group */
  	else if (attr == &dev_attr_cpu_realtime_temperature.attr)
  		address = conf.cpu.rt_temp_address;
-@@ -3042,6 +3446,10 @@ static int __init msi_ec_init(void)
+@@ -3042,6 +3538,10 @@ static int __init msi_ec_init(void)
  	if (result < 0)
  		return result;
  
@@ -564,7 +678,7 @@ index ff33729..a572ff2 100644
  	msi_platform_device = platform_create_bundle(&msi_platform_driver,
  						     msi_platform_probe,
  						     NULL, 0, NULL, 0);
-@@ -3109,8 +3517,8 @@ MODULE_LICENSE("GPL");
+@@ -3109,8 +3609,8 @@ MODULE_LICENSE("GPL");
  MODULE_AUTHOR("Jose Angel Pastrana <japp0005@red.ujaen.es>");
  MODULE_AUTHOR("Aakash Singh <mail@singhaakash.dev>");
  MODULE_AUTHOR("Nikita Kravets <teackot@gmail.com>");

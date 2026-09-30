@@ -18,10 +18,15 @@ Raider 18 HX AI A2XWIG
 MS-1824
 BIOS E1824IMS.310
 EC 1824EMS1.108
-msi_ec 0.13.1 / AB0BFAE2391B5ADD66E01BD
+msi_ec 0.13.1 / AB0BFAE2391B5ADD66E01BD (legacy)
+          or / 9086C45007CBB7FA1264430 (snapshot ABI required)
 ```
 
 Do not edit the checks to force a related model.
+
+These are two explicitly validated builds, not a wildcard source-version check.
+The snapshot build requires its read-only interface and never silently falls
+back. See the staged driver-transition notes in [DRIVER_INSTALL.md](DRIVER_INSTALL.md).
 
 ## Install
 
@@ -32,7 +37,7 @@ sudo ./scripts/install-profile.sh
 The script:
 
 - refuses to overwrite an existing installation;
-- installs root-owned executables;
+- installs root-owned executables and their shared read-only ABI helper;
 - installs a root-only tmpfiles lock;
 - installs the matching README, operations, and safety documentation used by
   the systemd unit;
@@ -76,8 +81,12 @@ manager/daemon/recovery helper/unit/tmpfiles/documentation as one release, and
 reactivates only through the new guarded manager. Fresh installs and upgrades
 write an `INSTALL_RECORD` with the deployed artifact hashes under
 `/usr/local/share/doc/msi-fan-profile/`.
-If the upgrade stops after entering the safe state, it intentionally leaves the
-service disabled in factory auto mode rather than restarting a partial release.
+If the upgrade stops before activation after entering the safe state, it leaves
+the service disabled in factory auto mode. Once activation begins, a failed
+start or health check leaves runtime cooling, the recovery keeper, and boot
+enablement untouched; it reports the error and retained backup location. It
+never replaces runtime recovery with factory mode merely because activation or
+status verification failed. Inspect both units before deciding on another action.
 
 ## Verify systemd
 

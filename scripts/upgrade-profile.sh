@@ -27,6 +27,7 @@ source_files=(
   "$repo/src/msi-fan-profile"
   "$repo/src/msi-fan-profiled"
   "$repo/src/msi-gpu-recover"
+  "$repo/src/msi_fan_control.py"
   "$repo/systemd/msi-fan-profile.service"
   "$repo/systemd/msi-fan-profile-keeper.service"
   "$repo/tmpfiles/msi-fan-profile.conf"
@@ -38,6 +39,7 @@ target_files=(
   /usr/local/sbin/msi-fan-profile
   /usr/local/libexec/msi-fan-profiled
   /usr/local/libexec/msi-gpu-recover
+  /usr/local/libexec/msi_fan_control.py
   /etc/systemd/system/msi-fan-profile.service
   /etc/systemd/system/msi-fan-profile-keeper.service
   /etc/tmpfiles.d/msi-fan-profile.conf
@@ -45,8 +47,8 @@ target_files=(
   /usr/local/share/doc/msi-fan-profile/OPERATIONS.md
   /usr/local/share/doc/msi-fan-profile/SAFETY.md
 )
-modes=(0755 0755 0755 0644 0644 0644 0644 0644 0644)
-must_exist=(yes yes yes yes no yes no no no)
+modes=(0755 0755 0755 0644 0644 0644 0644 0644 0644 0644)
+must_exist=(yes yes yes no yes no yes no no no)
 record_target=/usr/local/share/doc/msi-fan-profile/INSTALL_RECORD
 
 for index in "${!source_files[@]}"; do
@@ -76,12 +78,11 @@ cleanup() {
   trap - EXIT
   [[ -n $stage && -d $stage ]] && rm -rf -- "$stage"
   if ((rc != 0 && activation_started)); then
-    if "$manager" factory-auto >/dev/null 2>&1 && \
-        systemctl disable "$service" >/dev/null 2>&1; then
-      echo 'Upgrade stopped after activation; factory auto mode is restored and the service is disabled.' >&2
-    else
-      echo 'Upgrade stopped after activation; guarded factory fallback could not be verified. Inspect cooling immediately.' >&2
-    fi
+    # Once activation has begun, the manager and systemd recovery own cooling.
+    # A failed start or status check may already have staged the full-cooling
+    # keeper; an upgrade rollback must not stop it or release Cooler Boost.
+    echo 'Upgrade stopped after activation; runtime cooling and recovery were left untouched. Inspect controller and keeper status.' >&2
+    echo "Previous artifacts are retained at: $backup" >&2
   elif ((rc != 0 && enabled_for_startup)); then
     systemctl disable "$service" >/dev/null 2>&1 || true
     echo 'Upgrade stopped before activation; the service was disabled and factory auto mode remains in effect.' >&2
@@ -126,9 +127,9 @@ if [[ -e $recovery_latch || -L $recovery_latch ]]; then
 fi
 safe_state=1
 
-# Retain a root-only rollback snapshot, but never auto-restore it: a failed
-# upgrade should remain in verified factory-auto state rather than re-enable an
-# uncertain controller release.
+# Retain a root-only rollback snapshot, but never auto-restore it. Before
+# activation a failed upgrade remains in verified factory-auto state; after
+# activation the manager and runtime recovery retain responsibility for cooling.
 install -d -o root -g root -m 0700 "$backup_root"
 backup=$(mktemp -d "$backup_root/upgrade.XXXXXXXXXX")
 for target in "${target_files[@]}" "$record_target"; do

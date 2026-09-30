@@ -45,5 +45,30 @@ python3 -m json.tool data/results.json >/dev/null
 ./scripts/verify-release.sh
 ```
 
+The default suite uses mocks and skips real systemd integration. To exercise
+lifecycle behavior using only UUID-named user services and temporary fake files:
+
+```bash
+MSI_FANCTL_SYSTEMD_INTEGRATION=1 PYTHONDONTWRITEBYTECODE=1 \
+  python3 -m unittest discover -s tests -p test_systemd_integration.py -v
+```
+
+This requires a reachable non-root `systemd --user` manager. The test cleans up
+only its generated units; it never starts/stops the installed controller or
+writes sysfs. It does not validate the production privileged sandbox or hardware.
+
+With a clean checkout of the pinned upstream driver and matching installed
+kernel headers, verify application/build without installing or loading:
+
+```bash
+./scripts/verify-driver-build.sh /path/to/pinned-msi-ec-checkout "$(uname -r)"
+```
+
+The script requires upstream commit `d7fbbd88e6831e56801b860e46475cbf8ddbc7c1`
+and verifies its tree/archive and patch digests. It builds only a temporary
+copy, checks module identity/vermagic, and removes the temporary build. Source
+checkout and installed modules remain untouched. This is a build check, not a
+simulated EC transaction fault test or thermal compatibility claim.
+
 Keep the production manager free of generic curve/address input. New profiles
 must be named constants, reviewed, measured, and exact-platform gated.

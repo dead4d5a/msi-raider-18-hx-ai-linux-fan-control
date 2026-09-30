@@ -20,7 +20,25 @@ check_equal product "$(cat /sys/class/dmi/id/product_name 2>/dev/null || true)" 
 check_equal board "$(cat /sys/class/dmi/id/board_name 2>/dev/null || true)" 'MS-1824'
 check_equal bios "$(cat /sys/class/dmi/id/bios_version 2>/dev/null || true)" 'E1824IMS.310'
 check_equal kernel_module "$(cat /sys/module/msi_ec/version 2>/dev/null || true)" '0.13.1'
-check_equal module_source "$(cat /sys/module/msi_ec/srcversion 2>/dev/null || true)" 'AB0BFAE2391B5ADD66E01BD'
+module_source=$(cat /sys/module/msi_ec/srcversion 2>/dev/null || true)
+case "$module_source" in
+    AB0BFAE2391B5ADD66E01BD)
+        printf 'PASS module_source            %s (legacy ABI)\n' "$module_source"
+        ;;
+    9086C45007CBB7FA1264430)
+        printf 'PASS module_source            %s (snapshot ABI)\n' "$module_source"
+        if [[ -r $base/fan_control_snapshot ]]; then
+            echo 'PASS snapshot ABI present'
+        else
+            echo 'FAIL pinned snapshot driver is missing its ABI'
+            failed=1
+        fi
+        ;;
+    *)
+        printf 'FAIL module_source            unsupported exact build <%s>\n' "$module_source"
+        failed=1
+        ;;
+esac
 check_equal ec_firmware "$(cat "$base/fw_version" 2>/dev/null || true)" '1824EMS1.108'
 check_equal shift_mode "$(cat "$base/shift_mode" 2>/dev/null || true)" 'comfort'
 

@@ -6,12 +6,18 @@
 $ msi-fan-profile status
 {
   "cooler_boost": "off",
+  "configuration_valid": true,
   "curve": "candidate14",
   "driver_srcversion": "AB0BFAE2391B5ADD66E01BD",
   "driver_version": "0.13.1",
   "ec_firmware": "1824EMS1.108",
   "factory_override": false,
   "fan_mode": "advanced",
+  "health": {
+    "age_seconds": 0.2,
+    "state": "normal",
+    "status": "fresh"
+  },
   "service_active_state": "active",
   "service_enabled": true,
   "service_job": "",
@@ -22,13 +28,14 @@ $ msi-fan-profile status
 }
 ```
 
-The PID naturally changes each boot.
+The PID naturally changes each boot. This excerpt omits the detailed health
+telemetry, per-channel errors, timestamps, latch ownership, and cooldown fields.
 
 ## Temporary maximum cooling
 
 ```console
 $ sudo msi-fan-profile boost-on
-Cooler Boost enabled and physically verified.
+Cooler Boost enabled and fan response verified.
 
 $ sudo msi-fan-profile boost-release
 Cooler Boost released after monitored cooldown.

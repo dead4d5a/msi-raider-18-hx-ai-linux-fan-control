@@ -42,11 +42,19 @@ GPU speeds:      0 25 35 44 58 70 75
 - Candidate 14 keeps Candidate 13's low idle behavior and strengthens only the
   >55°C GPU/shared bins.
 
-## Unbiased results
+## Measured results
 
 Values below use the last 20 seconds unless noted. Ambient and unrelated host
 activity varied; comparisons were run under the same profile harness and fixed
 workload recipes.
+
+These are preliminary measurements, not proof of an optimal curve. Candidate 14
+has one published 180-second combined soak, and its CPU-only comparison borrows
+Candidate 13's equivalent active CPU bins. Further selection should use repeated,
+matched, attended runs long enough to reach thermal equilibrium, with recorded
+ambient conditions, background activity, package/GPU power, throughput,
+throttling, RPM, and noise. Compare cooling/performance/noise together; a lower
+temperature caused by lower completed work is not necessarily an improvement.
 
 | Workload | Policy | GPU | CPU package | Fan 1 | Fan 2 | Result |
 |---|---|---:|---:|---:|---:|---|
