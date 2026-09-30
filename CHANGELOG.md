@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Select CI kernel headers from the installed generic metapackage, not the
+  highest version across runner kernel flavors; check matching release, module
+  support and exact battery-hook exports before building the pinned driver.
 - Reject overdue same-poll telemetry before cooldown release and report actual
   observation freshness; retain Boost without an off/on flicker after slow reads.
 - Add default-off, explicitly enabled timing diagnostics for validation, with no

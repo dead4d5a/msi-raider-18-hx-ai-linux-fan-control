@@ -18,6 +18,30 @@ kernel_build=/lib/modules/$kernel_release/build
   echo "Matching kernel headers are missing: $kernel_build" >&2
   exit 1
 }
+[[ -r $kernel_build/include/config/kernel.release &&
+   $(<"$kernel_build/include/config/kernel.release") == "$kernel_release" ]] || {
+  echo "Kernel header release does not match $kernel_release: $kernel_build" >&2
+  exit 1
+}
+if [[ ! -r $kernel_build/.config ]] ||
+    ! grep -qx 'CONFIG_MODULES=y' "$kernel_build/.config" ||
+    ! grep -qxE 'CONFIG_ACPI_BATTERY=(y|m)' "$kernel_build/.config"; then
+  echo "Kernel headers require module and ACPI battery support: $kernel_build" >&2
+  exit 1
+fi
+[[ -r $kernel_build/Module.symvers && -s $kernel_build/Module.symvers ]] || {
+  echo "Kernel symbol exports are missing: $kernel_build/Module.symvers" >&2
+  exit 1
+}
+for symbol in battery_hook_register battery_hook_unregister; do
+  if ! awk -v wanted="$symbol" '$2 == wanted {found=1} END {exit !found}' \
+      "$kernel_build/Module.symvers"; then
+    echo "Kernel headers do not export required symbol $symbol: $kernel_build" >&2
+    exit 1
+  fi
+done
+printf 'Verified kernel build prerequisites: %s (%s)\n' \
+  "$kernel_release" "$(readlink -f "$kernel_build")"
 
 expected_commit=d7fbbd88e6831e56801b860e46475cbf8ddbc7c1
 expected_tree=072c10a344c22372665a729add6c10faada7c6da

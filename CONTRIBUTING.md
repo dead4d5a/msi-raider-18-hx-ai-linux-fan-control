@@ -70,5 +70,12 @@ copy, checks module identity/vermagic, and removes the temporary build. Source
 checkout and installed modules remain untouched. This is a build check, not a
 simulated EC transaction fault test or thermal compatibility claim.
 
+CI resolves its build target from the installed `linux-headers-generic`
+metapackage's exact dependency with `scripts/select-ci-kernel.sh`. It must not
+pick the runner's running or highest-version kernel: a cloud/Azure kernel may
+lack the ACPI battery-hook exports that `msi_ec` requires. The verifier checks
+the header release, module/battery configuration and symbol exports before
+building; it never suppresses unresolved-symbol failures or relaxes ABI pins.
+
 Keep the production manager free of generic curve/address input. New profiles
 must be named constants, reviewed, measured, and exact-platform gated.

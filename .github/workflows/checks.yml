@@ -33,6 +33,6 @@ jobs:
       - name: Verify patch and build without installing or loading
         shell: bash
         run: |
-          kernel_build=$(find /lib/modules -mindepth 2 -maxdepth 2 -name build -printf '%h\n' | sort -V | tail -n1)
-          test -n "$kernel_build"
-          ./scripts/verify-driver-build.sh .driver-build-source "${kernel_build##*/}"
+          kernel_release=$(./scripts/select-ci-kernel.sh)
+          printf 'Selected generic kernel headers: %s\n' "$kernel_release"
+          ./scripts/verify-driver-build.sh .driver-build-source "$kernel_release"
