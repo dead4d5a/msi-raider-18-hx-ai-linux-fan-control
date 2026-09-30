@@ -3,13 +3,15 @@
 """Exercise CI header selection and build preflight without host kernel access.
 
 Package metadata is supplied by a fake dpkg-query. Build-header paths are
-relocated into private temporary directories, and git/make/modinfo are replaced
-by tripwires. Valid preflight intentionally stops at the first fake git call;
-these checks never compile, install, load, or inspect a real kernel module.
+relocated into private temporary directories, and external commands are replaced
+by tripwires or fixture metadata. Valid preflight stops at the first fake git
+call; post-build checks use fake modinfo. These checks never compile, install,
+load, or inspect a real kernel module.
 """
 
 from __future__ import annotations
 
+import ast
 import json
 import os
 import pathlib
@@ -25,6 +27,8 @@ ROOT = pathlib.Path(__file__).parents[1]
 RELEASE = "6.8.0-101-generic"
 HEADERS_PACKAGE = "linux-headers-" + RELEASE
 INSTALLED = "install ok installed"
+SNAPSHOT_SRCVERSION = "9086C45007CBB7FA1264430"
+CI_68_SRCVERSION = "123635EB33D32BA9FCFABCA"
 EXPORTS = "".join(
     f"0x01234567\t{symbol}\tdrivers/acpi/battery\tEXPORT_SYMBOL_GPL\t\n"
     for symbol in ("battery_hook_register", "battery_hook_unregister")
@@ -42,6 +46,14 @@ command = pathlib.Path(sys.argv[0]).name
 arguments = sys.argv[1:]
 with (root / "calls.jsonl").open("a", encoding="ascii") as stream:
     stream.write(json.dumps([command, *arguments]) + "\n")
+if command == "modinfo" and (root / "module-info.json").is_file():
+    expected_module = root / "module-build/driver/msi-ec.ko"
+    if len(arguments) != 3 or arguments[0] != "-F" or arguments[2] != str(expected_module):
+        print("Unexpected mocked module query", file=sys.stderr)
+        raise SystemExit(1)
+    fields = json.loads((root / "module-info.json").read_text(encoding="ascii"))
+    sys.stdout.write(fields.get(arguments[1], "") + "\n")
+    raise SystemExit(0)
 if command != "dpkg-query":
     print("Blocked test tripwire: " + command, file=sys.stderr)
     raise SystemExit(73)
@@ -282,6 +294,77 @@ class DriverHeaderPreflightTests(TemporaryCommandFixture):
             encoding="ascii",
         )
         self.assert_preflight_rejected()
+
+
+class OfflineModuleIdentityTests(TemporaryCommandFixture):
+    def setUp(self):
+        super().setUp()
+        self.module_directory = self.folder / "module-build"
+        self.module = self.module_directory / "driver/msi-ec.ko"
+        original = (ROOT / "scripts/verify-driver-build.sh").read_text(encoding="ascii")
+        boundary = "\nmodule=$verify_dir/driver/msi-ec.ko\n"
+        self.assertEqual(original.count(boundary), 1, "execute the actual post-build verification tail")
+        tail = original.partition(boundary)[2]
+        self.script = self.folder / "verify-module-tail.sh"
+        self.script.write_text(
+            "set -Eeuo pipefail\n"
+            "verify_dir=" + shlex.quote(str(self.module_directory)) + "\n"
+            "kernel_release=" + shlex.quote(RELEASE) + "\n"
+            "module=$verify_dir/driver/msi-ec.ko\n" + tail,
+            encoding="ascii",
+        )
+
+    def verify_identity(self, **overrides):
+        fields = {"name": "msi_ec", "version": "0.13.1",
+                  "srcversion": SNAPSHOT_SRCVERSION,
+                  "vermagic": RELEASE + " SMP preempt mod_unload modversions "}
+        fields.update(overrides)
+        (self.folder / "module-info.json").write_text(json.dumps(fields), encoding="ascii")
+        (self.folder / "calls.jsonl").write_text("", encoding="ascii")
+        self.assertFalse(self.module.exists(), "there is no real module for modinfo to inspect")
+        result = self.run_script(self.script)
+        self.assertTrue(self.calls(), "actual tail must query the fake metadata")
+        self.assertTrue(all(call[0] == "modinfo" and call[-1] == str(self.module)
+                            for call in self.calls()), self.calls())
+        self.assertFalse(self.module.exists(), "verification must not generate a module")
+        return result
+
+    def test_both_exact_offline_build_checksums_are_accepted(self):
+        for source in (SNAPSHOT_SRCVERSION, CI_68_SRCVERSION):
+            with self.subTest(source=source):
+                result = self.verify_identity(srcversion=source)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertIn("verification: PASS", result.stdout)
+
+    def test_unknown_empty_or_extended_source_checksum_is_rejected(self):
+        for source in ("", "0" * 24, CI_68_SRCVERSION + "0", CI_68_SRCVERSION.lower()):
+            with self.subTest(source=source):
+                result = self.verify_identity(srcversion=source)
+                self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertNotIn("verification: PASS", result.stdout)
+
+    def test_both_known_checksums_still_require_name_version_and_vermagic(self):
+        for source in (SNAPSHOT_SRCVERSION, CI_68_SRCVERSION):
+            for field, value in (("name", "untrusted_driver"), ("version", "0.13.2"),
+                                 ("vermagic", "6.17.0-1001-azure SMP "),
+                                 ("vermagic", RELEASE + "-other SMP "),
+                                 ("vermagic", "")):
+                with self.subTest(source=source, field=field, value=value):
+                    result = self.verify_identity(srcversion=source, **{field: value})
+                    self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+                    self.assertNotIn("verification: PASS", result.stdout)
+
+    def test_ci_only_checksum_does_not_expand_runtime_build_trust(self):
+        tree = ast.parse((ROOT / "src/msi_fan_control.py").read_text(encoding="ascii"))
+        assignments = {target.id: node.value
+                       for node in tree.body if isinstance(node, ast.Assign)
+                       for target in node.targets if isinstance(target, ast.Name)}
+        supported_node = assignments["SUPPORTED_SRCVERSIONS"]
+        self.assertIsInstance(supported_node, (ast.Tuple, ast.List))
+        supported = tuple(ast.literal_eval(assignments[item.id]) if isinstance(item, ast.Name)
+                          else ast.literal_eval(item) for item in supported_node.elts)
+        self.assertEqual(supported, ("AB0BFAE2391B5ADD66E01BD", SNAPSHOT_SRCVERSION))
+        self.assertNotIn(CI_68_SRCVERSION, supported)
 
 
 if __name__ == "__main__":

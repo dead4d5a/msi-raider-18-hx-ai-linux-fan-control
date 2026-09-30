@@ -75,7 +75,15 @@ metapackage's exact dependency with `scripts/select-ci-kernel.sh`. It must not
 pick the runner's running or highest-version kernel: a cloud/Azure kernel may
 lack the ACPI battery-hook exports that `msi_ec` requires. The verifier checks
 the header release, module/battery configuration and symbol exports before
-building; it never suppresses unresolved-symbol failures or relaxes ABI pins.
+building; it never suppresses unresolved-symbol failures or relaxes runtime ABI
+pins. The offline verifier recognizes two exact checksums reproduced from the
+same pinned driver source: `9086C45007CBB7FA1264430` with the tested 7.0 relative
+dependency layout, and `123635EB33D32BA9FCFABCA` with the CI 6.8 absolute layout.
+Kbuild's source-version calculation includes the local configuration header in
+the latter layout but not the former. Archive/patch digests, name, version, and
+target vermagic remain mandatory. The CI checksum is **not** added to the
+controller's runtime allowlist, and a successful CI build is not hardware
+validation or permission to deploy a different module.
 
 Keep the production manager free of generic curve/address input. New profiles
 must be named constants, reviewed, measured, and exact-platform gated.

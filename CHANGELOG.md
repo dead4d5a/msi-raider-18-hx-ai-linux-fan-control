@@ -5,6 +5,9 @@
 - Select CI kernel headers from the installed generic metapackage, not the
   highest version across runner kernel flavors; check matching release, module
   support and exact battery-hook exports before building the pinned driver.
+- Recognize only the two reproduced Kbuild source-checksum layouts in offline
+  verification and print built module metadata; runtime driver ABI pins remain
+  unchanged.
 - Reject overdue same-poll telemetry before cooldown release and report actual
   observation freshness; retain Boost without an off/on flicker after slow reads.
 - Add default-off, explicitly enabled timing diagnostics for validation, with no

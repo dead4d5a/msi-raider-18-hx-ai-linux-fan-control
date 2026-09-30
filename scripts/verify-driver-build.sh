@@ -71,8 +71,21 @@ git -C "$verify_dir/driver" apply "$patch_file"
 # DKMS, load, or reload targets and never modify the supplied checkout.
 make -C "$kernel_build" M="$verify_dir/driver" -j2 modules
 module=$verify_dir/driver/msi-ec.ko
+for field in name version srcversion vermagic; do
+  printf 'Built module %s: %s\n' "$field" "$(modinfo -F "$field" "$module")"
+done
 [[ $(modinfo -F name "$module") == msi_ec ]]
 [[ $(modinfo -F version "$module") == 0.13.1 ]]
-[[ $(modinfo -F srcversion "$module") == 9086C45007CBB7FA1264430 ]]
+# Kbuild's relative/absolute dependency layouts hash local headers differently.
+# Both fingerprints were reproduced from byte-identical pinned source. These
+# are offline build checks only: do not add the CI variant to runtime ABI pins.
+module_srcversion=$(modinfo -F srcversion "$module")
+case "$module_srcversion" in
+  9086C45007CBB7FA1264430|123635EB33D32BA9FCFABCA) ;;
+  *)
+    echo "Unexpected pinned-source module checksum: $module_srcversion" >&2
+    exit 1
+    ;;
+esac
 [[ $(modinfo -F vermagic "$module") == "$kernel_release "* ]]
 echo "Pinned driver patch and unprivileged build verification: PASS ($kernel_release)"
