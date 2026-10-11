@@ -97,6 +97,11 @@ elif command == "msi-fan-profile":
         sys.exit(24)
 elif command == "systemctl":
     action = args[0]
+    if action == "disable" and failure == "disable" and not state.get("disable_refused"):
+        # Only the first disable fails, as a transient systemd error would.
+        state["disable_refused"] = True
+        save()
+        sys.exit(1)
     if action in ("enable", "disable"):
         state["enabled"] = "enabled" if action == "enable" else "disabled"
         save()
@@ -364,13 +369,33 @@ class UpgradeCoolingPreservationTests(UpgradeSandboxTestCase):
                 self.assertEqual(self.deployed.get(target), "755")
                 self.assertRegex(self.record, r"(?m)^[0-9a-f]{64}  \S*/" + target + "$")
 
-    def test_unsafe_recovery_latch_stops_before_activation_and_is_kept(self):
-        result, state, calls = self.run_upgrade("", latch_mode=0o644)
+    def assert_stopped_after_verified_factory(self, result, state, calls):
         self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertTrue(self.latch_remaining)
+        # The manager did reach factory auto/off: no cool-retry advice, and the
+        # disabled service is named, since the profile would not return at boot.
+        self.assertIn("existing manager reported factory auto/off, but a later",
+                      result.stderr)
+        self.assertNotIn("did not reach verified factory auto/off", result.stderr)
+        self.assertNotIn("let the machine cool", result.stderr)
+        self.assertIn("The service was disabled, so the installed profile will not "
+                      "return at boot.", result.stderr)
+        self.assertRegex(result.stderr, r"run 'sudo \S*/usr/local/sbin/msi-fan-profile "
+                                        r"apply-default' before rebooting")
         self.assertEqual((state["curve"], state["mode"], state["boost"], state["enabled"]),
                          (FACTORY, "auto", "off", "disabled"))
         self.assertNotIn(["msi-fan-profile", "apply-default"], calls)
+        self.assertNotIn("usr/local/libexec/msi-fan-kernel-readiness", self.deployed)
+        self.assertEqual(self.record, "")
+
+    def test_unsafe_recovery_latch_stops_before_activation_and_is_kept(self):
+        result, state, calls = self.run_upgrade("", latch_mode=0o644)
+        self.assert_stopped_after_verified_factory(result, state, calls)
+        self.assertTrue(self.latch_remaining)
+
+    def test_failed_disable_after_factory_auto_replaces_nothing_and_retries(self):
+        result, state, calls = self.run_upgrade("disable")
+        self.assert_stopped_after_verified_factory(result, state, calls)
+        self.assertEqual(calls.count(["systemctl", "disable", "msi-fan-profile.service"]), 2)
 
 
 class UnprivilegedReleaseCheckTests(UpgradeSandboxTestCase):

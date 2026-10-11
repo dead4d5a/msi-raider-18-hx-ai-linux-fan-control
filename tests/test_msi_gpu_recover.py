@@ -1094,7 +1094,9 @@ class KeeperLoopMemoryTests(HardwareIsolatedTestCase):
     Mock records each call and would itself grow by far more than a leak.
     """
 
-    WARMUP = 1000
+    # One-time allocator and cache growth settles over thousands of passes;
+    # after 1000 it still varied between runs, unrelated to PASSES.
+    WARMUP = 5000
     PASSES = 4000
     CYCLE = 60
 

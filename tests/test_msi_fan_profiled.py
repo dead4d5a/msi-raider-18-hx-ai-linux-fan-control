@@ -1678,7 +1678,9 @@ class MainLoopMemoryTests(HardwareFreeMainLoopTests):
     more than the leak being measured.
     """
 
-    WARMUP = 1000
+    # One-time allocator and cache growth settles over thousands of passes;
+    # after 1000 it still measured up to ~450 blocks, unrelated to PASSES.
+    WARMUP = 5000
     PASSES = 4000
     CYCLE = 120
 

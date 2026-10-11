@@ -29,7 +29,8 @@
 - Test allocator growth across thousands of passes of the real daemon main loop
   and keeper loop on a private file-backed sysfs tree, with plain-function
   fakes, so a per-pass leak anywhere in either loop fails the suite, not only
-  one in health publication.
+  one in health publication. A 5000-pass warm-up keeps one-time allocator
+  growth from failing the release checks at random.
 - Stop `factory-auto` from disabling the service when it is merely too hot to
   release Cooler Boost. When the verified factory curve and auto mode are in
   place and only the cool release is refused (heat, or invalid or unavailable
@@ -46,7 +47,9 @@
   the factory `auto/off` postcondition passes, so a later failure can no longer
   re-assert Boost without it. `upgrade-profile.sh` reports a failed
   `factory-auto` as nothing replaced, with the cool-retry and `apply-default`
-  instructions.
+  instructions. A later failure after a successful `factory-auto`, before any
+  replacement, is reported as nothing replaced with the service disabled, and
+  `apply-default` before rebooting, not as a hot refusal.
 - Treat the `factory-auto` marker appearing while the daemon runs as a clean
   stop request, the same path as the stop signal that follows it, instead of a
   fault exit that briefly staged full-cooling recovery and a failed unit.
@@ -70,6 +73,8 @@
   after DKMS for every installed kernel, logs to the journal under the
   `msi-fan-profile` tag, warns on stderr on failure and always exits 0. Install,
   upgrade (including backup), uninstall and `INSTALL_RECORD` cover both files.
+  The installed `OPERATIONS.md` that the hook names explains the checks itself
+  and names uninstalled documents by their source checkout path.
 - Restore the deployed legacy driver patch from the initial release as
   `patches/msi-ec-0.13.1-legacy-fan-curve.patch` with its own pinned digest, so
   a lost `/usr/src/msi_ec-0.13.1` can be regenerated. `verify-driver-build.sh`

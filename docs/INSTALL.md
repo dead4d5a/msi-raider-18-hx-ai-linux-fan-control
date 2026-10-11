@@ -110,6 +110,14 @@ installed profile now, run `sudo msi-fan-profile apply-default` and rerun the
 upgrade when cool. Managers older than this release also disable the service on
 that failure, so their cool retry fails until `apply-default` has been run.
 
+If `factory-auto` succeeds but a later check fails before any replacement (the
+disable, the stopped units, the runtime marker, factory `auto/off`, or a
+recovery-Boost marker that is not a root-owned mode-`0600` file), the upgrade
+also replaces nothing, but it leaves the service disabled and says so: the
+installed profile does not return at boot until `apply-default` has run. Inspect
+both units, the marker and the latch, resolve the failed check, run
+`sudo msi-fan-profile apply-default` before rebooting, and rerun the upgrade.
+
 ## Verify systemd
 
 ```bash

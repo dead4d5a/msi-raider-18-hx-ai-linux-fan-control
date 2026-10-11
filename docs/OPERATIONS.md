@@ -47,8 +47,21 @@ installed kernel and logs the result with the `msi-fan-profile` tag
 (`sudo journalctl -t msi-fan-profile`). A DKMS signing failure does not fail a
 kernel installation, so a `FAIL` here is often the only warning before the
 reboot. Do not reboot into a kernel that fails; the fans would stay on firmware
-control. The kernel update section of `ROLLBACK.md` explains each check and
-warning, and what to do before rebooting.
+control.
+
+Each `FAIL` line names the failed step: the `msi_ec/0.13.1` DKMS build for that
+kernel, the module `modinfo` resolves, its pinned source version and
+`vermagic`, its signature by the enrolled MOK certificate, `msi_wmi_platform`,
+`coretemp`, or a `modprobe.d` override. `WARN` lines do not fail the check. If
+header packages were configured after the kernel image, DKMS may build the
+module after the hook ran; run the check again by hand before deciding. Repair a
+failure for that kernel in an attended session, or boot a kernel the check
+passes for; reboot into the new kernel only once its check exits `0`. If a
+failing kernel has already booted, see
+[Controller failed: driver not loaded](#controller-failed-driver-not-loaded).
+In the source checkout, which is not installed, the kernel update section of
+`docs/ROLLBACK.md` explains each check and warning in full, and
+`docs/DRIVER_INSTALL.md` covers the DKMS build, signing and MOK enrollment.
 
 ## Boot window
 
@@ -279,7 +292,8 @@ keeper keeps cooling:
 4. Run `msi-fan-profile status` again. It should exit `0`, with the keeper
    inactive, no recovery latch, and `cooler_boost` `off`.
 5. If the installed release leaks, install a fixed one in a cool window with the
-   guarded `sudo ./scripts/upgrade-profile.sh` (see `INSTALL.md`). Afterwards,
+   guarded `sudo ./scripts/upgrade-profile.sh` (see `docs/INSTALL.md` in the
+   source checkout). Afterwards,
    check `controller_memory.memory_peak_bytes` over several days; it should
    stay far below 64 MiB.
 
@@ -308,8 +322,8 @@ names the failing step. Neither the controller nor its recovery helper has
 written to the EC, the keeper is skipped, and the fans are on the firmware's own
 automatic control. Repair the driver for that kernel in an attended session, or
 boot a kernel that passes the readiness check. Then run
-`sudo msi-fan-profile apply-default`. See the kernel update section of
-`ROLLBACK.md`.
+`sudo msi-fan-profile apply-default`. See [Kernel updates](#kernel-updates)
+and, in the source checkout, the kernel update section of `docs/ROLLBACK.md`.
 
 ## Degraded telemetry
 
@@ -384,7 +398,7 @@ there (`/sys/power/disk` reads `[disabled]`). A desktop idle-suspend request
 therefore fails. The daemon's resume path, a forced Candidate 14 reapply, is
 implemented and covered by mocked tests, but has not run in the field with the
 current code. Keep the targets masked until the attended suspend test in
-`VALIDATION.md` passes. Check them with:
+`docs/VALIDATION.md` of the source checkout passes. Check them with:
 
 ```bash
 systemctl is-enabled sleep.target suspend.target hibernate.target hybrid-sleep.target

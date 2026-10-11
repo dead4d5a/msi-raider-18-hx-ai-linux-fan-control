@@ -76,6 +76,7 @@ backup_root=/var/lib/msi-fan-profile/upgrade-backups
 backup=''
 safe_state=0
 factory_transition=0
+factory_verify=0
 enabled_for_startup=0
 activation_started=0
 
@@ -95,6 +96,13 @@ cleanup() {
   elif ((rc != 0 && safe_state)); then
     systemctl disable "$service" >/dev/null 2>&1 || true
     echo 'Upgrade stopped; the service remains disabled in factory auto mode.' >&2
+  elif ((rc != 0 && factory_verify)); then
+    # The existing manager reported factory auto/off, but disabling the service
+    # or a later unit, marker, cooling or latch check failed. Nothing was
+    # replaced; keep the service disabled, as this window intended.
+    systemctl disable "$service" >/dev/null 2>&1 || true
+    echo 'Upgrade stopped before replacing any artifact: the existing manager reported factory auto/off, but a later service, marker, cooling or recovery Boost latch check failed.' >&2
+    echo "The service was disabled, so the installed profile will not return at boot. Inspect both units, $marker and $recovery_latch, resolve the failed check, then run 'sudo $manager apply-default' before rebooting and rerun this upgrade." >&2
   elif ((rc != 0 && factory_transition)); then
     # Nothing was replaced. Leave whatever cooling and boot enablement the
     # existing manager reported: a refused hot Boost release keeps Boost on.
@@ -121,6 +129,8 @@ systemctl stop "$keeper" 2>/dev/null || true
 systemctl reset-failed "$keeper" 2>/dev/null || true
 factory_transition=1
 "$manager" factory-auto
+factory_transition=0
+factory_verify=1
 systemctl disable "$service"
 systemctl stop "$service" 2>/dev/null || true
 systemctl reset-failed "$service" 2>/dev/null || true
