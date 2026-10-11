@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Run release checks, including the unit-test suite, without root from install
+  and upgrade: as the invoking sudo user, or as `nobody` on a private copy when
+  no sudo user is known, with no supplementary groups and no new privileges.
+  `verify-release.sh` itself now refuses to run as root.
 - Keep daemon main-loop, manager and recovery tests off the live host: relocate
   every `/run` and sysfs path constant into a per-test directory, block
   unmocked fixed-path helpers and subprocesses, and fail when a new host path

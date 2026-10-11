@@ -4,6 +4,13 @@ set -euo pipefail
 repo=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$repo"
 
+# The unit tests run on the live controller host. Never give a missing mock
+# root access to sysfs, /run, or systemd; privileged callers drop first.
+if [[ $EUID -eq 0 ]]; then
+    echo 'Refusing to run release checks as root; use scripts/verify-release-unprivileged.sh.' >&2
+    exit 1
+fi
+
 verify_cache=$(mktemp -d)
 cleanup() {
     rm -rf -- "$verify_cache"

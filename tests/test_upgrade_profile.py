@@ -7,6 +7,9 @@ from __future__ import annotations
 import json
 import os
 import pathlib
+import pwd
+import re
+import shutil
 import subprocess
 import tempfile
 import textwrap
@@ -17,8 +20,9 @@ ROOT = pathlib.Path(__file__).parents[1]
 FACTORY = "58 64 70 76 82 88 0 25 35 44 58 70 75 52 58 64 70 76 82 0 25 35 44 58 70 75"
 DEFAULT = "50 60 70 76 82 88 20 30 40 50 60 80 110 38 40 42 44 55 70 20 30 40 60 70 100 120"
 
-# Every privileged command is replaced, and every deployment/sysfs path is
-# relocated beneath TemporaryDirectory. No test can reach the real controller.
+# Every privileged command is replaced, every deployment/sysfs path is
+# relocated beneath TemporaryDirectory, and PATH holds only the mocks and an
+# explicit allowlist of real tools. No test can reach the real controller.
 COMMAND_SHIM = textwrap.dedent(r'''\
 #!/usr/bin/env python3
 import json
@@ -47,7 +51,25 @@ def cooling(curve, mode, boost):
     save()
 
 failure = os.environ.get("UPGRADE_TEST_FAIL_AT")
-if command == "msi-fan-profile":
+if command == "setpriv":
+    # Record the privilege drop, then run the command as this test user.
+    separator = args.index("--")
+    child = args[separator + 1:]
+    uid = next(arg.split("=", 1)[1] for arg in args[:separator] if arg.startswith("--reuid="))
+    unreadable = os.environ.get("UPGRADE_TEST_UNREADABLE")
+    if child[0] == "test" and unreadable and child[-1].startswith(unreadable + "/"):
+        sys.exit(1)
+    os.execvpe(child[0], child, dict(os.environ, UPGRADE_TEST_UID=uid))
+elif command == "verify-release.sh":
+    tree = pathlib.Path(sys.argv[0]).parents[1]
+    (root / "verify.json").write_text(json.dumps({
+        "tree": str(tree), "uid": os.environ.get("UPGRADE_TEST_UID"),
+        "bytecode": os.environ.get("PYTHONDONTWRITEBYTECODE"),
+        "manifest": (tree / "SHA256SUMS").is_file(), "git": (tree / ".git").exists(),
+        "mode": stat.S_IMODE(tree.stat().st_mode)}))
+    if failure == "verify":
+        sys.exit(26)
+elif command == "msi-fan-profile":
     if args == ["factory-auto"]:
         state.update(active="inactive", substate="dead", keeper="inactive")
         marker = root / "run/msi-fan-profile.factory-auto"
@@ -129,18 +151,38 @@ elif command == "install":
 ''').lstrip("\\\n")
 
 
-class UpgradeCoolingPreservationTests(unittest.TestCase):
-    def run_upgrade(self, failure):
+# Real tools the upgrade and its release-check helper may use. Any other bare
+# command, including a future privileged one, is not found inside the sandbox.
+ALLOWED_TOOLS = ("awk", "bash", "cat", "chmod", "cmp", "cp", "dirname", "env", "find",
+                 "id", "mktemp", "python3", "rm", "sha256sum", "test")
+MOCKED_TOOLS = ("chgrp", "install", "setpriv", "stat", "systemctl", "systemd-analyze",
+                "systemd-tmpfiles")
+ROOT_GUARD = "[[ $EUID -eq 0 ]] || { echo 'Run with sudo.' >&2; exit 1; }"
+# An absolute host reference left after relocation would bypass PATH shims.
+HOST_REFERENCE = re.compile(
+    r"(?<![\w./-])/(?:bin|boot|dev|etc|lib|lib64|proc|run|sbin|sys|usr|var)(?![\w-])")
+LATCH_PAYLOAD = "candidate14\n"
+
+
+class UpgradeSandboxTestCase(unittest.TestCase):
+    def run_upgrade(self, failure, *, sudo=("4242", "4343"), unreadable=False,
+                    latch_mode=None):
         with tempfile.TemporaryDirectory() as temporary:
             sandbox = pathlib.Path(temporary)
             release = sandbox / "release"
             (release / "scripts").mkdir(parents=True)
+            (release / ".git").mkdir()
+            (release / ".git/config").write_text("[core]\n")
             (sandbox / "run").mkdir()
             base = sandbox / "sys/devices/platform/msi-ec"
             base.mkdir(parents=True)
             for name, value in (("fan_curve", DEFAULT), ("fan_mode", "advanced"),
                                 ("cooler_boost", "off")):
                 (base / name).write_text(value)
+            latch = sandbox / "run/msi-fan-profile.recovery-boost"
+            if latch_mode is not None:
+                latch.write_text(LATCH_PAYLOAD)
+                latch.chmod(latch_mode)
             state_path = sandbox / "state.json"
             state_path.write_text(json.dumps({
                 "active": "active", "substate": "running", "keeper": "inactive",
@@ -148,21 +190,30 @@ class UpgradeCoolingPreservationTests(unittest.TestCase):
             }))
             (sandbox / "calls.jsonl").touch()
 
-            script = (ROOT / "scripts/upgrade-profile.sh").read_text()
             # Keep all control flow intact; relocate host paths and bypass only
-            # the root guard, since ownership/privileged commands are mocked.
-            root_guard = "[[ $EUID -eq 0 ]] || { echo 'Run with sudo.' >&2; exit 1; }"
-            self.assertIn(root_guard, script)
-            script = script.replace(root_guard, ": # root check mocked")
-            for prefix in ("/usr/local", "/etc", "/run", "/var/lib", "/sys/devices"):
-                script = script.replace(prefix, str(sandbox) + prefix)
-            script_path = release / "scripts/upgrade-profile.sh"
-            script_path.write_text(script)
+            # the root guards, since ownership/privileged commands are mocked.
+            for name, relocate in (("upgrade-profile.sh", True),
+                                   ("verify-release-unprivileged.sh", False)):
+                script = (ROOT / "scripts" / name).read_text()
+                self.assertIn(ROOT_GUARD, script)
+                script = script.replace(ROOT_GUARD, ": # root check mocked")
+                if relocate:
+                    for prefix in ("/usr/local", "/etc", "/run", "/var/lib", "/sys/devices"):
+                        script = script.replace(prefix, str(sandbox) + prefix)
+                body = "\n".join(line for line in script.splitlines()
+                                 if not line.lstrip().startswith("#"))
+                body = body.replace("/dev/null", "")
+                self.assertIsNone(HOST_REFERENCE.search(body), name)
+                script_path = release / "scripts" / name
+                script_path.write_text(script)
+                script_path.chmod(0o755)
 
-            for name in ("preflight.sh", "verify-release.sh"):
-                path = release / "scripts" / name
-                path.write_text("#!/usr/bin/env bash\nexit 0\n")
-                path.chmod(0o755)
+            path = release / "scripts/preflight.sh"
+            path.write_text("#!/usr/bin/env bash\nexit 0\n")
+            path.chmod(0o755)
+            path = release / "scripts/verify-release.sh"
+            path.write_text(COMMAND_SHIM)
+            path.chmod(0o755)
             for relative in (
                 "src/msi-fan-profile", "src/msi-fan-profiled", "src/msi-gpu-recover",
                 "src/msi_fan_control.py",
@@ -185,19 +236,41 @@ class UpgradeCoolingPreservationTests(unittest.TestCase):
 
             mock_bin = sandbox / "mock-bin"
             mock_bin.mkdir()
-            for name in ("install", "stat", "systemctl", "systemd-analyze", "systemd-tmpfiles"):
+            for name in MOCKED_TOOLS:
                 path = mock_bin / name
                 path.write_text(COMMAND_SHIM)
                 path.chmod(0o755)
-            environment = dict(os.environ, PATH=str(mock_bin) + os.pathsep + os.environ["PATH"],
+            allowed_bin = sandbox / "allowed-bin"
+            allowed_bin.mkdir()
+            for name in ALLOWED_TOOLS:
+                tool = shutil.which(name)
+                self.assertIsNotNone(tool, name)
+                (allowed_bin / name).symlink_to(tool)
+            # verify-release.sh points PYTHONPYCACHEPREFIX at an empty cache,
+            # which would make every Python shim recompile its imports.
+            environment = {key: value for key, value in os.environ.items()
+                           if not key.startswith("SUDO_") and key != "PYTHONPYCACHEPREFIX"}
+            if sudo:
+                environment.update(SUDO_USER="tester", SUDO_UID=sudo[0], SUDO_GID=sudo[1])
+            if unreadable:
+                environment["UPGRADE_TEST_UNREADABLE"] = str(release)
+            environment.update(PATH=str(mock_bin) + os.pathsep + str(allowed_bin),
                                UPGRADE_TEST_ROOT=str(sandbox), UPGRADE_TEST_FAIL_AT=failure,
                                UPGRADE_TEST_FACTORY=FACTORY, UPGRADE_TEST_DEFAULT=DEFAULT)
-            result = subprocess.run(["bash", str(script_path)], env=environment,
-                                    text=True, capture_output=True, timeout=30)
+            result = subprocess.run(["bash", str(release / "scripts/upgrade-profile.sh")],
+                                    env=environment, text=True, capture_output=True, timeout=30)
             state = json.loads(state_path.read_text())
             calls = [json.loads(line) for line in (sandbox / "calls.jsonl").read_text().splitlines()]
+            verify = sandbox / "verify.json"
+            self.verify = json.loads(verify.read_text()) if verify.exists() else None
+            if self.verify is not None:
+                self.verify["in_place"] = self.verify["tree"] == str(release)
+                self.verify["tree_remaining"] = pathlib.Path(self.verify["tree"]).exists()
+            self.latch_remaining = latch.exists()
             return result, state, calls
 
+
+class UpgradeCoolingPreservationTests(UpgradeSandboxTestCase):
     def assert_recovery_preserved(self, failure, code):
         result, state, calls = self.run_upgrade(failure)
         self.assertEqual(result.returncode, code, result.stdout + result.stderr)
@@ -224,6 +297,90 @@ class UpgradeCoolingPreservationTests(unittest.TestCase):
                          (FACTORY, "auto", "off", "inactive"))
         self.assertEqual(state["enabled"], "disabled")
         self.assertNotIn(["msi-fan-profile", "apply-default"], calls)
+
+    def test_keeper_recovery_latch_is_removed_in_the_verified_factory_state(self):
+        result, state, calls = self.run_upgrade("", latch_mode=0o600)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertFalse(self.latch_remaining)
+        self.assertEqual(state["enabled"], "enabled")
+        self.assertLess(calls.index(["msi-fan-profile", "factory-auto"]),
+                        calls.index(["msi-fan-profile", "apply-default"]))
+
+    def test_unsafe_recovery_latch_stops_before_activation_and_is_kept(self):
+        result, state, calls = self.run_upgrade("", latch_mode=0o644)
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertTrue(self.latch_remaining)
+        self.assertEqual((state["curve"], state["mode"], state["boost"], state["enabled"]),
+                         (FACTORY, "auto", "off", "disabled"))
+        self.assertNotIn(["msi-fan-profile", "apply-default"], calls)
+
+
+class UnprivilegedReleaseCheckTests(UpgradeSandboxTestCase):
+    def assert_dropped(self, calls, uid, gid):
+        drops = [call for call in calls if call[0] == "setpriv"]
+        self.assertTrue(drops)
+        for call in drops:
+            self.assertEqual(call[1:call.index("--")], [
+                f"--reuid={uid}", f"--regid={gid}", "--clear-groups",
+                "--no-new-privs", "--reset-env"])
+        self.assertEqual(drops[-1][drops[-1].index("--") + 1:][:2],
+                         ["env", "PYTHONDONTWRITEBYTECODE=1"])
+        self.assertEqual(self.verify["uid"], uid)
+        self.assertEqual(self.verify["bytecode"], "1")
+        # Release checks finish before the installed controller is touched.
+        first_change = next(index for index, call in enumerate(calls)
+                            if call[0] in ("systemctl", "msi-fan-profile", "install"))
+        self.assertLess(calls.index(drops[-1]), first_change)
+
+    def test_release_checks_run_in_place_as_the_sudo_user(self):
+        result, _, calls = self.run_upgrade("")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assert_dropped(calls, "4242", "4343")
+        self.assertTrue(self.verify["in_place"])
+        self.assertNotIn("chgrp", [call[0] for call in calls])
+
+    def test_without_a_sudo_user_release_checks_run_as_nobody_on_a_private_copy(self):
+        nobody = pwd.getpwnam("nobody")
+        for sudo in (None, ("0", "0")):
+            with self.subTest(sudo=sudo):
+                result, _, calls = self.run_upgrade("", sudo=sudo, unreadable=True)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assert_dropped(calls, str(nobody.pw_uid), str(nobody.pw_gid))
+                self.assertFalse(self.verify["in_place"])
+                self.assertTrue(self.verify["manifest"])
+                self.assertFalse(self.verify["git"])
+                self.assertEqual(self.verify["mode"], 0o750)
+                self.assertIn(["chgrp", "--", str(nobody.pw_gid), self.verify["tree"]], calls)
+                self.assertFalse(self.verify["tree_remaining"])
+
+    def test_checkout_unreadable_by_the_sudo_user_is_copied_for_that_user(self):
+        result, _, calls = self.run_upgrade("", unreadable=True)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assert_dropped(calls, "4242", "4343")
+        self.assertFalse(self.verify["in_place"])
+        self.assertIn(["chgrp", "--", "4343", self.verify["tree"]], calls)
+        self.assertFalse(self.verify["tree_remaining"])
+
+    def test_failed_release_checks_stop_before_any_controller_change(self):
+        result, state, calls = self.run_upgrade("verify")
+        self.assertEqual(result.returncode, 26, result.stdout + result.stderr)
+        self.assertEqual(self.verify["uid"], "4242")
+        # Only the read-only manager ownership check precedes the release checks.
+        self.assertEqual({call[0] for call in calls}, {"stat", "setpriv", "verify-release.sh"})
+        self.assertEqual((state["curve"], state["mode"], state["boost"], state["enabled"]),
+                         (DEFAULT, "advanced", "off", "enabled"))
+
+    def test_privileged_scripts_never_run_release_checks_directly(self):
+        for name in ("install-profile.sh", "upgrade-profile.sh"):
+            script = (ROOT / "scripts" / name).read_text()
+            with self.subTest(name=name):
+                self.assertEqual(script.count('"$repo/scripts/verify-release-unprivileged.sh"\n'), 1)
+                self.assertNotIn("scripts/verify-release.sh", script)
+                self.assertLess(script.index('"$repo/scripts/preflight.sh"'),
+                                script.index("verify-release-unprivileged.sh"))
+        verify = (ROOT / "scripts/verify-release.sh").read_text()
+        guard = verify.index("if [[ $EUID -eq 0 ]]; then")
+        self.assertLess(guard, verify.index("python3 -m unittest"))
 
 
 if __name__ == "__main__":

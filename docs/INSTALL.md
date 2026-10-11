@@ -37,6 +37,8 @@ sudo ./scripts/install-profile.sh
 The script:
 
 - refuses to overwrite an existing installation;
+- runs the release checks, including the unit tests, without root: as the
+  invoking sudo user, or as `nobody` on a private copy of the checkout;
 - installs root-owned executables and their shared read-only ABI helper;
 - installs a root-only tmpfiles lock;
 - installs the matching README, operations, and safety documentation used by
@@ -74,7 +76,8 @@ For a guarded in-place upgrade from this repository, use:
 sudo ./scripts/upgrade-profile.sh
 ```
 
-The upgrade command verifies the source manifest and exact platform, stages all
+The upgrade command verifies the source manifest and exact platform (running
+the release checks without root, as the installer does), stages all
 artifacts, moves the existing controller to verified factory `auto/off`,
 disables it for the replacement window, keeps a root-only backup, refreshes the
 manager/daemon/recovery helper/unit/tmpfiles/documentation as one release, and

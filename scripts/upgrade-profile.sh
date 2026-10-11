@@ -20,8 +20,9 @@ factory='58 64 70 76 82 88 0 25 35 44 58 70 75 52 58 64 70 76 82 0 25 35 44 58 7
 
 # Validate the exact platform and the source release before touching the installed
 # controller. This also prevents a mismatched digest manifest from being deployed.
+# The release checks, including the unit tests, run without root.
 "$repo/scripts/preflight.sh"
-"$repo/scripts/verify-release.sh"
+"$repo/scripts/verify-release-unprivileged.sh"
 
 source_files=(
   "$repo/src/msi-fan-profile"

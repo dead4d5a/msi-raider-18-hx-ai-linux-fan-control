@@ -45,6 +45,9 @@ python3 -m json.tool data/results.json >/dev/null
 ./scripts/verify-release.sh
 ```
 
+Run the release checks as a normal user; `verify-release.sh` refuses root. The
+install and upgrade scripts drop privileges before running it.
+
 The default suite uses mocks and skips real systemd integration. To exercise
 lifecycle behavior using only UUID-named user services and temporary fake files:
 

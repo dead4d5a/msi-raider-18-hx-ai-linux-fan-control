@@ -5,7 +5,7 @@ set -Eeuo pipefail
 repo=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 [[ $EUID -eq 0 ]] || { echo 'Run with sudo.' >&2; exit 1; }
 "$repo/scripts/preflight.sh"
-"$repo/scripts/verify-release.sh"
+"$repo/scripts/verify-release-unprivileged.sh"
 
 paths=(
   /usr/local/sbin/msi-fan-profile
