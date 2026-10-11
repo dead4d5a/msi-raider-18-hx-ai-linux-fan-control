@@ -3,6 +3,7 @@
 """Persistent exact-platform MSI EC fan profile with read-only runtime monitoring."""
 from __future__ import annotations
 
+import errno
 import fcntl
 import json
 import os
@@ -179,22 +180,50 @@ def require_policy_identity(*, monitoring: bool = False,
         control = None
     else:
         try:
-            identity = fan_control.identity(read, BASE, monitoring=True)
-            if identity[fan_control.SOURCE_PATH] == fan_control.SNAPSHOT_SRCVERSION:
-                acquisition_started = time.monotonic()
-                if timing is not None:
-                    timing.begin_sensor(acquisition_started)
-                state = fan_control.snapshot(read, BASE)
-                control = MonitorControl(state, acquisition_started)
-                shift = state.shift
-            else:
-                control = None
-                shift = read(BASE / "shift_mode")
+            identity = fan_control.identity(read, BASE, monitoring=True,
+                                            firmware_checked_by_curve_read=True)
+            if identity[fan_control.SOURCE_PATH] != fan_control.SNAPSHOT_SRCVERSION:
+                # Legacy: legacy_monitoring_controls() checks the shift mode
+                # after the curve read's in-kernel firmware check.
+                return None
+            acquisition_started = time.monotonic()
+            if timing is not None:
+                timing.begin_sensor(acquisition_started)
+            state = fan_control.snapshot(read, BASE)
+            control = MonitorControl(state, acquisition_started)
+            shift = state.shift
         except (OSError, fan_control.ControlABIError) as error:
             raise ProfileError(f"monitoring identity/ABI validation failed: {error}") from error
+    require_comfort_shift(shift)
+    return control
+
+
+def require_comfort_shift(shift: str) -> None:
     if shift != "comfort":
         raise ProfileError("EC shift mode is no longer comfort")
-    return control
+
+
+def legacy_monitoring_controls() -> tuple[str, str, str]:
+    """Return the legacy curve, mode and Boost, reading fan_curve first.
+
+    Legacy monitoring skips the separate fw_version read. The pinned legacy
+    build's fan_curve read re-checks DMI and EC firmware in the kernel and
+    fails on a mismatch, so every later EC value of the pass follows a fresh
+    firmware check, as with the snapshot build.
+    """
+    try:
+        curve = read(BASE / "fan_curve")
+    except OSError as error:
+        check = (" by the in-kernel DMI/EC firmware check"
+                 if error.errno == errno.EOPNOTSUPP else "")
+        raise ProfileError(
+            f"monitoring identity/ABI validation failed{check}: {error}") from error
+    try:
+        shift = read(BASE / "shift_mode")
+    except OSError as error:
+        raise ProfileError(f"monitoring identity/ABI validation failed: {error}") from error
+    require_comfort_shift(shift)
+    return curve, read(BASE / "fan_mode"), read(BASE / "cooler_boost")
 
 
 def verify_boost(wmi: pathlib.Path, heartbeat: Callable[[str], None]) -> None:
@@ -748,9 +777,10 @@ def main() -> int:
         ready = False
         last_health_error: float | None = None
 
-        def observe_response(sample: RuntimeSample | None, now: float) -> bool:
+        def observe_response(boost: str, sample: RuntimeSample | None,
+                             now: float) -> bool:
             nonlocal response
-            if read(BASE / "cooler_boost") != "on":
+            if boost != "on":
                 response = None
                 return False
             if response is None:
@@ -859,9 +889,11 @@ def main() -> int:
                     control = None
             last_suspend_offset = suspend_offset
 
-            curve = control.state.curve if control else read(BASE / "fan_curve")
-            mode = control.state.mode if control else read(BASE / "fan_mode")
-            boost = control.state.boost if control else read(BASE / "cooler_boost")
+            if control:
+                curve, mode, boost = (control.state.curve, control.state.mode,
+                                      control.state.boost)
+            else:
+                curve, mode, boost = legacy_monitoring_controls()
             if curve != DEFAULT or mode != "advanced" or boost not in ("on", "off"):
                 if curve == FACTORY and mode == "auto" and boost in ("on", "off"):
                     preserve = manual_boost or automatic_boost or boost == "on"
@@ -974,8 +1006,8 @@ def main() -> int:
                     automatic_boost = True
                 # Old RPM from a stalled acquisition is not fresh response
                 # evidence, even when its numeric values are plausible.
-                verified = (False if slow_acquisition else
-                            observe_response(error.partial, acquisition_finished))
+                verified = (False if slow_acquisition else observe_response(
+                    read(BASE / "cooler_boost"), error.partial, acquisition_finished))
                 if boost_ack_pending and verified:
                     acknowledge("boost-on")
                     boost_ack_pending = False
@@ -1010,7 +1042,10 @@ def main() -> int:
                     write(BASE / "cooler_boost", "on")
                 if reason and not manual_boost:
                     automatic_boost = True
-            verified = observe_response(sample, acquisition_finished)
+            # One fresh read serves response evidence and the decisions below:
+            # paths that write Boost before those decisions continue instead.
+            boost = read(BASE / "cooler_boost")
+            verified = observe_response(boost, sample, acquisition_finished)
             if boost_ack_pending and verified:
                 acknowledge("boost-on")
                 boost_ack_pending = False
@@ -1045,7 +1080,6 @@ def main() -> int:
                     "until monitored cooldown completes",
                     file=sys.stderr, flush=True)
 
-            boost = read(BASE / "cooler_boost")
             if reason:
                 # Preserve a queued explicit release, but require a fresh full
                 # cool interval after every unsafe observation.

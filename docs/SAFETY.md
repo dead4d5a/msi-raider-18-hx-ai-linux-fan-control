@@ -54,6 +54,13 @@ Once-per-second monitoring checks:
 - shift mode remains `comfort`;
 - suspend/resume time discontinuity.
 
+On the pinned legacy build, the per-second EC firmware check is the one the
+driver's `fan_curve` read performs in the kernel: it re-checks DMI and the EC
+firmware string and fails the read with `EOPNOTSUPP` on a mismatch. The daemon
+and keeper read `fan_curve` before any other EC value of a pass instead of
+reading `fw_version` separately, as the snapshot build's snapshot already
+does. Every write and the manager's status still read `fw_version`.
+
 ### 5. Thermal/fan escalation
 
 The daemon requests and physically verifies Cooler Boost for:

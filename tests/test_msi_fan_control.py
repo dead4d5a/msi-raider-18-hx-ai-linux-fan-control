@@ -35,19 +35,36 @@ def snapshot_text(cpu=50, gpu=40):
 
 
 class ExactIdentityTests(unittest.TestCase):
-    def identity(self, values, *, monitoring=False, abi_present=True):
+    def identity(self, values, *, monitoring=False, abi_present=True, **options):
         read = mock.Mock(side_effect=lambda path: values[path])
         with mock.patch.object(CONTROL.pathlib.Path, 'exists', return_value=False), \
                 mock.patch.object(CONTROL.pathlib.Path, 'is_file', return_value=abi_present):
-            result = CONTROL.identity(read, BASE, monitoring=monitoring)
+            result = CONTROL.identity(read, BASE, monitoring=monitoring, **options)
         return result, read
 
     def test_legacy_identity_checks_firmware_even_when_monitoring(self):
+        # The manager's status reports this value from the same validated read.
         values = identity_values()
         result, read = self.identity(values, monitoring=True, abi_present=False)
         self.assertEqual(result[BASE / 'fw_version'], CONTROL.FIRMWARE)
         self.assertEqual(read.call_args_list.count(mock.call(BASE / 'fw_version')), 1)
         self.assertNotIn(mock.call(BASE / 'fan_control_snapshot'), read.call_args_list)
+
+    def test_curve_read_opt_in_skips_only_the_legacy_monitoring_firmware_read(self):
+        values = identity_values()
+        result, read = self.identity(values, monitoring=True, abi_present=False,
+                                     firmware_checked_by_curve_read=True)
+        self.assertEqual(result[CONTROL.SOURCE_PATH], CONTROL.LEGACY_SRCVERSION)
+        self.assertNotIn(BASE / 'fw_version', result)
+        self.assertNotIn(mock.call(BASE / 'fw_version'), read.call_args_list)
+        # The opt-in never weakens a mutation's own fresh firmware check.
+        values[BASE / 'fw_version'] = '1824EMS1.999'
+        with self.assertRaisesRegex(CONTROL.ControlABIError, 'EC firmware mismatch'):
+            self.identity(values, abi_present=False, firmware_checked_by_curve_read=True)
+        # Host and driver identity are still checked before the curve read.
+        values = identity_values('unknown-build')
+        with self.assertRaisesRegex(CONTROL.ControlABIError, 'unsupported exact driver build'):
+            self.identity(values, monitoring=True, firmware_checked_by_curve_read=True)
 
     def test_new_monitoring_defers_firmware_to_snapshot_but_mutations_check_it(self):
         values = identity_values(CONTROL.SNAPSHOT_SRCVERSION)

@@ -567,6 +567,24 @@ class StatusReadBudgetTests(HardwareIsolatedTestCase):
         self.assertEqual(snapshot['driver_version'], '0.13.1')
         self.assertTrue(snapshot['service_enabled'])
 
+    def test_legacy_status_keeps_its_firmware_read_without_the_loop_shortcut(self):
+        # Only the daemon and keeper 1 Hz loops rely on the legacy curve read's
+        # in-kernel firmware check. status, the apply-default post-start check,
+        # boost-on/boost-release and factory-auto all report fw_version from
+        # full_status().
+        options_seen = []
+        real_identity = MANAGER.fan_control.identity
+
+        def recording_identity(read, base, **options):
+            options_seen.append(options)
+            return real_identity(read, base, **options)
+
+        with mock.patch.object(MANAGER.fan_control, 'identity', recording_identity):
+            reads, _, snapshot = self.exercise_status(twice=False)
+        self.assertEqual(options_seen, [{'monitoring': True}])
+        self.assertEqual(reads[MANAGER.BASE / 'fw_version'], 1)
+        self.assertEqual(snapshot['ec_firmware'], MANAGER.fan_control.FIRMWARE)
+
     def test_stable_two_snapshot_status_uses_only_two_systemctl_calls(self):
         reads, calls, snapshot = self.exercise_status(twice=True)
         self.assertEqual(calls, 2)

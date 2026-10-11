@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import contextlib
+import errno
 import gc
 import importlib.machinery
 import importlib.util
@@ -187,6 +188,64 @@ class SensorHoldTests(unittest.TestCase):
         self.assertTrue(any("invalid fan telemetry" in item for item in heartbeat))
 
 
+class LegacyMonitoringReadTests(unittest.TestCase):
+    """The legacy 1 Hz pass relies on the pinned fan_curve read's firmware check."""
+
+    def controls(self, values):
+        reads = []
+
+        def fake_read(path):
+            reads.append(path.name)
+            value = values[path.name]
+            if isinstance(value, Exception):
+                raise value
+            return value
+
+        with mock.patch.object(DAEMON, "BASE", pathlib.Path("/fake/ec")), \
+                mock.patch.object(DAEMON, "read", fake_read):
+            try:
+                return DAEMON.legacy_monitoring_controls(), reads
+            except DAEMON.ProfileError as error:
+                return error, reads
+
+    def test_curve_is_read_before_every_other_control(self):
+        result, reads = self.controls({"fan_curve": DAEMON.DEFAULT, "shift_mode": "comfort",
+                                       "fan_mode": "advanced", "cooler_boost": "off"})
+        self.assertEqual(result, (DAEMON.DEFAULT, "advanced", "off"))
+        self.assertEqual(reads, ["fan_curve", "shift_mode", "fan_mode", "cooler_boost"])
+
+    def test_in_kernel_firmware_mismatch_fails_before_any_other_control(self):
+        refused = OSError(errno.EOPNOTSUPP, "Operation not supported", "/fake/ec/fan_curve")
+        result, reads = self.controls({"fan_curve": refused})
+        self.assertIsInstance(result, DAEMON.ProfileError)
+        self.assertRegex(str(result), "validation failed by the in-kernel DMI/EC firmware "
+                                      "check: .*Operation not supported")
+        self.assertEqual(reads, ["fan_curve"])
+        result, _ = self.controls({"fan_curve": OSError(errno.EIO, "I/O error")})
+        self.assertRegex(str(result), "^monitoring identity/ABI validation failed: .*I/O error")
+
+    def test_shift_mode_is_still_checked_before_mode_and_boost(self):
+        result, reads = self.controls({"fan_curve": DAEMON.DEFAULT, "shift_mode": "turbo"})
+        self.assertRegex(str(result), "no longer comfort")
+        self.assertEqual(reads, ["fan_curve", "shift_mode"])
+
+    def test_monitoring_identity_opts_in_only_for_the_legacy_pass(self):
+        options_seen = []
+
+        def identity(_read, _base, **options):
+            options_seen.append(options)
+            return {DAEMON.fan_control.SOURCE_PATH: DAEMON.fan_control.LEGACY_SRCVERSION}
+
+        def no_ec_read(path):
+            raise AssertionError(f"legacy identity read an EC attribute: {path}")
+
+        with mock.patch.object(DAEMON.fan_control, "identity", identity), \
+                mock.patch.object(DAEMON, "read", no_ec_read):
+            self.assertIsNone(DAEMON.require_policy_identity(monitoring=True))
+        self.assertEqual(options_seen, [{"monitoring": True,
+                                         "firmware_checked_by_curve_read": True}])
+
+
 class HardwareFreeMainLoopTests(unittest.TestCase):
     """Run main() against a private runtime directory, never the live host.
 
@@ -320,6 +379,9 @@ class SustainedAlarmMainLoopTests(HardwareFreeMainLoopTests):
                 return state["mode"]
             if text.endswith("cooler_boost"):
                 return state["boost"]
+            if text.endswith("shift_mode"):
+                # Legacy monitoring checks it after the curve read.
+                return "comfort"
             raise AssertionError(f"unexpected text read: {text}")
 
         def fake_read_uint(path):
@@ -447,6 +509,9 @@ class SensorHoldMainLoopTests(HardwareFreeMainLoopTests):
                 return state["mode"]
             if text.endswith("cooler_boost"):
                 return state["boost"]
+            if text.endswith("shift_mode"):
+                # Legacy monitoring checks it after the curve read.
+                return "comfort"
             raise AssertionError(f"unexpected text read: {text}")
 
         def fake_write(path, value):
@@ -571,6 +636,9 @@ class SensorHoldMainLoopTests(HardwareFreeMainLoopTests):
                 return state["mode"]
             if text.endswith("cooler_boost"):
                 return state["boost"]
+            if text.endswith("shift_mode"):
+                # Legacy monitoring checks it after the curve read.
+                return "comfort"
             raise AssertionError(f"unexpected text read: {text}")
 
         def fake_write(path, value):
@@ -674,7 +742,8 @@ class RecoveryHandoffMainLoopTests(HardwareFreeMainLoopTests):
     def run_startup(self, recovery_latched, *, duration=33.0, sample_at=None,
                     event_at=None, suspend_offset_at=None, initial_verified=True,
                     clock_gap_at=None, sensor_delay_at=None, timing_setting=None,
-                    control_at=None, override_at=None, factory_released=True):
+                    control_at=None, override_at=None, factory_released=True,
+                    initial_boost="on"):
         class Clock:
             now = 0.0
 
@@ -709,7 +778,7 @@ class RecoveryHandoffMainLoopTests(HardwareFreeMainLoopTests):
                 raise FileNotFoundError
 
         clock = Clock()
-        state = {"curve": DAEMON.DEFAULT, "mode": "advanced", "boost": "on"}
+        state = {"curve": DAEMON.DEFAULT, "mode": "advanced", "boost": initial_boost}
         writes = []
         preserves = []
         events = []
@@ -727,6 +796,9 @@ class RecoveryHandoffMainLoopTests(HardwareFreeMainLoopTests):
                 return state["mode"]
             if text.endswith("cooler_boost"):
                 return state["boost"]
+            if text.endswith("shift_mode"):
+                # Legacy monitoring checks it after the curve read.
+                return "comfort"
             raise AssertionError(f"unexpected text read: {text}")
 
         def fake_write(path, value):
@@ -969,6 +1041,25 @@ class RecoveryHandoffMainLoopTests(HardwareFreeMainLoopTests):
                 {"ec_cpu": "unavailable"})
         with self.assertRaisesRegex(DAEMON.ProfileError, "fan1 did not respond"):
             self.run_startup(True, duration=20, sample_at=sample)
+
+    def test_legacy_pass_reads_curve_first_and_reuses_the_response_boost_read(self):
+        for latched, per_pass in (
+                (False, ["fan_curve", "shift_mode", "fan_mode", "cooler_boost",
+                         "cooler_boost"]),
+                # The latch's reassertion check keeps its own fresh read.
+                (True, ["fan_curve", "shift_mode", "fan_mode", "cooler_boost",
+                        "cooler_boost", "cooler_boost"])):
+            with self.subTest(latched=latched):
+                self.health_publisher.reset_mock()
+                # Hot enough to hold a latch, below every alarm threshold.
+                self.run_startup(latched, duration=20, initial_boost="off",
+                                 sample_at=lambda _now: DAEMON.RuntimeSample(
+                                     90000, 50, 40, 4400, 4400))
+                passes = len(self.health_publisher.call_args_list)
+                names = [pathlib.PurePath(path).name for path in self.control_reads
+                         if path != "/proc/self/cgroup"]
+                # One startup Boost read, then no fw_version read in any pass.
+                self.assertEqual(names, ["cooler_boost"] + per_pass * passes)
 
     def test_manual_request_cancels_automatic_cooldown(self):
         def event(now, _state):

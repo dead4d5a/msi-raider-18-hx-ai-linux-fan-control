@@ -67,8 +67,11 @@ def write(path: pathlib.Path, value: str) -> None:
         raise RuntimeError(f"recovery readback mismatch for {path.name}")
 
 
-def recovery_identity(*, monitoring: bool = False) -> dict[pathlib.Path, str]:
-    values = fan_control.identity(read, BASE, monitoring=monitoring)
+def recovery_identity(*, monitoring: bool = False,
+                      firmware_checked_by_curve_read: bool = False) -> dict[pathlib.Path, str]:
+    values = fan_control.identity(
+        read, BASE, monitoring=monitoring,
+        firmware_checked_by_curve_read=firmware_checked_by_curve_read)
     if not (BASE / "fan_curve").exists():
         raise RuntimeError("required fan-curve ABI is absent")
     return values
@@ -460,13 +463,16 @@ def keeper_repair(profile: str) -> str:
     """Reassert a drifted recovery state without needlessly rewriting its curve."""
     curve = FULL_COOLING_CURVES[profile]
     try:
-        identity = recovery_identity(monitoring=True)
+        identity = recovery_identity(monitoring=True, firmware_checked_by_curve_read=True)
         if identity[fan_control.SOURCE_PATH] == fan_control.SNAPSHOT_SRCVERSION:
             # The pinned new ABI provides a fresh firmware/control snapshot in
             # one transaction; malformed or absent snapshots never fall back.
             control = fan_control.snapshot(read, BASE)
             current_curve, mode, boost = control.curve, control.mode, control.boost
         else:
+            # No separate fw_version read: the pinned legacy build's fan_curve
+            # read re-checks DMI and EC firmware in the kernel and fails on a
+            # mismatch, so it comes before the other controls.
             current_curve = read(BASE / "fan_curve")
             mode = read(BASE / "fan_mode")
             boost = read(BASE / "cooler_boost")

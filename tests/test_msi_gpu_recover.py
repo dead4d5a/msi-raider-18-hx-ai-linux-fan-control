@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import errno
 import fcntl
 import importlib.machinery
 import importlib.util
@@ -678,26 +679,54 @@ class IdentitySnapshotTests(HardwareIsolatedTestCase):
                 write.assert_not_called()
                 self.assertNotIn(mock.call(RECOVER.BASE / "fan_curve"), read.call_args_list)
 
-    def test_legacy_keeper_retains_fresh_firmware_and_separate_control_reads(self):
+    def test_legacy_keeper_relies_on_the_curve_read_firmware_check(self):
         values = self.values(RECOVER.fan_control.LEGACY_SRCVERSION)
         with mock.patch.object(RECOVER, "read", side_effect=values.__getitem__) as read, \
                 mock.patch.object(pathlib.Path, "exists", side_effect=[False, True]):
             RECOVER.keeper_repair("candidate14")
-        for name in ("fw_version", "fan_curve", "fan_mode", "cooler_boost"):
-            self.assertIn(mock.call(RECOVER.BASE / name), read.call_args_list)
-        self.assertNotIn(mock.call(RECOVER.BASE / "fan_control_snapshot"), read.call_args_list)
+        sampled = [call.args[0] for call in read.call_args_list]
+        # The pinned legacy fan_curve read re-checks DMI and EC firmware in the
+        # kernel, so the 1 Hz pass reads it first instead of fw_version.
+        self.assertNotIn(RECOVER.BASE / "fw_version", sampled)
+        controls = [path.name for path in sampled if path.parent == RECOVER.BASE]
+        self.assertEqual(controls, ["fan_curve", "fan_mode", "cooler_boost"])
 
     def test_legacy_keeper_firmware_mismatch_rejects_all_control_actions(self):
         values = self.values(RECOVER.fan_control.LEGACY_SRCVERSION)
-        values[RECOVER.BASE / "fw_version"] = "changed-firmware"
-        with mock.patch.object(RECOVER, "read", side_effect=values.__getitem__), \
-                mock.patch.object(pathlib.Path, "exists", return_value=False), \
+
+        def read(path):
+            if path == RECOVER.BASE / "fan_curve":
+                # What the pinned driver returns on a DMI or firmware mismatch.
+                raise OSError(errno.EOPNOTSUPP, "Operation not supported", str(path))
+            return values[path]
+
+        with mock.patch.object(RECOVER, "read", side_effect=read) as reading, \
+                mock.patch.object(pathlib.Path, "exists", side_effect=[False, True]), \
                 mock.patch.object(RECOVER, "write") as write, \
                 mock.patch.object(RECOVER, "stage_full_cooling") as stage:
-            with self.assertRaisesRegex(RuntimeError, "identity/ABI"):
+            with self.assertRaisesRegex(RuntimeError, "identity/ABI.*Operation not supported"):
                 RECOVER.keeper_repair("candidate14")
         write.assert_not_called()
         stage.assert_not_called()
+        self.assertNotIn(mock.call(RECOVER.BASE / "fan_mode"), reading.call_args_list)
+        self.assertNotIn(mock.call(RECOVER.BASE / "cooler_boost"), reading.call_args_list)
+
+    def test_legacy_keeper_write_guard_still_reads_fresh_firmware(self):
+        values = self.values(RECOVER.fan_control.LEGACY_SRCVERSION)
+        values[RECOVER.BASE / "cooler_boost"] = "off"
+        with mock.patch.object(pathlib.Path, "open") as opened:
+            def read(path):
+                if path == RECOVER.BASE / "cooler_boost" and opened.called:
+                    return "on"  # The write's readback.
+                return values[path]
+
+            with mock.patch.object(RECOVER, "read", side_effect=read) as reading, \
+                    mock.patch.object(RECOVER, "write", side_effect=REAL_RECOVERY_WRITE), \
+                    mock.patch.object(pathlib.Path, "exists", side_effect=[False, True, False, True]):
+                self.assertEqual(RECOVER.keeper_repair("candidate14"), "Cooler Boost reasserted")
+        opened.assert_called_once_with("w", encoding="ascii")
+        # Only the write's own identity check reads the firmware.
+        self.assertEqual(reading.call_args_list.count(mock.call(RECOVER.BASE / "fw_version")), 1)
 
     def test_each_new_driver_write_requires_fresh_firmware(self):
         values = self.values(RECOVER.fan_control.SNAPSHOT_SRCVERSION)

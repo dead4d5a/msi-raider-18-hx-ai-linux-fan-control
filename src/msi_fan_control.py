@@ -71,11 +71,18 @@ def host_identity(read: Callable[[pathlib.Path], str],
 
 
 def identity(read: Callable[[pathlib.Path], str], base: pathlib.Path,
-             *, monitoring: bool = False) -> dict[pathlib.Path, str]:
+             *, monitoring: bool = False,
+             firmware_checked_by_curve_read: bool = False) -> dict[pathlib.Path, str]:
     values = host_identity(read, base)
     # Monitoring on the new ABI gets the fresh firmware check in its snapshot.
-    # Every mutation still calls the default and performs its own fresh check.
-    if not monitoring or values[SOURCE_PATH] == LEGACY_SRCVERSION:
+    # The pinned legacy build's fan_curve read re-checks DMI and EC firmware
+    # in the kernel and fails with EOPNOTSUPP on a mismatch. Only the 1 Hz
+    # loops opt in to rely on it: they read fan_curve before any other EC
+    # value of the pass. Other monitoring callers, such as the manager's status,
+    # still read and return fw_version. Every mutation calls the default and
+    # performs its own fresh check.
+    if (not monitoring or (values[SOURCE_PATH] == LEGACY_SRCVERSION and
+                           not firmware_checked_by_curve_read)):
         firmware = read(base / "fw_version")
         if firmware != FIRMWARE:
             raise ControlABIError(f"EC firmware mismatch: {firmware!r}")

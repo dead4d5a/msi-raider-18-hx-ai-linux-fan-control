@@ -44,7 +44,10 @@ The EC controls fan speed from the resident curve. Runtime monitoring reads:
 No polling loop writes target RPM.
 
 `msi_fan_control.py` centralizes two exact driver-build pins. The legacy build
-uses the existing attributes. The snapshot build requires its read-only
+uses the existing attributes. Its 1 Hz monitoring passes in the daemon and
+keeper read `fan_curve` first and rely on that read's in-kernel DMI and
+firmware check instead of a separate `fw_version` read; the manager's status
+still reads `fw_version`. The snapshot build requires its read-only
 `fan_control_snapshot` ABI: one fresh firmware check and 26 curve bytes plus
 shift/mode/Boost/EC temperatures under the driver control mutex (43 EC reads).
 It is serialized against this driver's curve/mode/Boost stores, not claimed
