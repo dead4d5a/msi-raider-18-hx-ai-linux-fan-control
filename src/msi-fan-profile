@@ -50,6 +50,10 @@ class ManagerError(RuntimeError):
     pass
 
 
+class FactoryReleaseRefused(ManagerError):
+    """The verified factory envelope keeps Boost on; only its release was refused."""
+
+
 class UnitState(TypedDict):
     Id: str
     ActiveState: str
@@ -281,17 +285,24 @@ def restore_factory_locked(release=True):
         raise ManagerError('factory envelope verification failed')
     if not release:
         return
-    core = [path for path in pathlib.Path('/sys/class/hwmon').glob('hwmon*')
-            if (path / 'name').exists() and read(path / 'name') == 'coretemp']
-    if len(core) != 1:
-        raise ManagerError('coretemp discovery failed')
-    package = int(read(core[0] / 'temp1_input'))
-    cpu = int(read(BASE / 'cpu/realtime_temperature'))
-    gpu = int(read(BASE / 'gpu/realtime_temperature'))
+    # From here the verified envelope holds Boost on. Unusable telemetry or heat
+    # refuses only the release, which a later cool factory-auto can complete.
+    try:
+        core = [path for path in pathlib.Path('/sys/class/hwmon').glob('hwmon*')
+                if (path / 'name').exists() and read(path / 'name') == 'coretemp']
+        if len(core) != 1:
+            raise FactoryReleaseRefused(
+                'factory restored but coretemp discovery failed; Boost retained')
+        package = int(read(core[0] / 'temp1_input'))
+        cpu = int(read(BASE / 'cpu/realtime_temperature'))
+        gpu = int(read(BASE / 'gpu/realtime_temperature'))
+    except (OSError, ValueError) as error:
+        raise FactoryReleaseRefused(
+            f'factory restored but telemetry is unavailable: {error}; Boost retained') from error
     if not (0 <= package <= 110000 and 0 <= cpu <= 110 and 0 <= gpu <= 110):
-        raise ManagerError('factory restored but telemetry is invalid; Boost retained')
+        raise FactoryReleaseRefused('factory restored but telemetry is invalid; Boost retained')
     if max(package, cpu * 1000) >= 85000 or not (gpu == 0 or gpu < 70):
-        raise ManagerError('factory restored but too hot to release Boost')
+        raise FactoryReleaseRefused('factory restored but too hot to release Boost')
     write(BASE / 'fan_mode', 'auto')
     write(BASE / 'cooler_boost', 'off')
     hardware = hw()
@@ -408,11 +419,15 @@ def managed_default(snapshot, require_boost=True):
             (not require_boost or snapshot['cooler_boost'] in ('on', 'off')))
 
 
+def factory_envelope(snapshot, boost='off'):
+    """What factory-auto itself establishes; boot enablement is not its output."""
+    return (unit_inactive(snapshot, 'service') and unit_inactive(snapshot, 'keeper') and
+            snapshot['factory_override'] and snapshot['curve'] == 'factory' and
+            snapshot['fan_mode'] == 'auto' and snapshot['cooler_boost'] == boost)
+
+
 def factory_override(snapshot):
-    return (snapshot['service_enabled'] and unit_inactive(snapshot, 'service') and
-            unit_inactive(snapshot, 'keeper') and snapshot['factory_override'] and
-            not snapshot['recovery_boost_latched'] and snapshot['curve'] == 'factory' and
-            snapshot['fan_mode'] == 'auto' and snapshot['cooler_boost'] == 'off')
+    return factory_envelope(snapshot) and not snapshot['recovery_boost_latched']
 
 
 def health_snapshot(pid):
@@ -542,7 +557,10 @@ def factory_auto():
     root()
     identity()
     descriptor = lock(MANAGER_LOCK)
+    refusal = None
     try:
+        # The marker blocks daemon and keeper starts for this boot; a daemon that
+        # sees it before the stop request takes the same clean stop path.
         make_marker()
         stop_keeper()
         ctl('stop', SERVICE, check=False, timeout=50)
@@ -552,12 +570,17 @@ def factory_auto():
         fan_descriptor = lock(FAN_LOCK)
         try:
             restore_factory_locked(release=True)
-            clear_recovery_latch()
+        except FactoryReleaseRefused as error:
+            refusal = error
         finally:
             os.close(fan_descriptor)
-        if not factory_override(full_status()):
+        # Boot enablement is the operator's choice and is never a postcondition.
+        if not factory_envelope(full_status(), 'off' if refusal is None else 'on'):
             raise ManagerError('factory override invariant failed')
-        print('Factory auto/off is active until apply-default or reboot.')
+        if refusal is None:
+            # Only a verified auto/off postcondition completes a recovery handoff;
+            # a staged Boost keeps the latch so a later start releases it when cool.
+            clear_recovery_latch()
     except Exception as error:
         try:
             disable_and_safe_factory()
@@ -568,6 +591,13 @@ def factory_auto():
             f'factory-auto failed: {error}; service disabled, factory auto with Boost on') from error
     finally:
         os.close(descriptor)
+    if refusal is not None:
+        # Not a fault: keep the marker, boot enablement and any recovery latch.
+        raise FactoryReleaseRefused(
+            f'factory-auto incomplete: {refusal}; factory staged with Boost on; '
+            'service enablement and recovery latch left unchanged; rerun factory-auto '
+            'when cool, or run apply-default to resume Candidate14') from refusal
+    print('Factory auto/off is active until apply-default or reboot.')
 
 
 def acknowledgement():

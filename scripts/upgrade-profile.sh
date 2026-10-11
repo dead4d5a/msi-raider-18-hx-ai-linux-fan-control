@@ -75,6 +75,7 @@ stage=$(mktemp -d /run/msi-fan-profile-upgrade.XXXXXXXXXX)
 backup_root=/var/lib/msi-fan-profile/upgrade-backups
 backup=''
 safe_state=0
+factory_transition=0
 enabled_for_startup=0
 activation_started=0
 
@@ -94,6 +95,12 @@ cleanup() {
   elif ((rc != 0 && safe_state)); then
     systemctl disable "$service" >/dev/null 2>&1 || true
     echo 'Upgrade stopped; the service remains disabled in factory auto mode.' >&2
+  elif ((rc != 0 && factory_transition)); then
+    # Nothing was replaced. Leave whatever cooling and boot enablement the
+    # existing manager reported: a refused hot Boost release keeps Boost on.
+    echo 'Upgrade stopped before replacing any artifact: the existing manager did not reach verified factory auto/off.' >&2
+    echo 'If it was too hot to release Cooler Boost, let the machine cool and rerun this upgrade.' >&2
+    echo "If a cool retry still fails, or to resume the installed profile now, run 'sudo $manager apply-default' and rerun this upgrade when cool." >&2
   fi
   exit "$rc"
 }
@@ -112,6 +119,7 @@ done
 systemctl daemon-reload
 systemctl stop "$keeper" 2>/dev/null || true
 systemctl reset-failed "$keeper" 2>/dev/null || true
+factory_transition=1
 "$manager" factory-auto
 systemctl disable "$service"
 systemctl stop "$service" 2>/dev/null || true

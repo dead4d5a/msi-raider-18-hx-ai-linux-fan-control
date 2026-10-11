@@ -826,7 +826,11 @@ def main() -> int:
             except FileNotFoundError:
                 pass
             else:
-                raise ProfileError("factory-auto runtime override pathname appeared")
+                # Only root's factory-auto creates this, just before it requests
+                # a stop. Take the SIGTERM clean-stop path, not a fault exit.
+                print("factory-auto runtime override pathname appeared; "
+                      "treating it as a clean stop request", file=sys.stderr, flush=True)
+                break
             control = require_policy_identity(monitoring=True, timing=timing)
             # Legacy mocked/real policy checks return no combined acquisition.
             if not isinstance(control, MonitorControl):

@@ -236,13 +236,16 @@ class ApplyDefaultFailureTests(HardwareIsolatedTestCase):
                 mock.patch.object(
                     MANAGER, "clear_recovery_latch",
                     side_effect=lambda: calls.append("clear")), \
-                mock.patch.object(MANAGER, "full_status", return_value=factory_auto), \
+                mock.patch.object(
+                    MANAGER, "full_status",
+                    side_effect=lambda: calls.append("postcondition") or factory_auto), \
                 mock.patch.object(MANAGER.os, "close"):
             MANAGER.factory_auto()
 
-        self.assertEqual(calls, ["restore", "clear"])
+        # The latch is cleared only once the auto/off postcondition has passed.
+        self.assertEqual(calls, ["restore", "postcondition", "clear"])
 
-    def test_factory_auto_keeps_the_recovery_latch_when_factory_release_fails(self):
+    def test_factory_auto_keeps_the_recovery_latch_when_factory_verification_fails(self):
         with mock.patch.object(MANAGER, "root"), \
                 mock.patch.object(MANAGER, "identity"), \
                 mock.patch.object(MANAGER, "lock", side_effect=(9, 10)), \
@@ -252,7 +255,7 @@ class ApplyDefaultFailureTests(HardwareIsolatedTestCase):
                 mock.patch.object(MANAGER, "inactive_dead", return_value=True), \
                 mock.patch.object(
                     MANAGER, "restore_factory_locked",
-                    side_effect=MANAGER.ManagerError("too hot")), \
+                    side_effect=MANAGER.ManagerError("factory auto/off verification failed")), \
                 mock.patch.object(MANAGER, "clear_recovery_latch") as clear_latch, \
                 mock.patch.object(MANAGER, "disable_and_safe_factory") as fallback, \
                 mock.patch.object(MANAGER.os, "close"):
@@ -261,6 +264,49 @@ class ApplyDefaultFailureTests(HardwareIsolatedTestCase):
 
         clear_latch.assert_not_called()
         fallback.assert_called_once_with()
+
+    def test_refused_factory_release_keeps_enablement_latch_and_staged_boost(self):
+        staged = {
+            "service_enabled": True,
+            "service_active_state": "inactive",
+            "service_sub_state": "dead",
+            "service_main_pid": 0,
+            "service_job": "",
+            "keeper_active_state": "inactive",
+            "keeper_sub_state": "dead",
+            "keeper_main_pid": 0,
+            "keeper_job": "",
+            "factory_override": True,
+            "recovery_boost_latched": True,
+            "curve": "factory",
+            "fan_mode": "auto",
+            "cooler_boost": "on",
+        }
+        with mock.patch.object(MANAGER, "root"), \
+                mock.patch.object(MANAGER, "identity"), \
+                mock.patch.object(MANAGER, "lock", side_effect=(9, 10)), \
+                mock.patch.object(MANAGER, "make_marker"), \
+                mock.patch.object(MANAGER, "stop_keeper"), \
+                mock.patch.object(MANAGER, "ctl") as ctl, \
+                mock.patch.object(MANAGER, "inactive_dead", return_value=True), \
+                mock.patch.object(
+                    MANAGER, "restore_factory_locked",
+                    side_effect=MANAGER.FactoryReleaseRefused(
+                        "factory restored but too hot to release Boost")), \
+                mock.patch.object(MANAGER, "full_status", return_value=staged), \
+                mock.patch.object(MANAGER, "clear_recovery_latch") as clear_latch, \
+                mock.patch.object(MANAGER, "disable_and_safe_factory") as fallback, \
+                mock.patch.object(MANAGER.os, "close") as close:
+            with self.assertRaisesRegex(
+                    MANAGER.FactoryReleaseRefused,
+                    "too hot.*factory staged with Boost on.*rerun factory-auto when cool"):
+                MANAGER.factory_auto()
+
+        clear_latch.assert_not_called()
+        fallback.assert_not_called()
+        self.assertNotIn(mock.call("disable", MANAGER.SERVICE, check=False, timeout=20),
+                         ctl.call_args_list)
+        self.assertEqual(sorted(call.args for call in close.call_args_list), [(9,), (10,)])
 
     def test_pre_start_setup_failure_keeps_the_existing_factory_fail_safe(self):
         def fake_ctl(action, *_args, **_kwargs):
@@ -875,6 +921,256 @@ class ManagerRequestTests(HardwareIsolatedTestCase):
         hardware.assert_not_called()
 
 
+class FactoryAutoHost:
+    """In-memory systemd units, EC controls, markers and telemetry.
+
+    stop models the daemon's clean stop and ExecStopPost: factory auto/off when
+    cool; otherwise exit 1, staged Candidate14/advanced/Boost plus the recovery
+    latch, and an OnFailure keeper that the factory-auto marker condition skips.
+    """
+
+    def __init__(self, hwmon, *, package=50000, ec_cpu=50, ec_gpu=40,
+                 enabled='enabled', service='active', latch=False):
+        self.hwmon = hwmon
+        self.hwmon_name = 'coretemp'
+        self.telemetry = {'package': package, 'ec_cpu': ec_cpu, 'ec_gpu': ec_gpu}
+        self.enabled = enabled
+        self.service = service
+        self.keeper = 'inactive'
+        self.marker = False
+        self.latch = latch
+        self.ec = ({'fan_curve': MANAGER.DEFAULT, 'fan_mode': 'advanced', 'cooler_boost': 'off'}
+                   if service == 'active' else
+                   {'fan_curve': MANAGER.FACTORY, 'fan_mode': 'auto', 'cooler_boost': 'off'})
+        self.identity_checks = 0
+        self.failing_identity_checks = set()
+        self.calls = []
+        self.writes = []
+
+    def cool(self):
+        package, cpu, gpu = (self.telemetry[key] for key in ('package', 'ec_cpu', 'ec_gpu'))
+        return (0 <= package <= 110000 and 0 <= cpu <= 110 and 0 <= gpu <= 110 and
+                max(package, cpu * 1000) < 85000 and (gpu == 0 or gpu < 70))
+
+    def identity(self, *, monitoring=False):
+        self.identity_checks += 1
+        if self.identity_checks in self.failing_identity_checks:
+            raise MANAGER.ManagerError('exact EC firmware identity mismatch')
+        return {
+            MANAGER.BASE / 'fw_version': MANAGER.fan_control.FIRMWARE,
+            MANAGER.fan_control.VERSION_PATH: '0.13.1',
+            MANAGER.fan_control.SOURCE_PATH: MANAGER.fan_control.LEGACY_SRCVERSION,
+        }
+
+    def read(self, path):
+        path = pathlib.Path(path)
+        if path == self.hwmon / 'name':
+            return self.hwmon_name
+        if path == self.hwmon / 'temp1_input':
+            return str(self.telemetry['package'])
+        relative = str(path.relative_to(MANAGER.BASE))
+        if relative == 'cpu/realtime_temperature':
+            return str(self.telemetry['ec_cpu'])
+        if relative == 'gpu/realtime_temperature':
+            return str(self.telemetry['ec_gpu'])
+        if relative == 'shift_mode':
+            return 'comfort'
+        return self.ec[relative]
+
+    def write(self, path, value):
+        self.identity()  # Every manager control write revalidates identity first.
+        self.writes.append((pathlib.Path(path).name, value))
+        self.ec[pathlib.Path(path).name] = value
+
+    def stop_daemon(self):
+        self.ec.update(fan_curve=MANAGER.FACTORY, fan_mode='auto', cooler_boost='on')
+        if self.cool():
+            self.ec['cooler_boost'] = 'off'
+            self.service = 'inactive'
+            return
+        self.ec.update(fan_curve=MANAGER.DEFAULT, fan_mode='advanced', cooler_boost='on')
+        self.latch = True
+        self.service = 'failed'
+        if not self.marker:
+            self.keeper = 'active'
+
+    def unit(self, name):
+        active = self.service if name == MANAGER.SERVICE else self.keeper
+        return '\n'.join((
+            f'Id={name}', f'ActiveState={active}',
+            'SubState=' + {'active': 'running', 'inactive': 'dead', 'failed': 'failed'}[active],
+            'MainPID=' + ('17' if active == 'active' else '0'), 'Job=',
+            'UnitFileState=' + (self.enabled if name == MANAGER.SERVICE else 'static')))
+
+    def ctl(self, action, *args, check=True, timeout=45):
+        self.calls.append((action, *args))
+        stdout = ''
+        if action == 'show':
+            stdout = '\n\n'.join(self.unit(name) for name in args
+                                  if not name.startswith('--')) + '\n'
+        elif action == 'is-enabled':
+            stdout = self.enabled + '\n'
+        elif action in ('enable', 'disable'):
+            self.enabled = action + 'd'
+        elif action == 'stop' and args == (MANAGER.KEEPER,):
+            self.keeper = 'inactive'
+        elif action == 'stop' and self.service == 'active':
+            self.stop_daemon()
+        elif action == 'reset-failed' and args == (MANAGER.SERVICE,) and self.service == 'failed':
+            self.service = 'inactive'
+        return types.SimpleNamespace(stdout=stdout, returncode=0)
+
+    def make_marker(self):
+        self.marker = True
+
+    def clear_recovery_latch(self):
+        self.calls.append(('clear-latch',))
+        self.latch = False
+
+    def outcome(self):
+        return (self.ec['fan_curve'] == MANAGER.FACTORY and self.ec['fan_mode'],
+                self.ec['cooler_boost'], self.enabled, self.marker, self.latch)
+
+
+class FactoryAutoStateMachineTests(HardwareIsolatedTestCase):
+    """Run the real factory_auto() and fail-safe against an in-memory host."""
+
+    def setUp(self):
+        super().setUp()
+        self.hwmon = MANAGER.OVERRIDE.parent / 'hwmon7'
+        self.hwmon.mkdir()
+        (self.hwmon / 'name').write_text('coretemp\n')
+
+    def host(self, **kwargs):
+        return FactoryAutoHost(self.hwmon, **kwargs)
+
+    def factory_auto(self, host, command=None):
+        command = command or MANAGER.factory_auto
+        with mock.patch.object(MANAGER, 'root'), \
+                mock.patch.object(MANAGER, 'identity', side_effect=host.identity), \
+                mock.patch.object(MANAGER, 'read', side_effect=host.read), \
+                mock.patch.object(MANAGER, 'write', side_effect=host.write), \
+                mock.patch.object(MANAGER, 'ctl', side_effect=host.ctl), \
+                mock.patch.object(MANAGER, 'lock', return_value=9), \
+                mock.patch.object(MANAGER, 'marker', side_effect=lambda: host.marker), \
+                mock.patch.object(MANAGER, 'make_marker', side_effect=host.make_marker), \
+                mock.patch.object(MANAGER, 'recovery_latch_metadata',
+                                  side_effect=lambda: host.latch), \
+                mock.patch.object(MANAGER, 'clear_recovery_latch',
+                                  side_effect=host.clear_recovery_latch), \
+                mock.patch.object(MANAGER.pathlib.Path, 'glob', return_value=[self.hwmon]), \
+                mock.patch.object(MANAGER.os, 'close'), \
+                contextlib.redirect_stdout(io.StringIO()) as output:
+            try:
+                return command()
+            finally:
+                self.output = output.getvalue()
+
+    def status_snapshot(self, host):
+        with mock.patch.object(MANAGER, 'identity', side_effect=host.identity), \
+                mock.patch.object(MANAGER, 'read', side_effect=host.read), \
+                mock.patch.object(MANAGER, 'ctl', side_effect=host.ctl), \
+                mock.patch.object(MANAGER, 'marker', side_effect=lambda: host.marker), \
+                mock.patch.object(MANAGER, 'recovery_latch_metadata',
+                                  side_effect=lambda: host.latch):
+            return MANAGER.full_status()
+
+    def test_cool_transition_releases_boost_and_keeps_enablement(self):
+        host = self.host()
+        self.factory_auto(host)
+        self.assertEqual(host.outcome(), ('auto', 'off', 'enabled', True, False))
+        self.assertIn('Factory auto/off is active', self.output)
+        self.assertNotIn(('disable', MANAGER.SERVICE), host.calls)
+        self.assertTrue(MANAGER.factory_override(self.status_snapshot(host)))
+
+    def test_hot_refusal_stages_boost_keeps_enablement_and_retries_once_cool(self):
+        host = self.host(package=90000)
+        with self.assertRaisesRegex(
+                MANAGER.FactoryReleaseRefused,
+                'too hot to release Boost; factory staged with Boost on;.*'
+                'rerun factory-auto when cool'):
+            self.factory_auto(host)
+        # The hot clean stop's ExecStopPost latched recovery Boost; it is kept.
+        self.assertEqual(host.outcome(), ('auto', 'on', 'enabled', True, True))
+        self.assertEqual(host.keeper, 'inactive')
+        self.assertNotIn(('disable', MANAGER.SERVICE), host.calls)
+        self.assertNotIn(('clear-latch',), host.calls)
+        self.assertNotIn(('cooler_boost', 'off'), host.writes)
+        snapshot = self.status_snapshot(host)
+        self.assertTrue(MANAGER.factory_envelope(snapshot, 'on'))
+        self.assertFalse(MANAGER.factory_override(snapshot))
+
+        host.telemetry.update(package=60000)
+        self.factory_auto(host)
+        self.assertEqual(host.outcome(), ('auto', 'off', 'enabled', True, False))
+        self.assertTrue(MANAGER.factory_override(self.status_snapshot(host)))
+
+    def test_invalid_or_unavailable_telemetry_refuses_release_without_disabling(self):
+        # The fake daemon judges its clean stop by the same telemetry, so only
+        # an invalid reading also leaves an ExecStopPost recovery latch.
+        for label, telemetry, hwmon_name, message, latched in (
+                ('EC CPU 255 C sentinel', {'ec_cpu': 255}, 'coretemp',
+                 'telemetry is invalid', True),
+                ('package over range', {'package': 120000}, 'coretemp',
+                 'telemetry is invalid', True),
+                ('no coretemp hwmon', {}, 'acpitz', 'coretemp discovery failed', False)):
+            with self.subTest(label):
+                host = self.host(**telemetry)
+                host.hwmon_name = hwmon_name
+                with self.assertRaisesRegex(MANAGER.FactoryReleaseRefused, message):
+                    self.factory_auto(host)
+                self.assertEqual(host.outcome(), ('auto', 'on', 'enabled', True, latched))
+                self.assertNotIn(('disable', MANAGER.SERVICE), host.calls)
+                self.assertNotIn(('cooler_boost', 'off'), host.writes)
+
+    def test_disabled_service_cool_transition_succeeds_without_enabling(self):
+        host = self.host(enabled='disabled', service='inactive')
+        host.ec['cooler_boost'] = 'on'
+        self.factory_auto(host)
+        self.assertEqual(host.outcome(), ('auto', 'off', 'disabled', True, False))
+        self.assertNotIn(('enable', MANAGER.SERVICE), host.calls)
+        self.assertTrue(MANAGER.factory_override(self.status_snapshot(host)))
+
+    def test_identity_failure_at_entry_changes_nothing(self):
+        host = self.host()
+        host.failing_identity_checks = {1}
+        with self.assertRaisesRegex(MANAGER.ManagerError, 'identity mismatch'):
+            self.factory_auto(host)
+        self.assertEqual(host.calls, [])
+        self.assertEqual(host.writes, [])
+        self.assertFalse(host.marker)
+
+    def test_identity_loss_during_transition_uses_the_disable_fail_safe(self):
+        # Check 1 is the entry check; check 2 guards the first factory EC write.
+        host = self.host()
+        host.failing_identity_checks = {2}
+        with self.assertRaisesRegex(
+                MANAGER.ManagerError,
+                'factory-auto failed: exact EC firmware identity mismatch; '
+                'service disabled, factory auto with Boost on'):
+            self.factory_auto(host)
+        self.assertEqual(host.outcome(), ('auto', 'on', 'disabled', True, False))
+        self.assertIn(('disable', MANAGER.SERVICE), host.calls)
+        self.assertNotIn(('cooler_boost', 'off'), host.writes)
+
+        host = self.host()
+        host.failing_identity_checks = set(range(2, 100))
+        with self.assertRaisesRegex(MANAGER.ManagerError, 'fail-safe failed'):
+            self.factory_auto(host)
+        self.assertEqual(host.enabled, 'disabled')
+        self.assertEqual(host.writes, [])
+
+    def test_refusal_exits_nonzero_with_the_retry_instruction(self):
+        host = self.host(ec_gpu=75)
+        stderr = io.StringIO()
+        with mock.patch.object(MANAGER.sys, 'argv', ['msi-fan-profile', 'factory-auto']), \
+                mock.patch.object(MANAGER.sys, 'stderr', stderr):
+            self.assertEqual(self.factory_auto(host, MANAGER.entrypoint), 1)
+        self.assertIn('factory staged with Boost on', stderr.getvalue())
+        self.assertIn('rerun factory-auto when cool', stderr.getvalue())
+        self.assertEqual(host.outcome(), ('auto', 'on', 'enabled', True, True))
+
+
 class FactoryReleasePlausibilityTests(HardwareIsolatedTestCase):
     def test_negative_package_or_ec_telemetry_never_releases_boost(self):
         core = mock.MagicMock()
@@ -886,7 +1182,7 @@ class FactoryReleasePlausibilityTests(HardwareIsolatedTestCase):
                     mock.patch.object(MANAGER, 'hw', return_value={
                         'raw': MANAGER.FACTORY, 'mode': 'auto', 'boost': 'on'}), \
                     mock.patch.object(MANAGER, 'write') as write:
-                with self.assertRaisesRegex(MANAGER.ManagerError, 'telemetry is invalid'):
+                with self.assertRaisesRegex(MANAGER.FactoryReleaseRefused, 'telemetry is invalid'):
                     MANAGER.restore_factory_locked()
             self.assertNotIn(mock.call(MANAGER.BASE / 'cooler_boost', 'off'), write.call_args_list)
 

@@ -2,6 +2,31 @@
 
 ## Unreleased
 
+- Stop `factory-auto` from disabling the service when it is merely too hot to
+  release Cooler Boost. When the verified factory curve and auto mode are in
+  place and only the cool release is refused (heat, or invalid or unavailable
+  temperature telemetry such as the EC CPU 255 C sentinel), it now exits `1`
+  with `factory staged with Boost on; ... rerun factory-auto when cool`, keeping
+  Boost on, the runtime marker, boot enablement and any recovery-Boost latch, so
+  Candidate 14 still returns at boot and a later start releases Boost when
+  cool. A dedicated `FactoryReleaseRefused` error carries that case; identity,
+  stop, lock, EC readback and postcondition failures keep the disabling
+  fail-safe.
+  `factory-auto` no longer requires the service to be enabled, so it succeeds
+  after the documented BIOS, driver or failed-upgrade disables, and `status`
+  accepts a disabled factory override. The recovery latch is cleared only after
+  the factory `auto/off` postcondition passes, so a later failure can no longer
+  re-assert Boost without it. `upgrade-profile.sh` reports a failed
+  `factory-auto` as nothing replaced, with the cool-retry and `apply-default`
+  instructions.
+- Treat the `factory-auto` marker appearing while the daemon runs as a clean
+  stop request, the same path as the stop signal that follows it, instead of a
+  fault exit that briefly staged full-cooling recovery and a failed unit.
+- Test `msi-gpu-recover`'s ExecStopPost decisions for every systemd service
+  result, `release_boost_if_cool`, latch creation and lock timeout on private
+  temporary files, and run the real `factory_auto()` and its fail-safe against
+  an in-memory systemd and EC for cool, hot, invalid-telemetry, disabled-service
+  and identity-failure transitions.
 - Add a read-only pre-reboot kernel readiness check,
   `scripts/check-kernel-readiness.sh`, installed as
   `/usr/local/libexec/msi-fan-kernel-readiness`. For the `/boot/vmlinuz` target

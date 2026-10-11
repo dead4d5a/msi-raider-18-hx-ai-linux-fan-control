@@ -75,6 +75,13 @@ elif command == "msi-fan-profile":
         marker = root / "run/msi-fan-profile.factory-auto"
         marker.touch()
         marker.chmod(0o600)
+        if failure == "hot-factory":
+            # The current manager's refused release: verified factory auto with
+            # Boost on; marker, enablement and recovery latch are left as they were.
+            cooling(os.environ["UPGRADE_TEST_FACTORY"], "auto", "on")
+            print("ERROR: factory-auto incomplete: factory restored but too hot to "
+                  "release Boost; factory staged with Boost on", file=sys.stderr)
+            sys.exit(27)
         cooling(os.environ["UPGRADE_TEST_FACTORY"], "auto", "off")
     elif args == ["apply-default"]:
         (root / "run/msi-fan-profile.factory-auto").unlink()
@@ -166,7 +173,7 @@ LATCH_PAYLOAD = "candidate14\n"
 
 class UpgradeSandboxTestCase(unittest.TestCase):
     def run_upgrade(self, failure, *, sudo=("4242", "4343"), unreadable=False,
-                    latch_mode=None):
+                    latch_mode=None, initial=None, marker=False):
         with tempfile.TemporaryDirectory() as temporary:
             sandbox = pathlib.Path(temporary)
             release = sandbox / "release"
@@ -176,18 +183,24 @@ class UpgradeSandboxTestCase(unittest.TestCase):
             (sandbox / "run").mkdir()
             base = sandbox / "sys/devices/platform/msi-ec"
             base.mkdir(parents=True)
-            for name, value in (("fan_curve", DEFAULT), ("fan_mode", "advanced"),
-                                ("cooler_boost", "off")):
-                (base / name).write_text(value)
+            initial_state = {
+                "active": "active", "substate": "running", "keeper": "inactive",
+                "enabled": "enabled", "curve": DEFAULT, "mode": "advanced", "boost": "off",
+                **(initial or {}),
+            }
+            for name, key in (("fan_curve", "curve"), ("fan_mode", "mode"),
+                              ("cooler_boost", "boost")):
+                (base / name).write_text(initial_state[key])
+            if marker:
+                path = sandbox / "run/msi-fan-profile.factory-auto"
+                path.touch()
+                path.chmod(0o600)
             latch = sandbox / "run/msi-fan-profile.recovery-boost"
             if latch_mode is not None:
                 latch.write_text(LATCH_PAYLOAD)
                 latch.chmod(latch_mode)
             state_path = sandbox / "state.json"
-            state_path.write_text(json.dumps({
-                "active": "active", "substate": "running", "keeper": "inactive",
-                "enabled": "enabled", "curve": DEFAULT, "mode": "advanced", "boost": "off",
-            }))
+            state_path.write_text(json.dumps(initial_state))
             (sandbox / "calls.jsonl").touch()
 
             # Keep all control flow intact; relocate host paths and bypass only
@@ -304,6 +317,35 @@ class UpgradeCoolingPreservationTests(UpgradeSandboxTestCase):
                          (FACTORY, "auto", "off", "inactive"))
         self.assertEqual(state["enabled"], "disabled")
         self.assertNotIn(["msi-fan-profile", "apply-default"], calls)
+
+    def test_hot_factory_refusal_replaces_nothing_and_says_how_to_retry(self):
+        result, state, calls = self.run_upgrade("hot-factory", latch_mode=0o600)
+        self.assertEqual(result.returncode, 27, result.stdout + result.stderr)
+        self.assertIn("did not reach verified factory auto/off", result.stderr)
+        self.assertIn("let the machine cool and rerun this upgrade", result.stderr)
+        self.assertRegex(result.stderr, r"run 'sudo \S*/usr/local/sbin/msi-fan-profile "
+                                        r"apply-default' and rerun this upgrade when cool")
+        # Boot enablement, staged Boost and the recovery latch are left alone, so
+        # the installed profile still returns at boot and releases Boost when cool.
+        self.assertEqual((state["curve"], state["mode"], state["boost"], state["enabled"]),
+                         (FACTORY, "auto", "on", "enabled"))
+        self.assertTrue(self.latch_remaining)
+        self.assertNotIn(["systemctl", "disable", "msi-fan-profile.service"], calls)
+        self.assertNotIn(["msi-fan-profile", "apply-default"], calls)
+        self.assertNotIn("usr/local/libexec/msi-fan-kernel-readiness", self.deployed)
+        self.assertEqual(self.record, "")
+
+    def test_cool_retry_after_a_refused_factory_release_completes(self):
+        staged = {"active": "inactive", "substate": "dead",
+                  "curve": FACTORY, "mode": "auto", "boost": "on"}
+        result, state, calls = self.run_upgrade("", latch_mode=0o600, initial=staged,
+                                                marker=True)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertFalse(self.latch_remaining)
+        self.assertEqual((state["curve"], state["mode"], state["boost"], state["enabled"]),
+                         (DEFAULT, "advanced", "off", "enabled"))
+        self.assertLess(calls.index(["msi-fan-profile", "factory-auto"]),
+                        calls.index(["msi-fan-profile", "apply-default"]))
 
     def test_keeper_recovery_latch_is_removed_in_the_verified_factory_state(self):
         result, state, calls = self.run_upgrade("", latch_mode=0o600)

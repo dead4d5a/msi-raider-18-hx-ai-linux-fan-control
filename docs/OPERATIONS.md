@@ -159,7 +159,25 @@ This:
 
 The profile remains enabled, but the `/run` marker blocks starts for this boot.
 Because `/run` is temporary, Candidate 14 returns automatically after reboot.
-Run `apply-default` to return without rebooting.
+Run `apply-default` to return without rebooting. `factory-auto` never changes
+boot enablement, so it also succeeds for a persistently disabled service, and
+`status` accepts the factory override either way.
+
+If the machine is too hot to release Cooler Boost (CPU package or EC CPU at or
+above 85 °C, or EC GPU at or above 70 °C), or the temperature telemetry is
+invalid or unavailable, `factory-auto` exits `1` with
+`factory staged with Boost on; ... rerun factory-auto when cool`. The verified
+factory curve and auto mode are in place with Cooler Boost on. The marker,
+boot enablement, and any recovery-Boost marker are left as they were, so
+`status` exits `1` until the transition completes. Rerun `factory-auto` once the
+machine is cool, or run `apply-default` to resume Candidate 14; a retained
+recovery marker then makes its Boost an automatic 30-second-cooldown latch.
+Any other failure, such as an identity, stop, lock, EC readback, or
+postcondition failure, still uses the fail-safe that persistently disables the
+service with factory auto and Boost on.
+
+If the daemon notices the marker before the stop request arrives, it takes the
+same clean-stop path as for the stop request, not a fault exit.
 
 ## Logs
 

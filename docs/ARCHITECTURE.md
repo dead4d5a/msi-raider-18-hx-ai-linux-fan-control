@@ -101,4 +101,9 @@ The guarded manager stops the keeper before it starts the primary daemon; after
 the daemon has reapplied and verified Candidate 14, it consumes the marker and
 treats the inherited Boost as an automatic latch. It may then release only after
 30 continuously valid, cool seconds. A verified `factory-auto` transition clears
-the marker instead.
+the marker instead, only after its factory `auto/off` postcondition passes. When
+it is too hot to release Boost, `factory-auto` leaves the verified factory curve
+and auto mode with Boost on. It keeps the recovery-Boost marker, its own
+runtime override, and boot enablement for a later cool retry or
+`apply-default`. A daemon that sees the `factory-auto` override marker before
+its stop request treats it as that clean stop request.

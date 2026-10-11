@@ -10,6 +10,9 @@ sudo msi-fan-profile factory-auto
 sudo systemctl disable msi-fan-profile.service
 ```
 
+If `factory-auto` reports `factory staged with Boost on`, the machine is too hot
+to release Cooler Boost. Let it cool and rerun `factory-auto` before updating.
+
 After the update, record:
 
 ```bash

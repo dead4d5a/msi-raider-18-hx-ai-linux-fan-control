@@ -674,7 +674,7 @@ class RecoveryHandoffMainLoopTests(HardwareFreeMainLoopTests):
     def run_startup(self, recovery_latched, *, duration=33.0, sample_at=None,
                     event_at=None, suspend_offset_at=None, initial_verified=True,
                     clock_gap_at=None, sensor_delay_at=None, timing_setting=None,
-                    control_at=None):
+                    control_at=None, override_at=None, factory_released=True):
         class Clock:
             now = 0.0
 
@@ -700,8 +700,12 @@ class RecoveryHandoffMainLoopTests(HardwareFreeMainLoopTests):
                     st_mode=DAEMON.stat.S_IFREG | 0o600, st_uid=0, st_gid=0)
 
         class MissingOverride:
+            # factory-auto may create the marker while the loop is running.
             @staticmethod
             def lstat():
+                if override_at is not None and clock.now >= override_at:
+                    return types.SimpleNamespace(
+                        st_mode=DAEMON.stat.S_IFREG | 0o600, st_uid=0, st_gid=0)
                 raise FileNotFoundError
 
         clock = Clock()
@@ -794,10 +798,10 @@ class RecoveryHandoffMainLoopTests(HardwareFreeMainLoopTests):
                 stack.enter_context(mock.patch.object(
                     DAEMON, "read_runtime_sample", side_effect=fake_sample))
                 self.acks = stack.enter_context(mock.patch.object(DAEMON, "acknowledge"))
-                stack.enter_context(mock.patch.object(
+                self.factory_restore = stack.enter_context(mock.patch.object(
                     DAEMON, "restore_factory_envelope", return_value=True))
-                stack.enter_context(mock.patch.object(
-                    DAEMON, "release_factory_if_cool", return_value=True))
+                self.factory_release = stack.enter_context(mock.patch.object(
+                    DAEMON, "release_factory_if_cool", return_value=factory_released))
                 stack.enter_context(mock.patch.object(DAEMON, "notify"))
                 stack.enter_context(mock.patch.object(
                     DAEMON.os, "geteuid", return_value=0))
@@ -828,6 +832,31 @@ class RecoveryHandoffMainLoopTests(HardwareFreeMainLoopTests):
         self.assertEqual(events[:2], ["apply", "consume"])
         self.assertEqual(writes, [(30.0, "off")])
         self.assertEqual(state["boost"], "off")
+
+    def test_appearing_factory_override_is_a_clean_stop_request(self):
+        """factory-auto creates its marker just before it stops the daemon."""
+        state, writes, _, _, events = self.run_startup(
+            recovery_latched=False, duration=60.0, override_at=5.0)
+        self.assertEqual(events, ["apply"])
+        self.factory_restore.assert_called_once_with()
+        self.factory_release.assert_called_once()
+        self.assertIn("factory-auto runtime override pathname appeared; "
+                      "treating it as a clean stop request", self.stderr.getvalue())
+        self.assertIn("clean stop requested; restoring factory auto", self.stderr.getvalue())
+        self.assertNotIn("ProfileError", self.stderr.getvalue())
+        # The loop stopped at the marker, long before the run's own deadline.
+        last_sample = max(call.args[0]["sampled_monotonic_ns"]
+                          for call in self.health_publisher.call_args_list)
+        self.assertLess(last_sample, 5_000_000_000)
+        self.assertEqual(writes, [])
+
+    def test_appearing_override_while_hot_fails_exactly_like_a_hot_sigterm(self):
+        with self.assertRaisesRegex(DAEMON.ProfileError,
+                                    "factory restored; Boost release unsafe"):
+            self.run_startup(recovery_latched=False, duration=60.0, override_at=5.0,
+                             factory_released=False)
+        self.factory_restore.assert_called_once_with()
+        self.assertIn("treating it as a clean stop request", self.stderr.getvalue())
 
     @staticmethod
     def snapshot_control(now, state):

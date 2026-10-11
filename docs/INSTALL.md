@@ -96,6 +96,14 @@ enablement untouched; it reports the error and retained backup location. It
 never replaces runtime recovery with factory mode merely because activation or
 status verification failed. Inspect both units before deciding on another action.
 
+If the existing manager cannot complete `factory-auto`, for example because the
+machine is too hot to release Cooler Boost, the upgrade stops before replacing
+any artifact, and the script itself changes no boot enablement. Let the machine
+cool and rerun the upgrade. If a cool retry still fails, or to resume the
+installed profile now, run `sudo msi-fan-profile apply-default` and rerun the
+upgrade when cool. Managers older than this release also disable the service on
+that failure, so their cool retry fails until `apply-default` has been run.
+
 ## Verify systemd
 
 ```bash
