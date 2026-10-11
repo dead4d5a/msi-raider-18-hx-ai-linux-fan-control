@@ -4,13 +4,17 @@
 
 from __future__ import annotations
 
+import fcntl
 import importlib.machinery
 import importlib.util
 import io
 import json
+import os
 import pathlib
+import stat
 import sys
 import tempfile
+import types
 import unittest
 from unittest import mock
 
@@ -29,6 +33,9 @@ def load_recovery_helper():
 
 RECOVER = load_recovery_helper()
 REAL_RECOVERY_WRITE = RECOVER.write
+REAL_MARK_RECOVERY_LATCH = RECOVER.mark_recovery_latch
+REAL_RECOVERY_LATCH_PRESENT = RECOVER.recovery_latch_present
+REAL_ACQUIRE_LOCK = RECOVER.acquire_lock
 HOST_PATH_PREFIXES = ("/run/", "/sys/", "/proc/", "/dev/", "/etc/", "/var/")
 
 
@@ -719,6 +726,328 @@ class IdentitySnapshotTests(HardwareIsolatedTestCase):
                         mock.patch.object(pathlib.Path, "exists", return_value=False), \
                         mock.patch.object(pathlib.Path, "is_file", return_value=present):
                     self.assertFalse(RECOVER.identity_safe_for_curve_write())
+
+
+def root_owned(info):
+    """Present a test-created file as root's; the kernel's chown is not under test."""
+    return types.SimpleNamespace(
+        st_mode=info.st_mode, st_uid=0, st_gid=0, st_nlink=info.st_nlink,
+        st_dev=info.st_dev, st_ino=info.st_ino)
+
+
+def write_private(path, payload, mode=0o600):
+    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, mode)
+    try:
+        os.write(descriptor, payload)
+    finally:
+        os.close(descriptor)
+    os.chmod(path, mode)
+
+
+def read_private(path):
+    # Path.open stays blocked by the suite guard; this reads a private temp file.
+    with open(path, "rb") as stream:
+        return stream.read()
+
+
+class RootOwnedPath(pathlib.PosixPath):
+    """A private temporary path whose metadata reports root ownership."""
+
+    def lstat(self):
+        return root_owned(os.lstat(self))
+
+    def stat(self, *, follow_symlinks=True):
+        return root_owned(os.stat(self, follow_symlinks=follow_symlinks))
+
+
+SUCCESS = ("success", "exited", "0")
+# systemd.exec(5) SERVICE_RESULT/EXIT_CODE/EXIT_STATUS combinations for a
+# non-clean end; None leaves the variable unset, as systemd does when no main
+# process exit was observed.
+FAILURE_RESULTS = (
+    ("exit-code", "exited", "1"),
+    ("signal", "killed", "KILL"),
+    ("signal", "killed", "TERM"),
+    ("watchdog", "killed", "KILL"),
+    ("oom-kill", "killed", "KILL"),
+    ("core-dump", "dumped", "SEGV"),
+    ("timeout", "killed", "KILL"),
+    ("protocol", "exited", "0"),
+    ("resources", None, None),
+    ("start-limit-hit", None, None),
+)
+
+
+class ExecStopPostDecisionTests(HardwareIsolatedTestCase):
+    """main()'s return code alone decides whether OnFailure starts the keeper.
+
+    A nonzero return turns a successful stop into a failed unit (keeper); for
+    an already failed unit it only reports that full cooling was unverified.
+    """
+
+    def run_main(self, result=SUCCESS, *, ec=None, cool=True, verified=True,
+                 argv=("msi-gpu-recover", "candidate14"), environment=None,
+                 lock_error=None, root=True):
+        state = ec or {"fan_mode": "auto", "fan_curve": RECOVER.FACTORY,
+                       "cooler_boost": "off"}
+        env = {"MSI_CALIBRATION_PROFILE": "candidate14"}
+        for name, value in zip(("SERVICE_RESULT", "EXIT_CODE", "EXIT_STATUS"), result):
+            if value is not None:
+                env[name] = value
+        env.update(environment or {})
+
+        def fake_read(path):
+            if isinstance(state, Exception):
+                raise state
+            return state[path.name]
+
+        self.stderr = io.StringIO()
+        with mock.patch.object(RECOVER.sys, "argv", list(argv)), \
+                mock.patch.dict(RECOVER.os.environ, env, clear=True), \
+                mock.patch.object(RECOVER.os, "geteuid", return_value=0 if root else 1000), \
+                mock.patch.object(RECOVER, "acquire_lock",
+                                  side_effect=lock_error, return_value=9) as lock, \
+                mock.patch.object(RECOVER.os, "close") as close, \
+                mock.patch.object(RECOVER, "recovery_identity_error", return_value=None), \
+                mock.patch.object(RECOVER, "read", side_effect=fake_read), \
+                mock.patch.object(RECOVER, "release_boost_if_cool",
+                                  return_value=cool) as self.release, \
+                mock.patch.object(RECOVER, "attempt_full_cooling",
+                                  return_value=verified) as self.full_cooling, \
+                mock.patch.object(RECOVER, "request_boost_best_effort") as self.request, \
+                mock.patch.object(RECOVER.sys, "stderr", self.stderr):
+            code = RECOVER.main()
+        if lock.called and lock_error is None:
+            close.assert_called_once_with(9)
+        else:
+            close.assert_not_called()
+        return code
+
+    def test_every_failure_result_stages_full_cooling(self):
+        for result in FAILURE_RESULTS:
+            for verified, code in ((True, 0), (False, 1)):
+                with self.subTest(result=result, verified=verified):
+                    self.assertEqual(self.run_main(result, verified=verified), code)
+                    self.full_cooling.assert_called_once_with("candidate14")
+                    self.release.assert_not_called()
+                    self.assertEqual(
+                        "FATAL: full-cooling" in self.stderr.getvalue(), not verified)
+
+    def test_failure_results_never_release_boost_even_from_factory_auto_off(self):
+        # A failed daemon that happened to leave factory auto/off is still a fault.
+        for result in FAILURE_RESULTS:
+            with self.subTest(result=result):
+                self.run_main(result)
+                self.release.assert_not_called()
+                self.full_cooling.assert_called_once_with("candidate14")
+
+    def test_clean_cool_factory_stop_completes_without_a_keeper(self):
+        self.assertEqual(self.run_main(), 0)
+        self.release.assert_called_once_with()
+        self.full_cooling.assert_not_called()
+        self.assertIn("left thermally verified factory auto/off", self.stderr.getvalue())
+
+    def test_clean_hot_factory_stop_keeps_boost_and_fails_for_the_keeper(self):
+        self.assertEqual(self.run_main(cool=False), 1)
+        self.request.assert_called_once_with()
+        self.full_cooling.assert_not_called()
+        self.assertIn("too hot; Boost re-enabled", self.stderr.getvalue())
+
+    def test_clean_exit_in_an_unexpected_state_stages_full_cooling_and_fails(self):
+        for ec in ({"fan_mode": "advanced", "fan_curve": RECOVER.DEFAULT, "cooler_boost": "off"},
+                   {"fan_mode": "auto", "fan_curve": RECOVER.FACTORY, "cooler_boost": "on"},
+                   {"fan_mode": "auto", "fan_curve": RECOVER.DEFAULT, "cooler_boost": "off"}):
+            for verified in (True, False):
+                with self.subTest(ec=ec, verified=verified):
+                    self.assertEqual(self.run_main(ec=ec, verified=verified), 1)
+                    self.release.assert_not_called()
+                    self.full_cooling.assert_called_once_with("candidate14")
+
+    def test_clean_exit_with_unreadable_state_stages_full_cooling_and_fails(self):
+        self.assertEqual(self.run_main(ec=OSError("EC read failed")), 1)
+        self.assertIn("success-state verification failed: EC read failed",
+                      self.stderr.getvalue())
+        self.release.assert_not_called()
+        self.full_cooling.assert_called_once_with("candidate14")
+
+    def test_success_after_a_clean_signal_stages_full_cooling_without_a_keeper(self):
+        # systemd also reports success for a TERM death; that path still stages
+        # full cooling, and its 0 (no keeper) is the documented R2 choice.
+        self.assertEqual(self.run_main(("success", "killed", "TERM")), 0)
+        self.full_cooling.assert_called_once_with("candidate14")
+        self.release.assert_not_called()
+
+    def test_unavailable_lock_fails_without_any_ec_access(self):
+        self.assertEqual(self.run_main(("exit-code", "exited", "1"),
+                                       lock_error=TimeoutError("fan-control lock remained busy")), 1)
+        self.assertIn("FATAL: recovery lock unavailable; no unlocked write attempted: "
+                      "fan-control lock remained busy", self.stderr.getvalue())
+        self.full_cooling.assert_not_called()
+        self.request.assert_not_called()
+
+    def test_invalid_invocation_is_refused_before_the_lock(self):
+        for label, kwargs in (
+                ("unprivileged", {"root": False}),
+                ("missing profile", {"argv": ("msi-gpu-recover",)}),
+                ("wrong profile", {"argv": ("msi-gpu-recover", "factory")}),
+                ("environment mismatch",
+                 {"environment": {"MSI_CALIBRATION_PROFILE": "factory"}})):
+            with self.subTest(label):
+                self.assertEqual(self.run_main(("exit-code", "exited", "1"), **kwargs), 1)
+                self.full_cooling.assert_not_called()
+                self.request.assert_not_called()
+
+
+class ReleaseBoostIfCoolTests(HardwareIsolatedTestCase):
+    def release(self, package="60000", ec_cpu="60", ec_gpu="50", *, readback=None,
+                core=pathlib.Path("/fake/core")):
+        state = {"fan_mode": "auto", "fan_curve": RECOVER.FACTORY, "cooler_boost": "on",
+                 "temp1_input": package}
+        temperatures = {"cpu": ec_cpu, "gpu": ec_gpu}
+        self.writes = []
+
+        def fake_read(path):
+            if path.name == "realtime_temperature":
+                return temperatures[path.parent.name]
+            if readback and path.name in readback and ("cooler_boost", "off") in self.writes:
+                return readback[path.name]
+            return state[path.name]
+
+        def fake_write(path, value):
+            self.writes.append((path.name, value))
+            state[path.name] = value
+
+        hwmon = ({"side_effect": core} if isinstance(core, Exception)
+                 else {"return_value": core})
+        with mock.patch.object(RECOVER, "one_hwmon", **hwmon), \
+                mock.patch.object(RECOVER, "read", side_effect=fake_read), \
+                mock.patch.object(RECOVER, "write", side_effect=fake_write), \
+                mock.patch.object(RECOVER, "request_boost_best_effort") as self.request, \
+                mock.patch.object(RECOVER.sys, "stderr", io.StringIO()):
+            return RECOVER.release_boost_if_cool()
+
+    def test_cool_valid_telemetry_releases_to_factory_auto_off(self):
+        for gpu in ("50", "0"):
+            with self.subTest(gpu=gpu):
+                self.assertTrue(self.release(ec_gpu=gpu))
+                self.assertEqual(self.writes, [("fan_mode", "auto"), ("cooler_boost", "off")])
+
+    def test_heat_at_any_release_threshold_never_writes(self):
+        for telemetry in (("85000", "60", "50"), ("60000", "85", "50"), ("60000", "60", "70")):
+            with self.subTest(telemetry=telemetry):
+                self.assertFalse(self.release(*telemetry))
+                self.assertEqual(self.writes, [])
+
+    def test_invalid_telemetry_never_writes(self):
+        for telemetry in (("60000", "255", "50"), ("110001", "60", "50"),
+                          ("60000", "60", "111")):
+            with self.subTest(telemetry=telemetry):
+                self.assertFalse(self.release(*telemetry))
+                self.assertEqual(self.writes, [])
+
+    def test_unreadable_telemetry_reasserts_boost(self):
+        for kwargs in ({"ec_cpu": "-1"}, {"package": "hot"},
+                       {"core": RuntimeError("expected one coretemp hwmon; found 0")}):
+            with self.subTest(kwargs=kwargs):
+                self.assertFalse(self.release(**kwargs))
+                self.assertEqual(self.writes, [])
+                self.request.assert_called_once_with()
+
+    def test_failed_final_readback_turns_boost_back_on(self):
+        for readback in ({"cooler_boost": "on"}, {"fan_mode": "advanced"},
+                         {"fan_curve": RECOVER.DEFAULT}):
+            with self.subTest(readback=readback):
+                self.assertFalse(self.release(readback=readback))
+                self.assertEqual(self.writes[-1], ("cooler_boost", "on"))
+
+
+class RecoveryLatchFileTests(HardwareIsolatedTestCase):
+    """Create and validate the latch on a private temporary file."""
+
+    def setUp(self):
+        super().setUp()
+        self.latch = RootOwnedPath(RECOVER.RECOVERY_LATCH)
+        real_fstat = os.fstat
+        for patcher in (
+                mock.patch.object(RECOVER, "RECOVERY_LATCH", self.latch),
+                mock.patch.object(RECOVER, "mark_recovery_latch", REAL_MARK_RECOVERY_LATCH),
+                mock.patch.object(RECOVER, "recovery_latch_present",
+                                  REAL_RECOVERY_LATCH_PRESENT),
+                mock.patch.object(RECOVER.os, "fstat",
+                                  side_effect=lambda descriptor: root_owned(real_fstat(descriptor)))):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        patcher = mock.patch.object(RECOVER.os, "fchown")
+        self.fchown = patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_latch_round_trip_creates_one_exact_private_payload(self):
+        self.assertFalse(RECOVER.recovery_latch_present())
+        RECOVER.mark_recovery_latch("candidate14")
+        self.assertEqual(read_private(self.latch), RECOVER.RECOVERY_LATCH_PAYLOAD)
+        info = os.lstat(self.latch)
+        self.assertTrue(stat.S_ISREG(info.st_mode))
+        self.assertEqual(stat.S_IMODE(info.st_mode), 0o600)
+        self.assertEqual(self.fchown.call_args.args[1:], (0, 0))
+        self.assertTrue(RECOVER.recovery_latch_present())
+        # A second recovery pass keeps the first writer's latch.
+        RECOVER.mark_recovery_latch("candidate14")
+        self.assertEqual(read_private(self.latch), RECOVER.RECOVERY_LATCH_PAYLOAD)
+        self.assertEqual(self.fchown.call_count, 1)
+
+    def test_unknown_profile_never_creates_a_latch(self):
+        with self.assertRaisesRegex(RuntimeError, "unexpected recovery latch profile"):
+            RECOVER.mark_recovery_latch("factory")
+        self.assertFalse(os.path.lexists(self.latch))
+
+    def test_symlink_latch_is_never_followed_or_written(self):
+        target = self.latch.parent / "target"
+        write_private(target, b"")
+        os.symlink(target, self.latch)
+        for action in (RECOVER.recovery_latch_present,
+                       lambda: RECOVER.mark_recovery_latch("candidate14")):
+            with self.subTest(action=action):
+                with self.assertRaisesRegex(RuntimeError, "unsafe recovery Boost latch"):
+                    action()
+        self.assertEqual(read_private(target), b"")
+
+    def test_wrong_mode_or_payload_is_not_a_handoff(self):
+        write_private(self.latch, RECOVER.RECOVERY_LATCH_PAYLOAD, 0o644)
+        with self.assertRaisesRegex(RuntimeError, "unsafe recovery Boost latch"):
+            RECOVER.recovery_latch_present()
+        write_private(self.latch, b"factory\n")
+        with self.assertRaisesRegex(RuntimeError, "invalid recovery Boost latch payload"):
+            RECOVER.recovery_latch_present()
+
+
+class RecoveryLockTests(HardwareIsolatedTestCase):
+    def setUp(self):
+        super().setUp()
+        self.lock = RootOwnedPath(RECOVER.LOCK)
+        write_private(self.lock, b"")
+        for patcher in (mock.patch.object(RECOVER, "LOCK", self.lock),
+                        mock.patch.object(RECOVER, "acquire_lock", REAL_ACQUIRE_LOCK)):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def test_busy_lock_times_out_and_closes_its_descriptor(self):
+        holder = os.open(self.lock, os.O_RDONLY)
+        self.addCleanup(os.close, holder)
+        fcntl.flock(holder, fcntl.LOCK_EX)
+        with mock.patch.object(RECOVER.os, "close", wraps=os.close) as close:
+            with self.assertRaisesRegex(TimeoutError, "fan-control lock remained busy"):
+                RECOVER.acquire_lock(0.1)
+        close.assert_called_once()
+        fcntl.flock(holder, fcntl.LOCK_UN)
+        descriptor = RECOVER.acquire_lock(0.1)
+        os.close(descriptor)
+
+    def test_unsafe_lock_mode_is_refused_before_opening(self):
+        os.chmod(self.lock, 0o644)
+        with mock.patch.object(RECOVER.os, "open") as opened:
+            with self.assertRaisesRegex(RuntimeError, "unsafe fan-control lock"):
+                RECOVER.acquire_lock(0.1)
+        opened.assert_not_called()
 
 
 if __name__ == "__main__":
