@@ -82,8 +82,9 @@ an additional warning at most once per minute while the condition persists.
 
 The automatic latch is released only after 30 continuously valid, cool seconds.
 It is not released merely because one sample looks cool, and an external
-Cooler-Boost-off toggle cannot defeat the latch while the thermal condition is
-active.
+Cooler-Boost-off toggle cannot defeat the latch, either while the thermal
+condition is active or during its cooldown. This holds when manual Boost was
+already on: the alarm still sets the latch.
 
 High temperature alone is not proof that the fan controller is unsafe: once
 both physical fans have verified at maximum cooling, stopping the daemon would
@@ -211,6 +212,13 @@ inserts its fixed helper directory explicitly.
 - Boost-on requires daemon acknowledgement and both fans above 3,000 RPM.
 - Release requires 30 continuously valid, cool seconds.
 - A thermal automatic latch cannot be defeated by an external off toggle.
+- Automatic and manual Boost ownership are independent. A thermal alarm,
+  invalid telemetry, an observation gap or a recovery handoff sets the
+  automatic latch even while manual Boost is on, and a `boost-on` request or
+  keyboard toggle never cancels the latch. An external or keyboard off during
+  the latch withdraws manual Boost while the latch keeps reasserting Boost.
+  When the latch's cooldown completes, Boost goes off only if no manual Boost
+  remains; a queued `boost-release` never switches Boost off under the latch.
 - Failure recovery and its keeper retain Candidate 14/`advanced` and leave Boost
   on until a guarded daemon handoff; the verified recovery marker then makes it
   an automatic, 30-second-cooldown latch. Physical verification is reported only

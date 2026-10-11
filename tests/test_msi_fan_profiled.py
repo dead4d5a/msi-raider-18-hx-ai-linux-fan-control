@@ -1061,17 +1061,148 @@ class RecoveryHandoffMainLoopTests(HardwareFreeMainLoopTests):
                 # One startup Boost read, then no fw_version read in any pass.
                 self.assertEqual(names, ["cooler_boost"] + per_pass * passes)
 
-    def test_manual_request_cancels_automatic_cooldown(self):
+    def health_at(self, now):
+        return next(call.args[0] for call in self.health_publisher.call_args_list
+                    if call.args[0]["sampled_monotonic_ns"] == int(now * 1_000_000_000))
+
+    def test_manual_request_keeps_boost_after_the_automatic_cooldown(self):
         def event(now, _state):
             if now == 29:
                 DAEMON.BOOST_REQUEST = True
         state, writes, *_ = self.run_startup(True, duration=65, event_at=event)
+        # The request adds a manual owner without cancelling the latch. The
+        # latch's cooldown then completes without switching Boost off.
         self.assertEqual(writes, [(29.0, "on")])
         self.assertEqual(state["boost"], "on")
         self.acks.assert_called_once_with("boost-on")
+        both = self.health_at(40)
+        self.assertTrue(both["manual_boost"])
+        self.assertTrue(both["automatic_boost"])
+        self.assertEqual(both["state"], "cooling")
         health = self.health_publisher.call_args.args[0]
         self.assertTrue(health["manual_boost"])
         self.assertFalse(health["automatic_boost"])
+        self.assertIn("automatic Cooler Boost latch cleared after 30-second cooldown; "
+                      "manual Boost remains on", self.stderr.getvalue())
+
+    # Regression scenarios B1, B2 and B4 from the Boost ownership audit: an
+    # external off must not defeat an automatic latch, whatever manual Boost
+    # was held when it began. Each has a control without manual Boost.
+    @staticmethod
+    def keyboard_off_at(when):
+        def event(now, state):
+            if now == when:
+                state["boost"] = "off"
+        return event
+
+    def test_b1_alarm_during_manual_boost_survives_a_keyboard_off_while_hot(self):
+        def sample(now):
+            package = 99000 if 10 <= now < 25 else 95000 if now < 40 else 50000
+            return DAEMON.RuntimeSample(package, 50, 40, 4400, 4400)
+        for initial, expected in (
+                ("on", [(30.0, "on"), (70.0, "off")]),
+                ("off", [(19.0, "on"), (30.0, "on"), (70.0, "off")])):
+            with self.subTest(initial_boost=initial):
+                self.health_publisher.reset_mock()
+                state, writes, *_ = self.run_startup(
+                    False, duration=75, sample_at=sample, initial_boost=initial,
+                    event_at=self.keyboard_off_at(30))
+                self.assertEqual(writes, expected)
+                self.assertEqual(state["boost"], "off")
+                self.assertIn("Cooler Boost established for alarm", self.stderr.getvalue())
+                hot = self.health_at(35)
+                self.assertFalse(hot["manual_boost"])
+                self.assertTrue(hot["automatic_boost"])
+                if initial == "on":
+                    self.assertTrue(self.health_at(29)["manual_boost"])
+                    self.assertTrue(self.health_at(29)["automatic_boost"])
+                    self.assertIn("manual Boost withdrawn", self.stderr.getvalue())
+
+    def test_b2_boost_on_during_automatic_latch_survives_a_keyboard_off_while_hot(self):
+        def sample(now):
+            return DAEMON.RuntimeSample(95000 if now < 40 else 50000, 50, 40, 4400, 4400)
+        for request, expected in (
+                (True, [(28.0, "on"), (30.0, "on"), (70.0, "off")]),
+                (False, [(30.0, "on"), (70.0, "off")])):
+            def event(now, state):
+                if request and now == 28:
+                    DAEMON.BOOST_REQUEST = True
+                self.keyboard_off_at(30)(now, state)
+            with self.subTest(request=request):
+                self.health_publisher.reset_mock()
+                state, writes, *_ = self.run_startup(
+                    True, duration=75, sample_at=sample, event_at=event)
+                self.assertEqual(writes, expected)
+                self.assertEqual(state["boost"], "off")
+                self.assertEqual(self.acks.call_args_list,
+                                 [mock.call("boost-on")] if request else [])
+                if request:
+                    self.assertTrue(self.health_at(29)["manual_boost"])
+                    self.assertTrue(self.health_at(29)["automatic_boost"])
+                after = self.health_at(31)
+                self.assertFalse(after["manual_boost"])
+                self.assertTrue(after["automatic_boost"])
+                self.assertEqual(self.health_at(69)["state"], "cooling")
+                self.assertEqual(self.health_at(70)["state"], "normal")
+
+    def test_b4_degraded_telemetry_during_manual_boost_survives_a_keyboard_off(self):
+        def sample(now):
+            if 10 <= now < 20:
+                raise DAEMON.SensorSampleError(
+                    "EC CPU temperature sentinel 255C",
+                    DAEMON.RuntimeSample(90000, None, 40, 4400, 4400),
+                    {"ec_cpu": "EC CPU temperature sentinel 255C"})
+            return DAEMON.RuntimeSample(90000 if now < 40 else 50000, 50, 40, 4400, 4400)
+        for initial, expected in (
+                ("on", [(30.0, "on"), (70.0, "off")]),
+                ("off", [(10.0, "on"), (30.0, "on"), (70.0, "off")])):
+            with self.subTest(initial_boost=initial):
+                self.health_publisher.reset_mock()
+                state, writes, *_ = self.run_startup(
+                    False, duration=75, sample_at=sample, initial_boost=initial,
+                    event_at=self.keyboard_off_at(30))
+                self.assertEqual(writes, expected)
+                self.assertEqual(state["boost"], "off")
+                degraded = self.health_at(15)
+                self.assertEqual(degraded["state"], "degraded")
+                self.assertTrue(degraded["automatic_boost"])
+                self.assertEqual(degraded["manual_boost"], initial == "on")
+                self.assertFalse(self.health_at(35)["manual_boost"])
+                self.assertTrue(self.health_at(35)["automatic_boost"])
+
+    def test_queued_manual_release_under_automatic_latch_writes_off_once(self):
+        def event(now, _state):
+            if now == 5:
+                DAEMON.BOOST_REQUEST = True
+            if now == 10:
+                DAEMON.RELEASE_REQUEST = True
+        state, writes, *_ = self.run_startup(True, duration=45, event_at=event)
+        # The latch's cooldown (from the request at 5) ends first and leaves
+        # Boost to the manual owner; the queued release (from 10) then ends it.
+        self.assertEqual(writes, [(5.0, "on"), (40.0, "off")])
+        self.assertEqual(state["boost"], "off")
+        self.assertEqual(self.acks.call_args_list, [
+            mock.call("boost-on"), mock.call("boost-release-queued"),
+            mock.call("boost-release")])
+        for now, automatic in ((34, True), (36, False)):
+            health = self.health_at(now)
+            self.assertTrue(health["manual_boost"])
+            self.assertEqual(health["automatic_boost"], automatic)
+            self.assertTrue(health["release_pending"])
+        self.assertFalse(self.health_at(40)["manual_boost"])
+        self.assertFalse(self.health_at(40)["release_pending"])
+
+    def test_keyboard_off_after_the_automatic_latch_ends_is_a_manual_release(self):
+        def event(now, state):
+            if now == 5:
+                DAEMON.BOOST_REQUEST = True
+            self.keyboard_off_at(40)(now, state)
+        state, writes, *_ = self.run_startup(True, duration=45, event_at=event)
+        # With no automatic latch left, the keyboard remains a manual override.
+        self.assertEqual(writes, [(5.0, "on")])
+        self.assertEqual(state["boost"], "off")
+        self.assertFalse(self.health_at(40)["manual_boost"])
+        self.assertFalse(self.health_at(40)["automatic_boost"])
 
     def test_requests_are_processed_while_temperatures_are_degraded(self):
         def sample(_now):

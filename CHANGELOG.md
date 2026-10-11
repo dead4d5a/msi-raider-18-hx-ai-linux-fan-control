@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- Track automatic and manual Cooler Boost ownership independently, as
+  `SAFETY.md` requires. A thermal alarm, invalid telemetry or an observation
+  gap now sets the automatic latch even while manual Boost is on, and a
+  `boost-on` request no longer cancels the latch. A keyboard or external off
+  during the latch withdraws manual Boost while the latch reasserts Boost, so
+  that off can no longer skip the 30 continuously valid, cool seconds after an
+  alarm or sensor fault. The latch's cooldown switches Boost off only when no
+  manual Boost remains, and a queued manual release never switches Boost off
+  under the latch. Health reports both owners.
 - Stop reading the EC firmware twice per second on the legacy driver. The
   daemon and keeper loops read `fan_curve` first and rely on its in-kernel DMI
   and firmware check, which fails the read on a mismatch, instead of a separate

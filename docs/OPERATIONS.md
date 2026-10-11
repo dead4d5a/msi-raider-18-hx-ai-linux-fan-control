@@ -112,7 +112,8 @@ Boost asserted through the guarded handoff. The daemon consumes a root-only
 same-boot recovery marker only after it has reapplied Candidate 14, then treats
 that inherited Boost as an automatic latch. It releases only after 30
 continuously valid, cool seconds; a keyboard or `boost-on` request made after
-the handoff remains a separate manual override.
+the handoff remains a separate manual override. It never cancels the latch, and
+it keeps Boost on after the latch's cooldown until it is itself released.
 
 ## Temporary maximum cooling
 
@@ -142,6 +143,11 @@ still requires valid fan response and release still requires valid temperatures.
 
 The chassis keyboard Cooler Boost shortcut remains usable. The daemon observes
 it as a manual override. Use `boost-release` for a monitored release.
+While an automatic latch is active (thermal alarm, invalid telemetry,
+observation gap or recovery handoff), the daemon switches Boost straight back
+on after a keyboard off. That off only withdraws manual Boost, so Boost goes
+off once the latch's own 30-second cooldown completes. `status` reports both
+owners as `health.manual_boost` and `health.automatic_boost`.
 
 ## Factory automatic mode until reboot
 
@@ -236,7 +242,8 @@ remains active rather than failing. `systemctl status msi-fan-profile.service`
 will report a sustained safety alarm, and the journal records the triggering
 temperature/fan condition. An automatically latched Cooler Boost releases only
 after 30 continuously valid, cool seconds; a manual Boost latch continues to
-use its separately requested, monitored release path.
+use its separately requested, monitored release path. Boost goes off only when
+neither holds it.
 
 Stop or reduce the workload if this occurs. This fan-only controller cannot
 guarantee a CPU temperature below the mid-90s under every sustained workload;

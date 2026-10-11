@@ -763,6 +763,10 @@ def main() -> int:
             f"recovery_latch={recovery_latched}",
               file=sys.stderr, flush=True)
         safety = Safety()
+        # Boost has two independent owners. The automatic latch (thermal alarm,
+        # invalid telemetry, observation gap or recovery handoff) releases only
+        # after its monitored cooldown; manual Boost (keyboard or boost-on) has
+        # its own release. Boost goes off only once neither owner holds it.
         manual_boost = existing_boost and not recovery_latched
         automatic_boost = recovery_latched
         release_pending = False
@@ -788,6 +792,17 @@ def main() -> int:
             return response.observe(
                 sample.fan1 if sample else None,
                 sample.fan2 if sample else None, now)
+
+        def withdraw_manual_boost() -> None:
+            # Only an external or keyboard toggle turns Boost off during the
+            # automatic latch. It withdraws manual Boost, so the latch's own
+            # cooldown may then release Boost; the latch still reasserts it.
+            nonlocal manual_boost
+            if manual_boost:
+                manual_boost = False
+                print("Cooler Boost switched off externally; manual Boost withdrawn, "
+                      "automatic latch keeps Boost on until its cooldown",
+                      file=sys.stderr, flush=True)
 
         def runtime_heartbeat(status: str, sample: RuntimeSample | None,
                               errors: dict[str, str], reason: str | None,
@@ -837,8 +852,7 @@ def main() -> int:
                 time.sleep(delay)
         if initial_physical_verification is False:
             sensor_hold.record(time.monotonic())
-            if not manual_boost:
-                automatic_boost = True
+            automatic_boost = True
             print(
                 "WARNING initial physical fan telemetry is invalid; "
                 "Candidate14 remains active with Cooler Boost latched",
@@ -879,8 +893,7 @@ def main() -> int:
                 alarm.clear()
                 if reapply_physical_verification is False:
                     sensor_hold.record(time.monotonic())
-                    if not manual_boost:
-                        automatic_boost = True
+                    automatic_boost = True
                 else:
                     sensor_hold.clear()
                 # Resume/reapply invalidates previously acquired EC temperatures.
@@ -905,8 +918,7 @@ def main() -> int:
                     alarm.clear()
                     if reapply_physical_verification is False:
                         sensor_hold.record(time.monotonic())
-                        if not manual_boost:
-                            automatic_boost = True
+                        automatic_boost = True
                     else:
                         sensor_hold.clear()
                     if control is not None:
@@ -915,13 +927,16 @@ def main() -> int:
                 else:
                     raise ProfileError(f"unexpected runtime state: {mode}/{boost}/{curve!r}")
 
+            if automatic_boost and boost == "off":
+                withdraw_manual_boost()
+
             # Process requests even while a thermal channel is unavailable.
-            # A new Boost-on cancels a previous release; its acknowledgement
-            # waits for actual fan response, not merely the control bit.
+            # A new Boost-on cancels a previous release but never an automatic
+            # latch; its acknowledgement waits for actual fan response, not
+            # merely the control bit.
             if BOOST_REQUEST:
                 write(BASE / "cooler_boost", "on")
                 manual_boost = True
-                automatic_boost = False
                 boost_ack_pending = True
                 release_pending = False
                 release_cool_since = None
@@ -952,8 +967,7 @@ def main() -> int:
                     alarm.clear()
                     response = None
                     sensor_hold.record(sampled_at)
-                    if not manual_boost:
-                        automatic_boost = True
+                    automatic_boost = True
                     if read(BASE / "cooler_boost") != "on":
                         write(BASE / "cooler_boost", "on")
                     print("WARNING monitoring gap; Boost latched and cooldown reset",
@@ -1002,8 +1016,7 @@ def main() -> int:
                 transition = sensor_hold.record(acquisition_finished)
                 if read(BASE / "cooler_boost") != "on":
                     write(BASE / "cooler_boost", "on")
-                if not manual_boost:
-                    automatic_boost = True
+                automatic_boost = True
                 # Old RPM from a stalled acquisition is not fresh response
                 # evidence, even when its numeric values are plausible.
                 verified = (False if slow_acquisition else observe_response(
@@ -1040,7 +1053,7 @@ def main() -> int:
             if reason or automatic_boost or boost_ack_pending or sensor_hold.started is not None:
                 if read(BASE / "cooler_boost") != "on":
                     write(BASE / "cooler_boost", "on")
-                if reason and not manual_boost:
+                if reason:
                     automatic_boost = True
             # One fresh read serves response evidence and the decisions below:
             # paths that write Boost before those decisions continue instead.
@@ -1101,8 +1114,7 @@ def main() -> int:
                         f"WARNING sustained safety alarm continues with verified "
                         f"Cooler Boost: {reason}",
                         file=sys.stderr, flush=True)
-                if not manual_boost:
-                    automatic_boost = True
+                automatic_boost = True
             else:
                 if alarm.clear():
                     print(
@@ -1113,23 +1125,31 @@ def main() -> int:
                 if automatic_boost:
                     # External/keyboard off cannot defeat the automatic latch.
                     if boost != "on":
+                        withdraw_manual_boost()
                         write(BASE / "cooler_boost", "on")
                     is_cool = cpu < 85000 and (ec_gpu == 0 or ec_gpu < 70)
                     safety.cool_since = Safety.update_since(
                         safety.cool_since, is_cool, timer_now)
                     if (verified and safety.cool_since is not None and
                             timer_now - safety.cool_since >= 30):
-                        write(BASE / "cooler_boost", "off")
+                        if manual_boost:
+                            # Manual Boost still owns Boost and keeps its own
+                            # release path, including any queued release.
+                            print("automatic Cooler Boost latch cleared after 30-second "
+                                  "cooldown; manual Boost remains on",
+                                  file=sys.stderr, flush=True)
+                        else:
+                            write(BASE / "cooler_boost", "off")
+                            if release_pending:
+                                acknowledge("boost-release")
+                            release_pending = False
+                            release_cool_since = None
+                            response = None
+                            verified = False
+                            print("automatic Cooler Boost released after 30-second cooldown",
+                                  file=sys.stderr, flush=True)
                         automatic_boost = False
-                        if release_pending:
-                            acknowledge("boost-release")
-                        release_pending = False
-                        release_cool_since = None
                         safety.cool_since = None
-                        response = None
-                        verified = False
-                        print("automatic Cooler Boost released after 30-second cooldown",
-                              file=sys.stderr, flush=True)
                 else:
                     # Track keyboard toggles only when no automatic latch is active.
                     manual_boost = boost == "on"
@@ -1147,15 +1167,22 @@ def main() -> int:
                         release_cool_since, is_cool, timer_now)
                     if (verified and release_cool_since is not None and
                             timer_now - release_cool_since >= 30):
-                        write(BASE / "cooler_boost", "off")
+                        if automatic_boost:
+                            # Never churn Boost off under the automatic latch;
+                            # its own release acknowledges the queued request.
+                            print("explicit manual Cooler Boost release completed; "
+                                  "automatic latch keeps Boost on until its cooldown",
+                                  file=sys.stderr, flush=True)
+                        else:
+                            write(BASE / "cooler_boost", "off")
+                            release_pending = False
+                            response = None
+                            verified = False
+                            acknowledge("boost-release")
+                            print("explicit Cooler Boost released after 30-second cooldown",
+                                  file=sys.stderr, flush=True)
                         manual_boost = False
-                        release_pending = False
                         release_cool_since = None
-                        response = None
-                        verified = False
-                        acknowledge("boost-release")
-                        print("explicit Cooler Boost released after 30-second cooldown",
-                              file=sys.stderr, flush=True)
 
             if started - last_log >= 60:
                 alarm_note = f" sustained_alarm={reason!r}" if alarm.sustained else ""
