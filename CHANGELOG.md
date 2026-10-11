@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Keep daemon main-loop, manager and recovery tests off the live host: relocate
+  every `/run` and sysfs path constant into a per-test directory, block
+  unmocked fixed-path helpers and subprocesses, and fail when a new host path
+  constant is not relocated. A keeper recovery latch in `/run` no longer makes
+  release checks, and therefore guarded upgrades, fail.
 - Fix a runtime memory leak that let `MemoryMax=64M` OOM-kill the controller
   after about 6.8 days, handing cooling to the keeper. Health publication
   wrapped each random temporary name in `pathlib.Path`; Python 3.12 interns path

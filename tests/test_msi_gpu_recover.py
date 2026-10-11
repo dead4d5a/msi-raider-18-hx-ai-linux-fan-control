@@ -10,6 +10,7 @@ import io
 import json
 import pathlib
 import sys
+import tempfile
 import unittest
 from unittest import mock
 
@@ -28,6 +29,7 @@ def load_recovery_helper():
 
 RECOVER = load_recovery_helper()
 REAL_RECOVERY_WRITE = RECOVER.write
+HOST_PATH_PREFIXES = ("/run/", "/sys/", "/proc/", "/dev/", "/etc/", "/var/")
 
 
 class HardwareIsolatedTestCase(unittest.TestCase):
@@ -36,11 +38,24 @@ class HardwareIsolatedTestCase(unittest.TestCase):
     Local test mocks override these guards. Tests exercising the real write
     identity check opt in to REAL_RECOVERY_WRITE and still mock Path.open.
     Caught best-effort exceptions cannot conceal a missing mock: cleanup fails
-    if any unmocked I/O was attempted.
+    if any unmocked I/O was attempted. Host path constants are relocated
+    beneath a per-test temporary directory as a further barrier.
     """
 
     def setUp(self):
         super().setUp()
+        directory = tempfile.TemporaryDirectory(prefix="msi-gpu-recover-test-")
+        self.addCleanup(directory.cleanup)
+        runtime = pathlib.Path(directory.name)
+        for name in ("BASE", "LOCK", "RECOVERY_LATCH"):
+            patcher = mock.patch.object(RECOVER, name, runtime / getattr(RECOVER, name).name)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        leaked = sorted(
+            name for name, value in vars(RECOVER).items()
+            if isinstance(value, pathlib.PurePath) and
+            str(value).startswith(HOST_PATH_PREFIXES) and not value.is_relative_to(runtime))
+        self.assertEqual(leaked, [], "relocate new host path constants in setUp")
         self.unmocked_io = []
 
         def blocked(name):

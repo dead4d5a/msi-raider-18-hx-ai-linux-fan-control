@@ -31,6 +31,11 @@ def load_daemon():
 
 
 DAEMON = load_daemon()
+# Captured before any test relocates it: a keeper handoff leaves a root-owned
+# latch here exactly when an operator upgrades, so tests must never read it.
+HOST_RECOVERY_LATCH = DAEMON.RECOVERY_LATCH
+HOST_PATH_PREFIXES = ("/run/", "/sys/", "/proc/", "/dev/", "/etc/", "/var/")
+RELOCATED_PATHS = ("BASE", "LOCK", "OVERRIDE", "ACK", "HEALTH", "RECOVERY_LATCH")
 
 
 class AlarmHoldTests(unittest.TestCase):
@@ -183,11 +188,67 @@ class SensorHoldTests(unittest.TestCase):
 
 
 class HardwareFreeMainLoopTests(unittest.TestCase):
+    """Run main() against a private runtime directory, never the live host.
+
+    Every host path constant is relocated beneath a per-test temporary
+    directory, and helpers with fixed host paths or sockets fail unless a test
+    mocks them. Local test mocks stack on top of these defaults.
+    """
+
     def setUp(self):
+        super().setUp()
+        directory = tempfile.TemporaryDirectory(prefix="msi-fan-profiled-test-")
+        self.addCleanup(directory.cleanup)
+        self.runtime = pathlib.Path(directory.name)
+        for name in RELOCATED_PATHS:
+            patcher = mock.patch.object(
+                DAEMON, name, self.runtime / getattr(DAEMON, name).name)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        self.assert_host_paths_relocated()
+
+        self.unmocked_io = []
+
+        def blocked(name):
+            def reject(*args, **kwargs):
+                self.unmocked_io.append((name, args, kwargs))
+                raise AssertionError(f"unmocked host I/O blocked: {name}")
+            return reject
+
+        for name in ("acknowledge", "one_hwmon", "notify"):
+            patcher = mock.patch.object(DAEMON, name, side_effect=blocked(name))
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        self.addCleanup(lambda: self.assertEqual(
+            self.unmocked_io, [], "test attempted unmocked host I/O"))
         self.real_health_publisher = DAEMON.publish_health
         publisher = mock.patch.object(DAEMON, "publish_health")
         self.health_publisher = publisher.start()
         self.addCleanup(publisher.stop)
+
+    def assert_host_paths_relocated(self):
+        leaked = sorted(
+            name for name, value in vars(DAEMON).items()
+            if isinstance(value, pathlib.PurePath) and
+            str(value).startswith(HOST_PATH_PREFIXES) and
+            not value.is_relative_to(self.runtime))
+        self.assertEqual(leaked, [], "relocate new host path constants in setUp")
+
+
+class MainLoopIsolationTests(HardwareFreeMainLoopTests):
+    def test_runtime_paths_are_private_and_absent(self):
+        for name in RELOCATED_PATHS:
+            with self.subTest(name=name):
+                path = getattr(DAEMON, name)
+                self.assertTrue(path.is_relative_to(self.runtime))
+                self.assertFalse(path.exists())
+        self.assertFalse(DAEMON.recovery_latch_present())
+
+    def test_new_unrelocated_host_path_constant_is_detected(self):
+        with mock.patch.object(DAEMON, "FUTURE_MARKER",
+                               pathlib.Path("/run/msi-fan-profile.future"), create=True):
+            with self.assertRaisesRegex(AssertionError, "FUTURE_MARKER"):
+                self.assert_host_paths_relocated()
 
 
 class BoostResponseTests(unittest.TestCase):
@@ -582,6 +643,31 @@ class SensorHoldMainLoopTests(HardwareFreeMainLoopTests):
         restore.assert_called_once()  # Only the requested clean stop.
         self.assertTrue(any("Sensor telemetry degraded 60s" in item
                             for item in notifications))
+
+
+class HostRecoveryLatchMainLoopTests(SustainedAlarmMainLoopTests,
+                                     SensorHoldMainLoopTests):
+    """Re-run the main loops that once read the host latch while one is present.
+
+    After a keeper takeover the live /run holds a root-owned latch, and the
+    upgrade's release checks must still pass. Only that pathname's stat is
+    virtualized; reading it would hit the mocked descriptor and fail.
+    """
+
+    def setUp(self):
+        super().setUp()
+        original_lstat = pathlib.Path.lstat
+
+        def host_latch_present(path):
+            if path == HOST_RECOVERY_LATCH:
+                return types.SimpleNamespace(
+                    st_mode=DAEMON.stat.S_IFREG | 0o600, st_uid=0, st_gid=0,
+                    st_nlink=1, st_dev=0, st_ino=0)
+            return original_lstat(path)
+
+        patcher = mock.patch.object(pathlib.Path, "lstat", host_latch_present)
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
 
 class RecoveryHandoffMainLoopTests(HardwareFreeMainLoopTests):

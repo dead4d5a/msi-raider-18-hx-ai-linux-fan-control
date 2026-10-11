@@ -12,6 +12,7 @@ import io
 import json
 import pathlib
 import sys
+import tempfile
 import types
 import unittest
 from unittest import mock
@@ -30,6 +31,45 @@ def load_manager():
 
 
 MANAGER = load_manager()
+HOST_PATH_PREFIXES = ("/run/", "/sys/", "/proc/", "/dev/", "/etc/", "/var/")
+RELOCATED_PATHS = ("BASE", "OVERRIDE", "ACK", "HEALTH", "RECOVERY_LATCH",
+                   "MANAGER_LOCK", "FAN_LOCK")
+
+
+class HardwareIsolatedTestCase(unittest.TestCase):
+    """Keep manager tests off the live host, even if they run with privileges.
+
+    Host path constants are relocated beneath a per-test temporary directory,
+    and the subprocess boundary behind ctl() fails unless a test mocks it.
+    Local test mocks override these guards; cleanup fails if a caught
+    exception concealed a blocked subprocess.
+    """
+
+    def setUp(self):
+        super().setUp()
+        directory = tempfile.TemporaryDirectory(prefix="msi-fan-profile-test-")
+        self.addCleanup(directory.cleanup)
+        runtime = pathlib.Path(directory.name)
+        for name in RELOCATED_PATHS:
+            patcher = mock.patch.object(MANAGER, name, runtime / getattr(MANAGER, name).name)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        leaked = sorted(
+            name for name, value in vars(MANAGER).items()
+            if isinstance(value, pathlib.PurePath) and
+            str(value).startswith(HOST_PATH_PREFIXES) and not value.is_relative_to(runtime))
+        self.assertEqual(leaked, [], "relocate new host path constants in setUp")
+        self.unmocked_commands = []
+
+        def reject(*args, **kwargs):
+            self.unmocked_commands.append((args, kwargs))
+            raise AssertionError(f"unmocked manager subprocess blocked: {args}")
+
+        patcher = mock.patch.object(MANAGER, "run", side_effect=reject)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.addCleanup(lambda: self.assertEqual(
+            self.unmocked_commands, [], "test attempted an unmocked subprocess"))
 
 
 def managed_snapshot():
@@ -77,7 +117,7 @@ def health_payload(**updates):
     return payload
 
 
-class ApplyDefaultFailureTests(unittest.TestCase):
+class ApplyDefaultFailureTests(HardwareIsolatedTestCase):
     def test_apply_default_stops_the_keeper_before_starting_the_daemon(self):
         calls = []
         healthy = {
@@ -241,7 +281,7 @@ class ApplyDefaultFailureTests(unittest.TestCase):
         factory.assert_called_once_with()
 
 
-class RecoveryLatchValidationTests(unittest.TestCase):
+class RecoveryLatchValidationTests(HardwareIsolatedTestCase):
     def test_unprivileged_status_reports_private_marker_presence_without_opening_it(self):
         latch = mock.Mock()
         latch.lstat.return_value = types.SimpleNamespace(
@@ -314,7 +354,7 @@ class RecoveryLatchValidationTests(unittest.TestCase):
                 MANAGER.recovery_latch()
 
 
-class BatchedUnitStateTests(unittest.TestCase):
+class BatchedUnitStateTests(HardwareIsolatedTestCase):
     def test_two_units_are_parsed_without_relying_on_property_order(self):
         output = (
             'MainPID=17\nId=msi-fan-profile.service\nActiveState=active\n'
@@ -350,7 +390,7 @@ class BatchedUnitStateTests(unittest.TestCase):
                 MANAGER.unit_states(MANAGER.SERVICE)
 
 
-class StatusReadBudgetTests(unittest.TestCase):
+class StatusReadBudgetTests(HardwareIsolatedTestCase):
     def exercise_status(self, twice, snapshot_driver=False, snapshot_error=None):
         values = {
             pathlib.Path('/sys/class/dmi/id/product_name'): 'Raider 18 HX AI A2XWIG',
@@ -463,7 +503,7 @@ class StatusReadBudgetTests(unittest.TestCase):
         open_file.assert_called_once()
 
 
-class ControllerHealthTests(unittest.TestCase):
+class ControllerHealthTests(HardwareIsolatedTestCase):
     def snapshot(self, payload, now=10_000_000_000):
         with mock.patch.object(MANAGER, 'private_file_bytes',
                                return_value=json.dumps(payload).encode()), \
@@ -591,7 +631,7 @@ class ControllerHealthTests(unittest.TestCase):
         health.assert_not_called()
 
 
-class ManagerRequestTests(unittest.TestCase):
+class ManagerRequestTests(HardwareIsolatedTestCase):
     def test_ack_rejects_the_wrong_pid_stale_timestamp_and_wrong_action(self):
         for response in (
                 {'pid': 18, 'action': 'boost-release', 'monotonic_ns': 101},
@@ -739,7 +779,7 @@ class ManagerRequestTests(unittest.TestCase):
         hardware.assert_not_called()
 
 
-class FactoryReleasePlausibilityTests(unittest.TestCase):
+class FactoryReleasePlausibilityTests(HardwareIsolatedTestCase):
     def test_negative_package_or_ec_telemetry_never_releases_boost(self):
         core = mock.MagicMock()
         (core / 'name').exists.return_value = True
@@ -753,6 +793,22 @@ class FactoryReleasePlausibilityTests(unittest.TestCase):
                 with self.assertRaisesRegex(MANAGER.ManagerError, 'telemetry is invalid'):
                     MANAGER.restore_factory_locked()
             self.assertNotIn(mock.call(MANAGER.BASE / 'cooler_boost', 'off'), write.call_args_list)
+
+
+class HostIsolationTests(HardwareIsolatedTestCase):
+    def test_unmocked_systemctl_is_blocked_before_any_subprocess(self):
+        with mock.patch.object(MANAGER.subprocess, 'run') as subprocess_run:
+            with self.assertRaisesRegex(AssertionError, 'unmocked manager subprocess'):
+                MANAGER.ctl('stop', MANAGER.SERVICE)
+        subprocess_run.assert_not_called()
+        self.unmocked_commands.clear()  # The block was this test's expected outcome.
+
+    def test_runtime_markers_are_read_from_the_private_directory(self):
+        self.assertFalse(MANAGER.marker())
+        self.assertFalse(MANAGER.recovery_latch_metadata())
+        self.assertFalse(MANAGER.recovery_latch())
+        with self.assertRaises(FileNotFoundError):
+            MANAGER.lock(MANAGER.FAN_LOCK)
 
 
 if __name__ == "__main__":
