@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- Fix a runtime memory leak that let `MemoryMax=64M` OOM-kill the controller
+  after about 6.8 days, handing cooling to the keeper. Health publication
+  wrapped each random temporary name in `pathlib.Path`; Python 3.12 interns path
+  components as immortal strings, retaining about 100 bytes per one-second
+  snapshot. The temporary is now removed by name only on failure. Allocation and
+  failure-cleanup regression tests cover it; this is offline evidence, not a
+  multi-day deployed soak.
 - Select CI kernel headers from the installed generic metapackage, not the
   highest version across runner kernel flavors; check matching release, module
   support and exact battery-hook exports before building the pinned driver.

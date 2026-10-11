@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import contextlib
+import gc
 import importlib.machinery
 import importlib.util
 import io
@@ -1107,6 +1108,49 @@ class HealthPublicationTests(unittest.TestCase):
                 with self.assertRaisesRegex(DAEMON.ProfileError, "unsafe runtime health"):
                     DAEMON.publish_health({"schema": 1})
             self.assertEqual(victim.read_text(), "unchanged")
+
+    def test_failed_snapshot_removes_its_temporary_file(self):
+        with tempfile.TemporaryDirectory() as directory:
+            target = pathlib.Path(directory) / "health.json"
+            with mock.patch.object(DAEMON, "HEALTH", target), \
+                    mock.patch.object(DAEMON.os, "fchown"):
+                with self.assertRaises(ValueError):
+                    DAEMON.publish_health({"schema": 1, "cooldown": float("nan")})
+            self.assertEqual(list(pathlib.Path(directory).iterdir()), [])
+
+    def test_repeated_publication_retains_no_memory_per_snapshot(self):
+        # The daemon publishes once per second for days under MemoryMax=64M.
+        # Python 3.12 pathlib interns path components as immortal strings, so a
+        # Path built from each random temporary name leaked one block per call.
+        publications = 5000
+        original_lstat = pathlib.Path.lstat
+
+        def virtual_root(path):
+            # Replace the previous root-owned snapshot as production does.
+            info = original_lstat(path)
+            return types.SimpleNamespace(st_uid=0, st_gid=0, st_mode=info.st_mode,
+                                         st_nlink=info.st_nlink)
+
+        def publish(count):
+            for _ in range(count):
+                DAEMON.publish_health({"schema": 1, "pid": 123, "state": "normal"})
+
+        with tempfile.TemporaryDirectory() as directory:
+            target = pathlib.Path(directory) / "health.json"
+            # Plain functions, not mocks: a Mock records every call and would
+            # itself grow by far more than the leak being measured.
+            with mock.patch.object(DAEMON, "HEALTH", target), \
+                    mock.patch.object(DAEMON.os, "fchown", lambda _fd, _uid, _gid: None), \
+                    mock.patch.object(pathlib.Path, "lstat", virtual_root):
+                # Let interpreter free lists and caches reach steady state first.
+                publish(1000)
+                gc.collect()
+                before = sys.getallocatedblocks()
+                publish(publications)
+                gc.collect()
+                growth = sys.getallocatedblocks() - before
+            self.assertEqual(list(pathlib.Path(directory).iterdir()), [target])
+        self.assertLess(growth, publications // 10)
 
 
 class RecoveryLatchValidationTests(unittest.TestCase):

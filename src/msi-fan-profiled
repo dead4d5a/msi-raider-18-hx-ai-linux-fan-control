@@ -473,8 +473,15 @@ def publish_health(payload: dict[str, object]) -> None:
             stream.write("\n")
             stream.flush()
         os.replace(temporary, HEALTH)
-    finally:
-        pathlib.Path(temporary).unlink(missing_ok=True)
+    except BaseException:
+        # Keep the random per-call name a plain str. Python 3.12 pathlib interns
+        # every path component as an immortal string, so wrapping it in a Path
+        # leaked one string per one-second publication until the cgroup OOM.
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+        raise
 
 
 @dataclass
