@@ -389,6 +389,65 @@ class BatchedUnitStateTests(HardwareIsolatedTestCase):
             with self.assertRaises(MANAGER.subprocess.CalledProcessError):
                 MANAGER.unit_states(MANAGER.SERVICE)
 
+    def test_memory_is_read_in_the_same_query_but_remains_optional(self):
+        output = ('Id=msi-fan-profile.service\nActiveState=active\nSubState=running\n'
+                  'MainPID=17\nJob=\nUnitFileState=enabled\n')
+        with mock.patch.object(MANAGER, 'ctl', return_value=mock.Mock(stdout=output)) as ctl:
+            states = MANAGER.unit_states(MANAGER.SERVICE)
+        ctl.assert_called_once()
+        self.assertIn('--property=Id,ActiveState,SubState,MainPID,Job,UnitFileState,'
+                      'MemoryCurrent,MemoryPeak,MemorySwapCurrent', ctl.call_args.args)
+        self.assertEqual(states[MANAGER.SERVICE]['MainPID'], '17')
+        self.assertNotIn('MemoryCurrent', states[MANAGER.SERVICE])
+
+
+class ControllerMemoryTests(HardwareIsolatedTestCase):
+    @staticmethod
+    def units(primary_state, keeper_state, primary_memory=None, keeper_memory=None):
+        def unit(state, memory):
+            values = {'ActiveState': state, 'SubState': 'running' if state == 'active' else 'dead',
+                      'MainPID': '17' if state == 'active' else '0', 'Job': '',
+                      'UnitFileState': 'enabled'}
+            values.update(memory or {})
+            return values
+        return {MANAGER.SERVICE: unit(primary_state, primary_memory),
+                MANAGER.KEEPER: unit(keeper_state, keeper_memory)}
+
+    def test_reports_whichever_controller_unit_is_active(self):
+        memory = {'MemoryCurrent': '12234752', 'MemoryPeak': '13262848',
+                  'MemorySwapCurrent': '0'}
+        for primary, keeper, unit in (('active', 'inactive', MANAGER.SERVICE),
+                                      ('failed', 'active', MANAGER.KEEPER)):
+            with self.subTest(unit=unit):
+                units = self.units(primary, keeper,
+                                   memory if unit == MANAGER.SERVICE else None,
+                                   memory if unit == MANAGER.KEEPER else None)
+                self.assertEqual(MANAGER.controller_memory(units), {
+                    'unit': unit, 'memory_current_bytes': 12234752,
+                    'memory_peak_bytes': 13262848, 'memory_swap_current_bytes': 0})
+
+    def test_unavailable_or_absent_values_are_unknown_not_zero(self):
+        units = self.units('active', 'inactive', {
+            'MemoryCurrent': '[not set]', 'MemoryPeak': '', 'MemorySwapCurrent': '-1'})
+        self.assertEqual(MANAGER.controller_memory(units), {
+            'unit': MANAGER.SERVICE, 'memory_current_bytes': None,
+            'memory_peak_bytes': None, 'memory_swap_current_bytes': None})
+        self.assertIsNone(MANAGER.controller_memory(self.units('failed', 'inactive')))
+
+    def test_memory_growth_between_snapshots_is_reported_not_instability(self):
+        first, second = managed_snapshot(), managed_snapshot()
+        first['controller_memory'] = {'unit': MANAGER.SERVICE, 'memory_current_bytes': 1}
+        second['controller_memory'] = {'unit': MANAGER.SERVICE, 'memory_current_bytes': 2}
+        with mock.patch.object(MANAGER, 'full_status', side_effect=[first, second]), \
+                mock.patch.object(MANAGER, 'health_snapshot', return_value={
+                    'status': 'fresh', 'state': 'normal'}), \
+                mock.patch.object(MANAGER.time, 'sleep'), \
+                contextlib.redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(MANAGER.status(), 0)
+        report = json.loads(output.getvalue())
+        self.assertTrue(report['snapshot_stable'])
+        self.assertEqual(report['controller_memory']['memory_current_bytes'], 2)
+
 
 class StatusReadBudgetTests(HardwareIsolatedTestCase):
     def exercise_status(self, twice, snapshot_driver=False, snapshot_error=None):
@@ -419,15 +478,20 @@ class StatusReadBudgetTests(HardwareIsolatedTestCase):
                 return snapshot_error
             return values[path]
 
-        output = (
-            'Id=msi-fan-profile.service\nActiveState=active\nSubState=running\n'
-            'MainPID=17\nJob=\nUnitFileState=enabled\n\n'
-            'Id=msi-fan-profile-keeper.service\nActiveState=inactive\nSubState=dead\n'
-            'MainPID=0\nJob=\nUnitFileState=static\n')
+        shows = []
 
-        def fake_ctl(action, *_args, **_kwargs):
+        def fake_ctl(action, *args, **_kwargs):
             self.assertEqual(action, 'show', 'status issued an extra enablement command')
-            return mock.Mock(stdout=output)
+            shows.append(args)
+            # Live memory moves between the two snapshots; configuration does not.
+            return mock.Mock(stdout=(
+                'Id=msi-fan-profile.service\nActiveState=active\nSubState=running\n'
+                'MainPID=17\nJob=\nUnitFileState=enabled\n'
+                f'MemoryCurrent={12_230_656 + 4096 * len(shows)}\n'
+                'MemoryPeak=13262848\nMemorySwapCurrent=0\n\n'
+                'Id=msi-fan-profile-keeper.service\nActiveState=inactive\nSubState=dead\n'
+                'MainPID=0\nJob=\nUnitFileState=static\nMemoryCurrent=[not set]\n'
+                'MemoryPeak=[not set]\nMemorySwapCurrent=[not set]\n'))
 
         with mock.patch.object(MANAGER.pathlib.Path, 'exists', return_value=False), \
                 mock.patch.object(MANAGER.pathlib.Path, 'is_file', return_value=snapshot_driver), \
@@ -464,6 +528,9 @@ class StatusReadBudgetTests(HardwareIsolatedTestCase):
         self.assertEqual(reads[MANAGER.BASE / 'fan_curve'], 2)
         self.assertTrue(snapshot['snapshot_stable'])
         self.assertTrue(snapshot['configuration_valid'])
+        self.assertEqual(snapshot['controller_memory'], {
+            'unit': MANAGER.SERVICE, 'memory_current_bytes': 12_238_848,
+            'memory_peak_bytes': 13_262_848, 'memory_swap_current_bytes': 0})
 
     def test_new_abi_status_uses_one_snapshot_and_no_legacy_control_reads(self):
         reads, calls, snapshot = self.exercise_status(twice=False, snapshot_driver=True)
@@ -501,6 +568,35 @@ class StatusReadBudgetTests(HardwareIsolatedTestCase):
                 MANAGER.write(MANAGER.BASE / 'cooler_boost', 'on')
         self.assertEqual(identity.call_count, 2)
         open_file.assert_called_once()
+
+
+class MissingDriverStatusTests(HardwareIsolatedTestCase):
+    def test_status_names_the_kernel_instead_of_a_bare_errno(self):
+        kernel = '7.0.0-99-generic'
+        host = {
+            pathlib.Path('/sys/class/dmi/id/product_name'): 'Raider 18 HX AI A2XWIG',
+            pathlib.Path('/sys/class/dmi/id/board_name'): 'MS-1824',
+            pathlib.Path('/sys/class/dmi/id/bios_version'): 'E1824IMS.310',
+        }
+
+        def fake_read(path):
+            path = pathlib.Path(path)
+            if path.is_relative_to('/sys/module/msi_ec'):
+                raise FileNotFoundError(2, 'No such file or directory', str(path))
+            return host[path]
+
+        with mock.patch.object(MANAGER.sys, 'argv', ['msi-fan-profile', 'status']), \
+                mock.patch.object(MANAGER, 'read', side_effect=fake_read), \
+                mock.patch.object(MANAGER.pathlib.Path, 'exists', return_value=False), \
+                mock.patch.object(MANAGER.fan_control.os, 'uname',
+                                  return_value=types.SimpleNamespace(release=kernel)), \
+                contextlib.redirect_stdout(io.StringIO()) as stdout, \
+                contextlib.redirect_stderr(io.StringIO()) as stderr:
+            self.assertEqual(MANAGER.entrypoint(), 1)
+        self.assertEqual(stderr.getvalue(),
+                         f'ERROR: msi_ec driver not loaded for kernel {kernel}\n')
+        self.assertEqual(stdout.getvalue(), '')
+        # The suite guard fails cleanup if status reached systemctl.
 
 
 class ControllerHealthTests(HardwareIsolatedTestCase):

@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/python3 -I
 # SPDX-License-Identifier: GPL-3.0-or-later
 """Exact-command manager for the persistent MSI Candidate14 fan profile."""
 from __future__ import annotations
@@ -13,7 +13,7 @@ import stat
 import subprocess
 import sys
 import time
-from typing import TypedDict
+from typing import NotRequired, TypedDict
 
 
 # Repository commands use the sibling module. The installed manager lives in
@@ -40,6 +40,10 @@ FACTORY = '58 64 70 76 82 88 0 25 35 44 58 70 75 52 58 64 70 76 82 0 25 35 44 58
 DEFAULT = '50 60 70 76 82 88 20 30 40 50 60 80 110 38 40 42 44 55 70 20 30 40 60 70 100 120'
 COMMANDS = ('status', 'apply-default', 'factory-auto', 'boost-on', 'boost-release')
 UNIT_PROPERTIES = ('Id', 'ActiveState', 'SubState', 'MainPID', 'Job', 'UnitFileState')
+# Read in the same batched query; optional so an older systemd can still report.
+MEMORY_PROPERTIES = ('MemoryCurrent', 'MemoryPeak', 'MemorySwapCurrent')
+# Dynamic samples are reported but never part of the stable configuration check.
+DYNAMIC_STATUS_KEYS = ('controller_memory',)
 
 
 class ManagerError(RuntimeError):
@@ -53,6 +57,9 @@ class UnitState(TypedDict):
     MainPID: str
     Job: str
     UnitFileState: str
+    MemoryCurrent: NotRequired[str]
+    MemoryPeak: NotRequired[str]
+    MemorySwapCurrent: NotRequired[str]
 
 
 def read(path):
@@ -202,7 +209,7 @@ def clear_recovery_latch():
 def unit_states(*services) -> dict[str, UnitState]:
     """Query related service properties in one systemctl invocation."""
     result = ctl('show', *services,
-                 '--property=' + ','.join(UNIT_PROPERTIES), timeout=8)
+                 '--property=' + ','.join(UNIT_PROPERTIES + MEMORY_PROPERTIES), timeout=8)
     states = {}
     for block in result.stdout.strip().split('\n\n'):
         values = dict(line.split('=', 1) for line in block.splitlines() if '=' in line)
@@ -318,8 +325,33 @@ def disable_and_safe_factory():
             'unsafe override marker prevented verified boot block: ' + str(marker_error))
 
 
+def systemd_bytes(value):
+    """Parse a systemd byte count; '[not set]' or an absent property is unknown."""
+    return int(value) if value.isascii() and value.isdecimal() else None
+
+
+def controller_memory(units):
+    """Report the active controller cgroup's memory; diagnostic only, never policy."""
+    for service in (SERVICE, KEEPER):
+        state = units[service]
+        if state['ActiveState'] == 'active':
+            return {
+                'unit': service,
+                'memory_current_bytes': systemd_bytes(state.get('MemoryCurrent', '')),
+                'memory_peak_bytes': systemd_bytes(state.get('MemoryPeak', '')),
+                'memory_swap_current_bytes': systemd_bytes(
+                    state.get('MemorySwapCurrent', '')),
+            }
+    return None
+
+
+def stable_configuration(snapshot):
+    return {key: value for key, value in snapshot.items()
+            if key not in DYNAMIC_STATUS_KEYS}
+
+
 def full_status():
-    """Configuration snapshot only; live telemetry must not affect activation."""
+    """Configuration snapshot; live telemetry and memory never affect activation."""
     validated_identity = identity(monitoring=True)
     units = unit_states(SERVICE, KEEPER)
     primary, keeper = units[SERVICE], units[KEEPER]
@@ -355,6 +387,7 @@ def full_status():
         'ec_firmware': firmware,
         'driver_version': validated_identity[pathlib.Path('/sys/module/msi_ec/version')],
         'driver_srcversion': validated_identity[pathlib.Path('/sys/module/msi_ec/srcversion')],
+        'controller_memory': controller_memory(units),
     }
 
 
@@ -452,7 +485,7 @@ def status():
     first = full_status()
     time.sleep(.05)
     second = full_status()
-    stable = first == second
+    stable = stable_configuration(first) == stable_configuration(second)
     report = dict(second)
     report['snapshot_stable'] = stable
     default = managed_default(second)
@@ -627,9 +660,13 @@ def main():
     return 0
 
 
-if __name__ == '__main__':
+def entrypoint():
     try:
-        raise SystemExit(main())
+        return main()
     except (ManagerError, subprocess.SubprocessError, OSError, ValueError) as error:
         print(f'ERROR: {error}', file=sys.stderr)
-        raise SystemExit(1)
+        return 1
+
+
+if __name__ == '__main__':
+    raise SystemExit(entrypoint())

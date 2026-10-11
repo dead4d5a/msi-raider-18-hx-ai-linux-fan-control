@@ -2,6 +2,29 @@
 
 ## Unreleased
 
+- Stop skipping the controller silently when its driver is unusable: the
+  primary unit no longer has a `fan_curve` condition, so a missing, rejected or
+  unpinned `msi_ec` after a kernel update fails the unit visibly at identity
+  validation, before any EC write. The daemon, `ExecStopPost` and
+  `msi-fan-profile status` name the reason, for example
+  `msi_ec driver not loaded for kernel <release>`, instead of a generic identity
+  failure or a bare errno. The keeper keeps its condition, and the factory-auto
+  skip is unchanged.
+- Wait up to 10 s at startup, with watchdog heartbeats, for udev to register the
+  `msi_wmi_platform` and `coretemp` hwmon devices before the first EC write.
+  Exactly one of each is still required, the failure after the bound is
+  unchanged, and runtime monitoring never retries discovery.
+- Make the 64 MiB memory limit a hard bound with `MemorySwapMax=0` on both units,
+  and add `OOMScoreAdjust=-900` and `MemoryMin=32M`. `MemoryMin` is inert unless
+  `system.slice` also has a protection allocation. `msi-fan-profile status`
+  reports the active unit's current, peak and swap memory under a new
+  `controller_memory` key, outside the stable comparison and exit status.
+- Run the daemon, recovery helper, keeper and manager with
+  `#!/usr/bin/python3 -I`, so a `python3` earlier in `PATH`, `PYTHON*`
+  variables or user site packages cannot change their interpreter or imports.
+- Pin every safety-relevant directive of both units in tests, each exactly once,
+  with a deny-list for directives that would block EC writes, throttle the
+  watchdog-protected loop, or let a condition skip the primary silently.
 - Run release checks, including the unit-test suite, without root from install
   and upgrade: as the invoking sudo user, or as `nobody` on a private copy when
   no sudo user is known, with no supplementary groups and no new privileges.

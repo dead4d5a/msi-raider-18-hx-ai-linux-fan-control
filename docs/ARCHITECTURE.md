@@ -88,7 +88,9 @@ fault; if identity is unknown, it performs no model-specific write and reports
 that limitation.
 
 `Restart=no` makes the primary failure visible and avoids a loop repeatedly
-restarting the controller. Its `OnFailure` handoff starts a separate,
+restarting the controller. The primary has no driver-presence condition, so an
+unusable driver on a new kernel is a visible, write-free failure rather than a
+silent skip. Its `OnFailure` handoff starts a separate,
 watchdog-protected keeper only after the post-stop helper completes. That keeper
 holds the shared lock and continuously repairs Candidate 14/`advanced`/Boost
 drift without interpreting incomplete telemetry as permission to release Boost.

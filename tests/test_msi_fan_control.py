@@ -95,6 +95,45 @@ class ExactIdentityTests(unittest.TestCase):
                 with self.assertRaisesRegex(CONTROL.ControlABIError, 'identity mismatch'):
                     self.identity(values)
 
+    def test_absent_or_versionless_driver_names_the_running_kernel(self):
+        version = pathlib.Path('/sys/module/msi_ec/version')
+        for module_present, wanted in (
+                (False, 'msi_ec driver not loaded for kernel 7.0.0-99-generic$'),
+                (True, 'msi_ec driver loaded for kernel 7.0.0-99-generic is not the '
+                       'pinned 0.13.1 build')):
+            values = identity_values()
+            del values[version]
+
+            def read(path):
+                if path == version:
+                    raise FileNotFoundError(2, 'No such file or directory', str(path))
+                return values[path]
+
+            reader = mock.Mock(side_effect=read)
+            with self.subTest(module_present=module_present), \
+                    mock.patch.object(CONTROL.pathlib.Path, 'exists', autospec=True,
+                                      side_effect=lambda path: (
+                                          module_present and path == CONTROL.MODULE_PATH)), \
+                    mock.patch.object(CONTROL.os, 'uname', return_value=mock.Mock(
+                        release='7.0.0-99-generic')):
+                with self.assertRaisesRegex(CONTROL.ControlABIError, wanted):
+                    CONTROL.identity(reader, BASE)
+            self.assertNotIn(mock.call(CONTROL.SOURCE_PATH), reader.call_args_list)
+            self.assertNotIn(mock.call(BASE / 'fw_version'), reader.call_args_list)
+
+    def test_other_missing_identity_files_keep_their_original_error(self):
+        values = identity_values()
+        missing = pathlib.Path('/sys/class/dmi/id/bios_version')
+
+        def read(path):
+            if path == missing:
+                raise FileNotFoundError(2, 'No such file or directory', str(path))
+            return values[path]
+
+        with mock.patch.object(CONTROL.pathlib.Path, 'exists', return_value=False):
+            with self.assertRaises(FileNotFoundError):
+                CONTROL.identity(read, BASE)
+
     def test_loaded_ec_sys_is_rejected_before_reading_host_or_ec(self):
         read = mock.Mock()
         with mock.patch.object(CONTROL.pathlib.Path, 'exists', return_value=True):

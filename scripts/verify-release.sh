@@ -108,7 +108,22 @@ for setting in (
 ):
     assert setting in keeper, setting
 assert "[Install]" not in keeper
+# A condition skip never fails, so a missing driver must not skip the primary.
+fan_curve = "ConditionPathExists=/sys/devices/platform/msi-ec/fan_curve"
+assert fan_curve not in primary.splitlines()
+assert fan_curve in keeper.splitlines()
+for unit in (primary, keeper):
+    assert "ConditionPathExists=!/run/msi-fan-profile.factory-auto" in unit.splitlines()
+    for setting in ("MemoryMin=32M", "MemoryMax=64M", "MemorySwapMax=0",
+                    "OOMScoreAdjust=-900"):
+        assert setting in unit.splitlines(), setting
+    assert "MemoryHigh=" not in unit and "ProtectKernelTunables=" not in unit
 print("failure keeper unit: OK")
+
+for program in ("src/msi-fan-profile", "src/msi-fan-profiled", "src/msi-gpu-recover"):
+    shebang = Path(program).read_text(encoding="utf-8").splitlines()[0]
+    assert shebang == "#!/usr/bin/python3 -I", (program, shebang)
+print("pinned isolated interpreter: OK")
 PY
 
 sha256sum -c SHA256SUMS >/dev/null

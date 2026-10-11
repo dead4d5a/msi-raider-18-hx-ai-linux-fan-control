@@ -253,6 +253,53 @@ class FullCoolingRecoveryTests(HardwareIsolatedTestCase):
         self.assertEqual(calls, ["stage", "latch"])
 
 
+class MissingDriverRecoveryTests(HardwareIsolatedTestCase):
+    KERNEL = "7.0.0-99-generic"
+
+    def test_absent_driver_is_refused_by_name_without_any_write(self):
+        """ExecStopPost and the keeper explain the refusal instead of writing."""
+        host = {
+            "/sys/class/dmi/id/product_name": "Raider 18 HX AI A2XWIG",
+            "/sys/class/dmi/id/board_name": "MS-1824",
+            "/sys/class/dmi/id/bios_version": "E1824IMS.310",
+        }
+
+        def fake_read(path):
+            text = str(path)
+            if text.startswith("/sys/module/msi_ec/"):
+                raise FileNotFoundError(2, "No such file or directory", text)
+            return host[text]
+
+        for argv in (["msi-gpu-recover", "candidate14"],
+                     ["msi-gpu-recover", "--keeper", "candidate14"]):
+            stderr = io.StringIO()
+            with self.subTest(argv=argv), \
+                    mock.patch.object(RECOVER.sys, "argv", argv), \
+                    mock.patch.dict(RECOVER.os.environ, {
+                        "MSI_CALIBRATION_PROFILE": "candidate14",
+                        "SERVICE_RESULT": "exit-code", "EXIT_CODE": "exited",
+                        "EXIT_STATUS": "1"}), \
+                    mock.patch.object(RECOVER.os, "geteuid", return_value=0), \
+                    mock.patch.object(RECOVER.signal, "signal"), \
+                    mock.patch.object(RECOVER, "acquire_lock", return_value=9), \
+                    mock.patch.object(RECOVER.os, "close") as close, \
+                    mock.patch.object(RECOVER, "read", side_effect=fake_read), \
+                    mock.patch.object(pathlib.Path, "exists", return_value=False), \
+                    mock.patch.object(RECOVER.fan_control.os, "uname", return_value=
+                                      mock.Mock(release=self.KERNEL)), \
+                    mock.patch.object(RECOVER.sys, "stderr", stderr):
+                self.assertEqual(RECOVER.main(), 1)
+                close.assert_called_once_with(9)
+            output = stderr.getvalue()
+            self.assertIn("FATAL: exact recovery identity/ABI check failed: "
+                          f"msi_ec driver not loaded for kernel {self.KERNEL}; "
+                          "no curve write attempted", output)
+            self.assertNotIn("Traceback", output)
+            self.assertNotIn("Errno", output)
+        # The suite guard records any write, latch, hwmon or notify attempt.
+        self.assertEqual(self.unmocked_io, [])
+
+
 class FanResponseTests(HardwareIsolatedTestCase):
     def test_response_floor_is_distinct_from_invalid_and_low_rpm(self):
         cases = (

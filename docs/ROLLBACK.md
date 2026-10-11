@@ -39,6 +39,16 @@ msi-fan-profile status
 
 The manager/daemon deliberately refuse an unexpected driver identity.
 
+If the pinned driver did not load for the new kernel, for example after a DKMS
+build or signing failure or when the in-tree `msi_ec` rejects this EC firmware,
+`msi-fan-profile status` exits `1` with
+`ERROR: msi_ec driver not loaded for kernel <release>`.
+`msi-fan-profile.service` then appears in `systemctl --failed`, and its journal
+gives the same reason. Neither the controller nor its recovery helper writes to
+the EC in that state, the keeper is skipped, and the fans stay on the firmware's
+own automatic control. Repair the driver for that kernel or boot the previous
+kernel, then run `sudo msi-fan-profile apply-default`.
+
 ## Remove profile service only
 
 From the repository:

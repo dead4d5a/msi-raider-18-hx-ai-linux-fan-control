@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/python3 -I
 # SPDX-License-Identifier: GPL-3.0-or-later
 """Persistent exact-platform MSI EC fan profile with read-only runtime monitoring."""
 from __future__ import annotations
@@ -50,6 +50,9 @@ BOOST_LOW_EVIDENCE_SECONDS = 2.0
 BOOST_RESPONSE_RPM = 3000
 MAX_OBSERVATION_GAP_SECONDS = 2.0
 POLL_INTERVAL_SECONDS = 1.0
+# udev coldplug registers coretemp and msi_wmi_platform; TimeoutStartSec is 30s.
+HWMON_STARTUP_WAIT_SECONDS = 10.0
+HWMON_STARTUP_POLL_SECONDS = 0.5
 
 
 class ProfileError(RuntimeError):
@@ -107,6 +110,29 @@ def one_hwmon(name: str) -> pathlib.Path:
     return matches[0]
 
 
+def startup_hwmon(name: str, deadline: float,
+                  heartbeat: Callable[[str], None]) -> pathlib.Path:
+    """Give udev coldplug a bounded startup window to register one hwmon.
+
+    Exactly one match is still required. Runtime monitoring never retries
+    discovery, and after the deadline the last error fails startup as before.
+    """
+    waiting = False
+    while True:
+        try:
+            return one_hwmon(name)
+        except ProfileError as error:
+            if time.monotonic() >= deadline:
+                raise
+            if not waiting:
+                print(f"WARNING {error}; waiting up to "
+                      f"{HWMON_STARTUP_WAIT_SECONDS:.0f}s for registration",
+                      file=sys.stderr, flush=True)
+                waiting = True
+            heartbeat(f"Waiting for {name} hwmon registration: {error}")
+            time.sleep(HWMON_STARTUP_POLL_SECONDS)
+
+
 def notify(message: str) -> None:
     address = os.environ.get("NOTIFY_SOCKET")
     if not address:
@@ -119,17 +145,24 @@ def notify(message: str) -> None:
         sock.sendall(message.encode("utf-8"))
 
 
-def immutable_identity_valid() -> bool:
+def immutable_identity_error() -> str | None:
+    """Return why the exact immutable identity is invalid, or None if valid."""
     try:
         fan_control.identity(read, BASE)
-        return True
-    except (OSError, fan_control.ControlABIError):
-        return False
+    except (OSError, fan_control.ControlABIError) as error:
+        return str(error)
+    return None
+
+
+def immutable_identity_valid() -> bool:
+    return immutable_identity_error() is None
 
 
 def require_immutable_identity() -> None:
-    if not immutable_identity_valid():
-        raise ProfileError("immutable hardware/driver/EC identity validation failed")
+    error = immutable_identity_error()
+    if error is not None:
+        raise ProfileError(
+            f"immutable hardware/driver/EC identity validation failed: {error}")
 
 
 @dataclass(frozen=True)
@@ -686,8 +719,9 @@ def main() -> int:
 
     try:
         require_policy_identity()
-        wmi = one_hwmon("msi_wmi_platform")
-        core = one_hwmon("coretemp")
+        hwmon_deadline = time.monotonic() + HWMON_STARTUP_WAIT_SECONDS
+        wmi = startup_hwmon("msi_wmi_platform", hwmon_deadline, heartbeat)
+        core = startup_hwmon("coretemp", hwmon_deadline, heartbeat)
         recovery_latched = recovery_latch_present()
         existing_boost = read(BASE / "cooler_boost") == "on"
         initial_physical_verification = force_apply_default(

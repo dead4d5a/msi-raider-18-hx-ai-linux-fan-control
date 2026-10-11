@@ -7,6 +7,7 @@ less expensive checks or to an unvalidated module.
 """
 from __future__ import annotations
 
+import os
 import pathlib
 from dataclasses import dataclass
 from typing import Callable
@@ -15,11 +16,27 @@ LEGACY_SRCVERSION = "AB0BFAE2391B5ADD66E01BD"
 SNAPSHOT_SRCVERSION = "9086C45007CBB7FA1264430"
 SUPPORTED_SRCVERSIONS = (LEGACY_SRCVERSION, SNAPSHOT_SRCVERSION)
 FIRMWARE = "1824EMS1.108"
-SOURCE_PATH = pathlib.Path("/sys/module/msi_ec/srcversion")
+MODULE_PATH = pathlib.Path("/sys/module/msi_ec")
+VERSION_PATH = MODULE_PATH / "version"
+SOURCE_PATH = MODULE_PATH / "srcversion"
 
 
 class ControlABIError(RuntimeError):
     pass
+
+
+def missing_driver_error() -> ControlABIError:
+    """Name the running kernel when the pinned module exposes no version.
+
+    After a kernel update this is the usual sign of a failed DKMS build or
+    signature, or of an in-tree msi_ec that rejected this EC firmware.
+    """
+    release = os.uname().release
+    if MODULE_PATH.exists():
+        return ControlABIError(
+            f"msi_ec driver loaded for kernel {release} is not the pinned "
+            "0.13.1 build: it has no module version")
+    return ControlABIError(f"msi_ec driver not loaded for kernel {release}")
 
 
 def host_identity(read: Callable[[pathlib.Path], str],
@@ -31,11 +48,16 @@ def host_identity(read: Callable[[pathlib.Path], str],
         pathlib.Path("/sys/class/dmi/id/product_name"): "Raider 18 HX AI A2XWIG",
         pathlib.Path("/sys/class/dmi/id/board_name"): "MS-1824",
         pathlib.Path("/sys/class/dmi/id/bios_version"): "E1824IMS.310",
-        pathlib.Path("/sys/module/msi_ec/version"): "0.13.1",
+        VERSION_PATH: "0.13.1",
     }
     values = {}
     for path, wanted in expected.items():
-        actual = read(path)
+        try:
+            actual = read(path)
+        except FileNotFoundError as error:
+            if path != VERSION_PATH:
+                raise
+            raise missing_driver_error() from error
         if actual != wanted:
             raise ControlABIError(f"identity mismatch {path}={actual!r}")
         values[path] = actual

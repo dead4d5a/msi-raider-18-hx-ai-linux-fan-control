@@ -1173,6 +1173,164 @@ class RecoveryHandoffMainLoopTests(HardwareFreeMainLoopTests):
         self.assertEqual(state["boost"], "on")
 
 
+class StartupGuardMainTests(HardwareFreeMainLoopTests):
+    """Startup before READY: exact identity first, then bounded hwmon discovery."""
+
+    KERNEL = "7.0.0-99-generic"
+
+    def run_entrypoint(self, *, driver_loaded=True, hwmon=(), real_identity=True):
+        class Clock:
+            now = 0.0
+
+            def monotonic(self):
+                return self.now
+
+            def sleep(self, seconds):
+                sleeps.append(seconds)
+                self.now += seconds
+
+        class Lock:
+            @staticmethod
+            def stat():
+                return types.SimpleNamespace(
+                    st_mode=DAEMON.stat.S_IFREG | 0o600, st_uid=0, st_gid=0)
+
+        class MissingOverride:
+            @staticmethod
+            def lstat():
+                raise FileNotFoundError
+
+        clock = Clock()
+        sleeps = []
+        writes = []
+        notifications = []
+        host = {
+            "/proc/self/cgroup": "0::/system.slice/msi-fan-profile.service",
+            "/sys/class/dmi/id/product_name": "Raider 18 HX AI A2XWIG",
+            "/sys/class/dmi/id/board_name": "MS-1824",
+            "/sys/class/dmi/id/bios_version": "E1824IMS.310",
+            "/sys/module/msi_ec/version": "0.13.1",
+            "/sys/module/msi_ec/srcversion": DAEMON.fan_control.LEGACY_SRCVERSION,
+            "/fake/ec/fw_version": DAEMON.fan_control.FIRMWARE,
+            "/fake/ec/shift_mode": "comfort",
+            "/fake/ec/cooler_boost": "off",
+        }
+
+        def fake_read(path):
+            text = str(path)
+            if text == "/sys/module/msi_ec/version" and not driver_loaded:
+                raise FileNotFoundError(2, "No such file or directory", text)
+            return host[text]
+
+        def fake_apply(_wmi, _preserve_boost, _heartbeat):
+            # Stop after the startup transaction; the loop is covered elsewhere.
+            DAEMON.STOP = True
+            return True
+
+        original_stop = DAEMON.STOP
+        DAEMON.STOP = False
+        try:
+            with contextlib.ExitStack() as stack:
+                stack.enter_context(
+                    mock.patch.object(DAEMON, "BASE", pathlib.Path("/fake/ec")))
+                stack.enter_context(mock.patch.object(DAEMON, "LOCK", Lock()))
+                stack.enter_context(
+                    mock.patch.object(DAEMON, "OVERRIDE", MissingOverride()))
+                stack.enter_context(
+                    mock.patch.object(DAEMON, "read", side_effect=fake_read))
+                stack.enter_context(mock.patch.object(
+                    DAEMON, "write", side_effect=lambda path, value: writes.append(
+                        (path, value))))
+                stack.enter_context(mock.patch.object(
+                    DAEMON.pathlib.Path, "exists", return_value=False))
+                stack.enter_context(mock.patch.object(
+                    DAEMON.fan_control.os, "uname",
+                    return_value=types.SimpleNamespace(release=self.KERNEL)))
+                if not real_identity:
+                    stack.enter_context(mock.patch.object(DAEMON, "require_policy_identity"))
+                self.discovery = stack.enter_context(mock.patch.object(
+                    DAEMON, "one_hwmon", side_effect=hwmon))
+                self.apply = stack.enter_context(mock.patch.object(
+                    DAEMON, "force_apply_default", side_effect=fake_apply))
+                stack.enter_context(mock.patch.object(
+                    DAEMON, "recovery_latch_present", return_value=False))
+                stack.enter_context(mock.patch.object(
+                    DAEMON, "restore_factory_envelope", return_value=True))
+                stack.enter_context(mock.patch.object(
+                    DAEMON, "release_factory_if_cool", return_value=True))
+                stack.enter_context(mock.patch.object(
+                    DAEMON, "notify", side_effect=notifications.append))
+                stack.enter_context(mock.patch.object(DAEMON.signal, "signal"))
+                stack.enter_context(mock.patch.object(DAEMON.os, "geteuid", return_value=0))
+                stack.enter_context(mock.patch.object(DAEMON.os, "open", return_value=9))
+                stack.enter_context(mock.patch.object(DAEMON.os, "close"))
+                stack.enter_context(mock.patch.object(DAEMON.fcntl, "flock"))
+                stack.enter_context(mock.patch.object(
+                    DAEMON.time, "monotonic", side_effect=clock.monotonic))
+                stack.enter_context(mock.patch.object(
+                    DAEMON.time, "sleep", side_effect=clock.sleep))
+                stderr = io.StringIO()
+                with contextlib.redirect_stderr(stderr):
+                    result = DAEMON.entrypoint()
+        finally:
+            DAEMON.STOP = original_stop
+        return result, stderr.getvalue(), writes, notifications, sleeps
+
+    def test_missing_driver_fails_at_identity_with_no_ec_write(self):
+        result, stderr, writes, notifications, _ = self.run_entrypoint(
+            driver_loaded=False)
+        self.assertEqual(result, 1)
+        self.assertIn("ERROR ProfileError: immutable hardware/driver/EC identity "
+                      f"validation failed: msi_ec driver not loaded for kernel {self.KERNEL}",
+                      stderr)
+        self.assertNotIn("Errno", stderr)
+        self.assertEqual(writes, [])
+        self.assertEqual(notifications, [])
+        self.discovery.assert_not_called()
+        self.apply.assert_not_called()
+
+    def test_late_hwmon_registration_is_awaited_before_the_first_ec_write(self):
+        missing = DAEMON.ProfileError("expected one msi_wmi_platform hwmon; found 0")
+        result, stderr, writes, notifications, sleeps = self.run_entrypoint(
+            hwmon=(missing,) * 4 + (pathlib.Path("/fake/wmi"), pathlib.Path("/fake/core")),
+            real_identity=False)
+        self.assertEqual(result, 0)
+        self.assertEqual(sleeps, [DAEMON.HWMON_STARTUP_POLL_SECONDS] * 4)
+        self.assertEqual([call.args for call in self.discovery.call_args_list],
+                         [("msi_wmi_platform",)] * 5 + [("coretemp",)])
+        self.apply.assert_called_once()
+        self.assertEqual(self.apply.call_args.args[0], pathlib.Path("/fake/wmi"))
+        waiting = [item for item in notifications if "Waiting for msi_wmi_platform" in item]
+        self.assertEqual(len(waiting), 4)
+        self.assertTrue(all(item.startswith("WATCHDOG=1\n") for item in waiting))
+        self.assertEqual(stderr.count("waiting up to 10s for registration"), 1)
+        # The mocked clean stop is the only remaining writer; none ran early.
+        self.assertEqual(writes, [])
+
+    def test_hwmon_wait_is_bounded_and_then_fails_as_before(self):
+        missing = DAEMON.ProfileError("expected one coretemp hwmon; found 0")
+        result, stderr, writes, notifications, sleeps = self.run_entrypoint(
+            hwmon=(pathlib.Path("/fake/wmi"),) + (missing,) * 40, real_identity=False)
+        self.assertEqual(result, 1)
+        self.assertLessEqual(DAEMON.HWMON_STARTUP_WAIT_SECONDS, 10.0)
+        self.assertEqual(sum(sleeps), DAEMON.HWMON_STARTUP_WAIT_SECONDS)
+        self.assertEqual(self.discovery.call_count, 1 + 21)
+        self.assertTrue(stderr.endswith(
+            "ERROR ProfileError: expected one coretemp hwmon; found 0\n"))
+        self.assertFalse(any(item.startswith("READY=1") for item in notifications))
+        self.apply.assert_not_called()
+        self.assertEqual(writes, [])
+
+    def test_duplicate_hwmon_is_never_accepted_while_waiting(self):
+        duplicate = DAEMON.ProfileError("expected one msi_wmi_platform hwmon; found 2")
+        result, stderr, writes, _, _ = self.run_entrypoint(
+            hwmon=(duplicate,) * 21, real_identity=False)
+        self.assertEqual(result, 1)
+        self.assertIn("found 2", stderr)
+        self.apply.assert_not_called()
+        self.assertEqual(writes, [])
+
+
 class HealthPublicationTests(unittest.TestCase):
     def test_snapshot_is_atomic_json_without_leftover_temporary_files(self):
         with tempfile.TemporaryDirectory() as directory:

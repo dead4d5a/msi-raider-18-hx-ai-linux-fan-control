@@ -19,6 +19,18 @@ publishes `/run/msi-fan-profile.health.json` as `root:root:0644`; the manager ch
 ownership, mode, inode, schema, PID, and a five-second freshness limit. Dynamic
 telemetry is not included in the stable configuration comparison.
 
+`controller_memory` names the active unit (the controller or its keeper) and
+reports its cgroup's current, peak, and swap memory in bytes from the same
+batched `systemctl show` query. It is `null` when neither unit is active, and a
+value is `null` when systemd cannot report it. It is diagnostic only and never
+enters the stable comparison or the exit status. Both units have a hard
+`MemoryMax=64M` without swap, so a peak approaching 64 MiB foreshadows a
+memory-limit kill and keeper takeover.
+
+When the pinned driver is not loaded, status exits `1` with
+`ERROR: msi_ec driver not loaded for kernel <release>`. See the kernel update
+section of `ROLLBACK.md`.
+
 ## Optional timing diagnostics (testing only)
 
 Timing diagnostics are **off by default** in both services. Only

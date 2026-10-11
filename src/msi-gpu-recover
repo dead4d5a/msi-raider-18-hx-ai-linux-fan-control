@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/python3 -I
 # SPDX-License-Identifier: GPL-3.0-or-later
 """Root-owned ExecStopPost recovery for the exact MSI Candidate14 service."""
 from __future__ import annotations
@@ -74,13 +74,18 @@ def recovery_identity(*, monitoring: bool = False) -> dict[pathlib.Path, str]:
     return values
 
 
-def identity_safe_for_curve_write() -> bool:
+def recovery_identity_error() -> str | None:
+    """Return why exact recovery identity is unusable, or None if it is valid."""
     try:
         # Mutations never use monitoring's snapshot-based firmware shortcut.
         recovery_identity()
-        return True
-    except Exception:
-        return False
+    except Exception as error:
+        return str(error) or type(error).__name__
+    return None
+
+
+def identity_safe_for_curve_write() -> bool:
+    return recovery_identity_error() is None
 
 
 def one_hwmon(name: str) -> pathlib.Path:
@@ -597,9 +602,10 @@ def main() -> int:
     try:
         # No model-specific control operation is permitted before exact ABI and
         # immutable hardware identity validation.
-        if not identity_safe_for_curve_write():
-            print("FATAL: exact recovery identity/ABI check failed; no curve write "
-                  "attempted", file=sys.stderr)
+        identity_error = recovery_identity_error()
+        if identity_error is not None:
+            print(f"FATAL: exact recovery identity/ABI check failed: {identity_error}; "
+                  "no curve write attempted", file=sys.stderr)
             return 1
         if keeper_mode:
             return run_keeper(profile)

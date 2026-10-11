@@ -164,6 +164,37 @@ until telemetry is valid and cool continuously for 30 seconds. The keeper itself
 never releases Boost, and a marker that is absent, malformed, or unsafe is never
 treated as permission to release cooling.
 
+The primary unit has no driver-presence condition; only the operator's runtime
+`factory-auto` marker may skip it. A condition skip is not a failure and never
+starts the keeper, so a missing, rejected, or unpinned `msi_ec` after a kernel
+update instead fails the primary at identity validation, before any EC write,
+with a journal reason such as `msi_ec driver not loaded for kernel <release>`.
+`ExecStopPost` logs the same reason and writes nothing. The keeper keeps its
+`fan_curve` condition, so it is skipped when the driver interface is absent and
+refuses to write when an unpinned driver is present. The EC then stays on its
+own firmware fan control until the driver is repaired.
+
+At startup only, the daemon gives udev coldplug up to 10 seconds, polled every
+0.5 seconds with watchdog heartbeats, to register the `msi_wmi_platform` and
+`coretemp` hwmon devices before its first EC write. It still requires exactly
+one of each, fails as before after that bound, and never retries discovery
+during runtime monitoring.
+
+Both units have `MemoryMax=64M` with `MemorySwapMax=0`, so the memory limit is
+a hard, deterministic leak tripwire rather than a limit reached only after swap
+fills. Reaching it kills the controller like any other fault: recovery and the
+keeper take over cooling. `OOMScoreAdjust=-900` makes the kernel's global OOM
+killer prefer other processes, but deliberately does not exempt the controller
+from its own limit. `MemoryMin=32M` requests reclaim protection; cgroup v2
+honours it only when the ancestor `system.slice` also has a protection
+allocation, which a stock Ubuntu host does not set.
+
+The daemon, recovery helper, keeper, and manager start with
+`#!/usr/bin/python3 -I`: the distribution interpreter rather than the first
+`python3` in `PATH`, in isolated mode without `PYTHON*` environment variables,
+user site packages, or the script directory on the import path. Each program
+inserts its fixed helper directory explicitly.
+
 ## Cooler Boost overrides
 
 - Boost-on requires daemon acknowledgement and both fans above 3,000 RPM.

@@ -7,6 +7,12 @@ $ msi-fan-profile status
 {
   "cooler_boost": "off",
   "configuration_valid": true,
+  "controller_memory": {
+    "memory_current_bytes": 12234752,
+    "memory_peak_bytes": 13262848,
+    "memory_swap_current_bytes": 0,
+    "unit": "msi-fan-profile.service"
+  },
   "curve": "candidate14",
   "driver_srcversion": "AB0BFAE2391B5ADD66E01BD",
   "driver_version": "0.13.1",
@@ -30,6 +36,16 @@ $ msi-fan-profile status
 
 The PID naturally changes each boot. This excerpt omits the detailed health
 telemetry, per-channel errors, timestamps, latch ownership, and cooldown fields.
+
+## Driver not loaded after a kernel update
+
+```console
+$ msi-fan-profile status
+ERROR: msi_ec driver not loaded for kernel 7.0.0-99-generic
+```
+
+The controller unit is then failed rather than skipped, and it has written
+nothing to the EC; the fans remain under firmware control.
 
 ## Temporary maximum cooling
 
