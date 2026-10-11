@@ -28,8 +28,8 @@ enters the stable comparison or the exit status. Both units have a hard
 memory-limit kill and keeper takeover.
 
 When the pinned driver is not loaded, status exits `1` with
-`ERROR: msi_ec driver not loaded for kernel <release>`. See the kernel update
-section of `ROLLBACK.md`.
+`ERROR: msi_ec driver not loaded for kernel <release>`. See
+[Controller failed: driver not loaded](#controller-failed-driver-not-loaded).
 
 ## Kernel updates
 
@@ -40,13 +40,35 @@ check; it exits `0` only when that kernel will load the pinned, signed driver:
 /usr/local/libexec/msi-fan-kernel-readiness [KERNEL_RELEASE]
 ```
 
-Without an argument it checks the kernel `/boot/vmlinuz` points to. The kernel
-postinst hook `/etc/kernel/postinst.d/zz-msi-fan-profile-readiness` runs it for
-every installed kernel and logs the result with the `msi-fan-profile` tag
-(`journalctl -t msi-fan-profile`). A DKMS signing failure does not fail a kernel
-installation, so a `FAIL` here is often the only warning before the reboot. Do
-not reboot into a kernel that fails; the fans would stay on firmware control.
-The kernel update section of `ROLLBACK.md` explains each check and warning.
+Without an argument it checks the kernel `/boot/vmlinuz` points to. Run it as a
+normal user. The kernel postinst hook
+`/etc/kernel/postinst.d/zz-msi-fan-profile-readiness` runs it for every
+installed kernel and logs the result with the `msi-fan-profile` tag
+(`sudo journalctl -t msi-fan-profile`). A DKMS signing failure does not fail a
+kernel installation, so a `FAIL` here is often the only warning before the
+reboot. Do not reboot into a kernel that fails; the fans would stay on firmware
+control. The kernel update section of `ROLLBACK.md` explains each check and
+warning, and what to do before rebooting.
+
+## Boot window
+
+The controller starts after `systemd-modules-load` and after
+`systemd-tmpfiles-setup`, which recreates its root-only locks. Until the journal
+shows `Candidate14 applied`, the EC follows its firmware's own automatic curve.
+That is thermally safe, but this project does not monitor it. On a normal boot
+of the validation host the window is about 13 seconds.
+
+When `/tmp` is not a tmpfs, `systemd-tmpfiles-setup` empties it at every boot
+(Ubuntu's `D /tmp` rule), so large `/tmp` contents lengthen the window. On
+2026-10-11 that step took 78 seconds, and Candidate 14 was applied 85 seconds
+after boot. Keep large scratch data out of `/tmp`, or make `/tmp` a tmpfs; that
+is a host choice. To measure a boot:
+
+```bash
+systemd-analyze blame | head -n 5
+sudo journalctl -b -o short-monotonic -u msi-fan-profile.service --no-pager |
+  grep 'Candidate14 applied'
+```
 
 ## Optional timing diagnostics (testing only)
 
@@ -185,6 +207,21 @@ service with factory auto and Boost on.
 If the daemon notices the marker before the stop request arrives, it takes the
 same clean-stop path as for the stop request, not a fault exit.
 
+## Stopping or rebooting while hot
+
+A clean stop releases Cooler Boost only when it is cool. When a
+`systemctl stop` or a reboot catches the machine hot, the journal shows
+`ERROR ProfileError: factory restored; Boost release unsafe`, followed by
+`runtime recovery verified Candidate14/advanced with Cooler Boost on`. This is
+intended. While the system keeps running, the unit is failed, the keeper holds
+full cooling, and `status` exits `1`; run `sudo msi-fan-profile apply-default`
+once the machine is cool. At shutdown the keeper cannot start, and systemd logs
+`Failed to enqueue OnFailure= job`. The EC keeps full cooling until power-off,
+and the next boot applies Candidate 14 as usual. Inside `factory-auto` the
+result is the `factory staged with Boost on` state above. To get the
+`successful candidate14 service left thermally verified factory auto/off` line
+at a reboot, reboot when cool. See `SAFETY.md`.
+
 ## Logs
 
 ```bash
@@ -211,6 +248,68 @@ an automatic latch, not a manual override. Inspect both units before taking over
 ```bash
 sudo systemctl status msi-fan-profile.service msi-fan-profile-keeper.service
 ```
+
+## After a keeper takeover (for example a memory-limit kill)
+
+`status` exits `1` with an active keeper and `recovery_boost_latched` set: the
+keeper holds Candidate 14/`advanced` with Cooler Boost on and never releases it.
+Find out why the primary stopped:
+
+```bash
+msi-fan-profile status
+sudo systemctl status msi-fan-profile.service msi-fan-profile-keeper.service --no-pager
+sudo journalctl -u msi-fan-profile.service -u msi-fan-profile-keeper.service -b \
+  --no-pager | tail -n 40
+```
+
+`Failed with result 'oom-kill'` with a `64.0M memory peak` means the controller
+reached its own `MemoryMax=64M`. The 2026-09-30 build did so after about 6.8
+days because of a health-publication leak, which 6ed5498 fixes. Then, while the
+keeper keeps cooling:
+
+1. Reduce heavy workloads.
+2. Run `sudo msi-fan-profile apply-default`. It stops the keeper and starts the
+   daemon, which reapplies Candidate 14 and keeps the inherited Boost as an
+   automatic latch. Use it rather than `systemctl start`.
+3. Wait at least 30 seconds. Once telemetry has been valid and cool for 30
+   seconds, the journal shows
+   `automatic Cooler Boost released after 30-second cooldown`. While it is
+   still hot, `health.automatic_boost` stays `true`; wait instead of repeating
+   commands.
+4. Run `msi-fan-profile status` again. It should exit `0`, with the keeper
+   inactive, no recovery latch, and `cooler_boost` `off`.
+5. If the installed release leaks, install a fixed one in a cool window with the
+   guarded `sudo ./scripts/upgrade-profile.sh` (see `INSTALL.md`). Afterwards,
+   check `controller_memory.memory_peak_bytes` over several days; it should
+   stay far below 64 MiB.
+
+## Controller failed: driver not loaded
+
+After a kernel update, `msi-fan-profile.service` can appear in
+`systemctl --failed` with no keeper running. Diagnose it:
+
+```bash
+msi-fan-profile status
+sudo journalctl -u msi-fan-profile.service -b --no-pager | tail -n 20
+uname -r
+sudo dkms status -m msi_ec
+modinfo -n msi_ec
+/usr/local/libexec/msi-fan-kernel-readiness "$(uname -r)"
+sudo journalctl -k -b --no-pager | grep -Ei 'msi[-_]ec|lockdown'
+```
+
+`msi_ec driver not loaded for kernel <release>` means no `msi_ec` module is
+loaded. The usual causes are a failed DKMS build, a module signed with a key
+that is not enrolled (refused under lockdown), or an in-tree `msi_ec` that
+rejected this EC firmware.
+`msi_ec driver loaded for kernel <release> is not the pinned 0.13.1 build` means
+another `msi_ec`, usually the in-tree one, loaded instead. The readiness check
+names the failing step. Neither the controller nor its recovery helper has
+written to the EC, the keeper is skipped, and the fans are on the firmware's own
+automatic control. Repair the driver for that kernel in an attended session, or
+boot a kernel that passes the readiness check. Then run
+`sudo msi-fan-profile apply-default`. See the kernel update section of
+`ROLLBACK.md`.
 
 ## Degraded telemetry
 
@@ -252,8 +351,76 @@ CPU power policy is deliberately outside its scope.
 The same sustained state can result from a verified fan-stall alarm. Treat that
 as a hardware fault and inspect the fan path before relying on the system.
 
+## Shift mode drift
+
+The daemon, including a start by `apply-default`, and `preflight.sh` require
+`shift_mode` to be `comfort`. If it changes, the daemon fails with
+`EC shift mode is no longer comfort`, and the keeper holds full cooling; the
+keeper itself ignores the shift mode. **This project never writes
+`shift_mode` and has no command to restore it.** First find what changed it,
+such as another EC tool or a firmware update. Then, in an attended session
+while the machine is cool:
+
+```bash
+sudo msi-fan-profile factory-auto               # must end in factory auto/off
+cat /sys/devices/platform/msi-ec/shift_mode
+echo comfort | sudo tee /sys/devices/platform/msi-ec/shift_mode >/dev/null
+cat /sys/devices/platform/msi-ec/shift_mode     # must print comfort
+sudo msi-fan-profile apply-default
+msi-fan-profile status
+```
+
+`factory-auto` stops the daemon and keeper and blocks both from starting, so
+nothing else writes to the EC during the single manual write. If it reports
+`factory staged with Boost on`, wait until it is cool and rerun it first. Write
+only `comfort`, the validated value. If the write or its readback fails, stay in
+factory auto and investigate.
+
+## Suspend and hibernation
+
+On the validation host, `sleep.target`, `suspend.target`, `hibernate.target` and
+`hybrid-sleep.target` are masked. Secure Boot lockdown also disables hibernation
+there (`/sys/power/disk` reads `[disabled]`). A desktop idle-suspend request
+therefore fails. The daemon's resume path, a forced Candidate 14 reapply, is
+implemented and covered by mocked tests, but has not run in the field with the
+current code. Keep the targets masked until the attended suspend test in
+`VALIDATION.md` passes. Check them with:
+
+```bash
+systemctl is-enabled sleep.target suspend.target hibernate.target hybrid-sleep.target
+```
+
+## Idle fan speed and the NVIDIA driver
+
+The controller does not use the NVIDIA driver; it reads the GPU temperature from
+the EC. Without an NVIDIA module for the running kernel, the discrete GPU stays
+powered in D0 with no runtime power management. On the validation host
+(7.0.0-34, and 7.0.0-38 until its module was installed), the idle EC GPU
+temperature rose from about 33 °C to about 42–47 °C, and fan 2 ran at about
+3,600–4,200 RPM instead of about 1,450 RPM. That is Candidate 14 responding as
+designed, not a controller fault. Installing the matching NVIDIA packages is an
+operator choice outside this project, and the kernel readiness check does not
+cover it. To check a kernel before rebooting, and the bound driver after boot:
+
+```bash
+modinfo -k KERNEL_RELEASE -n nvidia
+lspci -k -d 10de:
+```
+
+## Superseded calibration tools
+
+A host used for calibration may still have tools from before this release, such
+as `/usr/local/bin/msi-fanctl`. The installer neither installs, records nor
+removes them. `msi-fanctl` writes `fan_mode` and Cooler Boost directly, accepts
+an unpatched driver build, and releases Boost at up to 95 °C, above this
+project's 85 °C gate. Its only coordination with the controller is
+`/run/msi-fanctl.lock`, so it can still run whenever the controller is stopped,
+failed or in factory override. Do not use it alongside this controller. Archive
+or remove it, and any other unrecorded EC writer, in an attended session.
+
 ## Direct sysfs writes
 
 Do not write the curve or fan mode manually during normal operation. Use the
 manager. The driver interface exists for transactional, exact-profile operations
-and recovery—not arbitrary experimentation.
+and recovery—not arbitrary experimentation. The attended `shift_mode` restore
+above is the only manual EC write these documents describe.

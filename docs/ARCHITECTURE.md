@@ -74,7 +74,14 @@ or observation gaps over two seconds reset cooldown progress.
 
 ## Recovery plane
 
-A clean stop restores factory `auto/off`. An explicit `factory-auto` request,
+A clean stop restores factory `auto/off` when it is cool enough to release
+Cooler Boost. When it is not, the daemon exits `1` with
+`factory restored; Boost release unsafe`, and the failed stop takes the
+runtime-fault path below. Recovery restores Candidate 14/`advanced` with Boost
+on and the recovery-Boost marker. While the system runs, the keeper then holds
+that state. At shutdown it cannot be started, and the state lasts until
+power-off; Boost does not survive the reboot. The full-cooling result is
+intended; `SAFETY.md` describes it. An explicit `factory-auto` request,
 a manager setup failure before a service start is attempted, and the attended
 installation/upgrade transition also deliberately use the factory
 configuration. Those are operator-directed state changes, not runtime-fault

@@ -48,7 +48,11 @@ firmware. Related model names alone are not sufficient evidence of compatibility
 - Reports fresh normal/cooling versus degraded/stale health, with per-channel
   telemetry, latch ownership, and cooldown progress; missing temperatures do not
   suppress monitoring of healthy fan channels.
-- Restores the captured factory curve and firmware `auto` mode on clean stop.
+- Restores the captured factory curve and firmware `auto` mode on clean stop,
+  releasing Cooler Boost only when cool. A stop while hot, including at
+  shutdown, instead exits as a failure, and recovery leaves Candidate 14 in
+  `advanced` mode with Cooler Boost on. This is intended; see
+  [Safety](docs/SAFETY.md#clean-stop-while-hot).
 - On a runtime fault with immutable identity still verified, retains Candidate 14
   in `advanced` mode and deliberately leaves Cooler Boost on; a separate,
   watchdog-protected failure keeper continues to reassert that state until an
@@ -138,12 +142,19 @@ Completed:
 - Acknowledged Cooler Boost and 30-second cool release
 - Idle, CPU-only, GPU-only, combined, and 180-second soak tests
 
+Field evidence (unattended, 2026-10-10/11): a memory-limit kill of the
+2026-09-30 build, since fixed, was taken over by the keeper and handed back by
+`apply-default` with a 30-second automatic release. A hot stop at shutdown ended
+in Candidate 14/`advanced` with Cooler Boost on, and the next kernel loaded the
+signed driver.
+
 Pending:
 
 - One final attended suspend/resume validation of forced profile reapplication
-  on the exact tested laptop. The daemon already implements and logs this path.
-- Attended EC-sentinel degraded-telemetry validation and a primary-fault keeper
-  handoff/restart validation.
+  on the exact tested laptop. The daemon already implements and logs this path;
+  suspend is masked on the validation host until then.
+- Attended EC-sentinel degraded-telemetry validation and an attended
+  primary-fault keeper handoff/restart validation.
 
 See [Validation status](docs/VALIDATION.md).
 Mocked policy/request/upgrade checks, isolated user-systemd lifecycle tests, and

@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- Document what a clean stop does while hot: the daemon exits `1` with
+  `factory restored; Boost release unsafe`, and recovery returns the EC to
+  Candidate 14/`advanced` with Cooler Boost on. Record the 2026-10-10/11 field
+  evidence: the OOM kill of the 2026-09-30 build, the unattended keeper
+  takeover and `apply-default` handoff, and the 7.0.0-34 to 7.0.0-38 reboot.
+  Add runbooks for a keeper takeover, a driver that did not load, `shift_mode`
+  drift, the boot window, and kernel, release and firmware updates.
 - Track automatic and manual Cooler Boost ownership independently, as
   `SAFETY.md` requires. A thermal alarm, invalid telemetry or an observation
   gap now sets the automatic latch even while manual Boost is on, and a

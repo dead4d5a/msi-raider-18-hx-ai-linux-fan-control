@@ -32,10 +32,50 @@
 - The new primary remained active with fresh normal health, no channel errors
   or restarts, advancing watchdog notifications, and persistent boot enablement.
   Both services had timing diagnostics disabled; health contained no timing field.
+  That build later leaked memory until its memory limit killed it; see the field
+  evidence below.
 - Real Boost-on acknowledgement verified both fans at 5,714 RPM, followed by an
   acknowledged release after 30 continuously cool seconds and return to normal
   health. This validates the deployed user-space path on the legacy driver, not
   the new snapshot driver, forced-fault recovery, or suspend/resume.
+
+## Field evidence on 2026-10-10 and 2026-10-11
+
+These are unattended production events on the signed legacy driver
+`AB0BFAE2391B5ADD66E01BD`, taken from the journal (America/Denver). They are
+field observations, not attended or injected-fault tests.
+
+- Memory-limit kill: the 2026-09-30 build's daemon, started at the 2026-10-03
+  boot, ran until 2026-10-10 11:30:34, six days and 20 hours, when
+  `MemoryMax=64M` killed it (`Failed with result 'oom-kill'`, 64.0M memory peak,
+  8.6M swap peak). Health publication leaked about 100 bytes per second;
+  6ed5498 fixes it.
+- Unattended keeper takeover: in the same second, `ExecStopPost`
+  (`service_result=oom-kill`) verified Candidate 14/`advanced` with Cooler Boost
+  on. The `OnFailure` keeper started, verified fan response at 3,076/3,720 RPM
+  against the 3,000 RPM floor, and held that state for about 24.5 hours without
+  a restart (10.8M memory peak, no swap).
+- Latch handoff: on 2026-10-11 at 12:03:41, `apply-default` stopped the keeper.
+  The daemon applied Candidate 14 with
+  `preserved_boost=True recovery_latch=True` and released the inherited Boost as
+  an automatic latch at 12:04:12, after its 30-second cooldown.
+- A cool guarded upgrade deployed 6ed5498 at 12:06. The stop logged
+  `successful candidate14 service left thermally verified factory auto/off`, and
+  Candidate 14 was applied again at 12:06:17. A multi-day run of the fix is
+  still pending.
+- Reboot from 7.0.0-34 to 7.0.0-38: at the 12:43:36 shutdown the machine was too
+  hot to release Boost. The daemon restored factory auto with Boost on and
+  exited `1` with `factory restored; Boost release unsafe`; `ExecStopPost` then
+  verified Candidate 14/`advanced` with Boost on. systemd could not enqueue the
+  `OnFailure` keeper during shutdown and logged that. This is the intended hot
+  stop described in `SAFETY.md`. On 7.0.0-38 the signed DKMS driver loaded at
+  3.5 s, but `systemd-tmpfiles-setup` finished only at 84.0 s, so Candidate 14
+  was applied at 85.6 s, with `preserved_boost=False recovery_latch=False`:
+  Boost did not survive the reboot. The EC ran its firmware auto curve until
+  then.
+- A cool reboot on 7.0.0-38 at 14:40 left verified factory auto/off. On the next
+  boot `systemd-tmpfiles-setup` finished at 8.8 s and Candidate 14 was applied
+  at 13.4 s.
 
 ## Automated validation on 2026-09-30
 
@@ -81,15 +121,24 @@ thermal compatibility on another kernel.
 ## Pending
 
 - Final attended suspend/resume test confirming the daemon logs a resume event,
-  forcibly reprograms Candidate 14, and preserves watchdog service health.
+  forcibly reprograms Candidate 14, and preserves watchdog service health. The
+  validation host has `sleep`, `suspend`, `hibernate` and `hybrid-sleep` targets
+  masked since 2026-09-29, and Secure Boot lockdown disables hibernation there,
+  so the current code's resume path has not run in the field.
 - Attended EC telemetry-sentinel test confirming degraded mode remains active,
   Boost stays latched, and valid telemetry resumes the physical-verification
   path without a primary-service failure.
 - Attended primary-service fault test confirming the failure keeper reasserts
-  Candidate 14/`advanced`/Boost and yields cleanly to `apply-default`.
-- Extended attended validation of the deployed 2026-09-30 user-space release,
-  including the fault, resume, and sustained-load cases above. Successful guarded
-  deployment and Boost/cooldown checks do not replace those hardware tests.
+  Candidate 14/`advanced`/Boost and yields cleanly to `apply-default`. The
+  unattended memory-limit kill above exercised this path in the field; it does
+  not replace an attended, injected fault.
+- Extended attended validation of the deployed 2026-10-11 user-space release
+  (6ed5498), including a multi-day run with `controller_memory` checks and the
+  fault, resume, and sustained-load cases above. Successful guarded deployment
+  and Boost/cooldown checks do not replace those hardware tests.
+- Guarded deployment and attended validation of the unreleased changes in
+  `CHANGELOG.md`, including a visible driver-loss failure after a kernel update
+  and the kernel readiness hook on a real kernel installation.
 - Signing/staging/deployment and attended validation of the new snapshot driver
   `9086C45007CBB7FA1264430`. The currently loaded legacy module remains unchanged.
 - Matched post-deployment performance timings with diagnostics temporarily on,
@@ -104,7 +153,7 @@ thermal compatibility on another kernel.
 The implementation already uses a suspend-time discontinuity between
 `CLOCK_BOOTTIME` and monotonic time and forces a full safe reapply. Until the
 attended result is recorded, suspend/resume should be treated as implemented but
-not finally validated.
+not finally validated. Keep suspend masked on such a host until it is.
 
 ## Not claimed
 
@@ -112,7 +161,8 @@ not finally validated.
 - Other EC firmware versions
 - RTX 5090 A2XWJG behavior
 - Other MS-1824 marketing variants
-- Other Ubuntu/kernel releases
+- Other Ubuntu/kernel releases, including an upgrade to Ubuntu 26.04; field
+  operation on 7.0.0-34 and 7.0.0-38 is not attended validation
 - Hibernation behavior
 - Hard CPU temperature enforcement below 90°C
 - Generic fan-curve editing

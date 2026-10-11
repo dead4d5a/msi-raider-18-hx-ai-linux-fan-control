@@ -227,14 +227,43 @@ inserts its fixed helper directory explicitly.
 Explicit `factory-auto`, a clean service stop, manager setup errors before a
 service start is attempted, and installation or upgrade staging remain
 intentional factory `auto/off` transitions. They are not used as a response to
-a runtime fault.
+a runtime fault. Each switches Boost off only when it is cool.
+
+## Clean stop while hot
+
+A clean stop is a `systemctl stop`, a shutdown or reboot, or the stop inside
+`factory-auto` or an upgrade. The daemon first restores the factory curve and
+`auto` mode with Cooler Boost on. It then releases Boost only when the CPU
+package and EC CPU are below 85 °C and the EC GPU is below 70 °C. When it is
+hotter, the stop deliberately ends in full cooling instead:
+
+1. The daemon exits `1` with `factory restored; Boost release unsafe`, so
+   systemd records a failed stop.
+2. `ExecStopPost` treats it like a runtime fault. It re-stages and verifies
+   Candidate 14/`advanced` with Boost on and records the recovery-Boost marker.
+3. While the system is running, `OnFailure` starts the keeper, which holds that
+   state, and `status` exits `1`. When the machine is cool, `apply-default`
+   hands over to the daemon, which releases Boost after 30 continuously valid,
+   cool seconds. Within `factory-auto`, the factory marker skips the keeper. The
+   manager then restores the factory curve with Boost on and reports
+   `factory staged with Boost on`.
+4. During a shutdown, systemd cannot enqueue the keeper and logs that
+   `OnFailure=` job as failed. The EC keeps Candidate 14/`advanced` with Boost
+   on until power-off. Boost does not survive the reboot, the `/run` marker is
+   gone, and the next boot applies Candidate 14 as usual.
+
+This is the intended, safe direction: a stop never leaves a hot machine on the
+quieter factory curve with Boost released. The failed unit after a hot stop is
+not a fault to repair. Let the machine cool, then run `apply-default`.
 
 ## Suspend/resume
 
 The daemon compares `CLOCK_BOOTTIME` and monotonic time. A suspend gap triggers a
 forced reprogramming of Candidate 14 under the same auto/Boost envelope. This
 path is implemented; final attended suspend validation is still marked pending
-in `VALIDATION.md` until completed.
+in `VALIDATION.md` until completed. The validation host keeps its sleep targets
+masked until then, and Secure Boot lockdown disables hibernation, so this path
+does not run there.
 
 ## What this cannot guarantee
 

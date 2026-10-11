@@ -28,6 +28,12 @@ These are two explicitly validated builds, not a wildcard source-version check.
 The snapshot build requires its read-only interface and never silently falls
 back. See the staged driver-transition notes in [DRIVER_INSTALL.md](DRIVER_INSTALL.md).
 
+The deployed legacy build's patch is kept as
+`patches/msi-ec-0.13.1-legacy-fan-curve.patch`, only to restore a lost legacy
+source tree. If `sudo dkms status -m msi_ec` lists any version other than
+`0.13.1`, read
+[Stale DKMS registrations](DRIVER_INSTALL.md#stale-dkms-registrations).
+
 ## Install
 
 ```bash
@@ -117,10 +123,12 @@ write fan speeds.
 
 ## Reboot validation
 
-Reboot once:
+Check the next boot kernel with the read-only readiness check; it must end with
+`KERNEL READINESS PASSED`. Then reboot once, preferably while cool (see
+[Rollback](ROLLBACK.md#before-a-kernel-update-or-reboot)):
 
 ```bash
-sudo reboot
+/usr/local/libexec/msi-fan-kernel-readiness && sudo reboot
 ```
 
 After boot:
@@ -152,6 +160,8 @@ Do not run this service concurrently with:
 - fancontrol/other EC writers
 - `ec_sys` with write support
 - `msi_ec debug=1`
+- calibration-era tools such as `/usr/local/bin/msi-fanctl`; see the superseded
+  tools section of [Operations](OPERATIONS.md#superseded-calibration-tools)
 
 The daemon and manager hold a shared root-only lock, but unrelated software does
 not know about that lock.

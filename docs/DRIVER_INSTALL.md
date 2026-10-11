@@ -42,8 +42,15 @@ installation. Verify it without installing anything:
 ./scripts/verify-driver-build.sh /path/to/pinned-msi-ec-checkout "$(uname -r)" legacy
 ```
 
-Before rebooting into any new kernel, run the readiness check described in
-[Rollback](ROLLBACK.md#kernel-updates).
+Before rebooting into any new kernel, run the read-only readiness check
+`/usr/local/libexec/msi-fan-kernel-readiness` (from a checkout,
+`./scripts/check-kernel-readiness.sh`), described in
+[Rollback](ROLLBACK.md#kernel-updates). The profile installer also adds a kernel
+postinst hook that runs it for every installed kernel.
+
+If `sudo dkms status -m msi_ec` lists any version other than `0.13.1`, see
+[Stale DKMS registrations](#stale-dkms-registrations) before changing the
+`0.13.1` registration.
 
 > [!CAUTION]
 > Stop if any identity differs. Never use the driver's `firmware=` override,
@@ -369,3 +376,33 @@ module_blacklist=msi_ec modprobe.blacklist=msi_ec
 
 Then remove the loader and exact DKMS registration. Do not manually load the
 blacklisted module during that recovery boot.
+
+## Stale DKMS registrations
+
+An older `msi_ec` registration can remain from earlier experiments, such as an
+unpatched upstream `msi_ec/0.13` with `AUTOINSTALL` set. DKMS builds only the
+newest registered version for a new kernel, so it is harmless while `0.13.1`
+stays registered. During any window in which `0.13.1` is unregistered, a new
+kernel would get that unpatched driver instead. The kernel readiness check
+reports such a registration as a `WARN dkms_registration` line.
+
+Removing it is an attended, **operator-run** step; no script in this repository
+does it. First confirm that the stale version is installed for no kernel:
+
+```bash
+sudo dkms status -m msi_ec
+```
+
+Continue only if the stale version shows `added` or `built`, never `installed`,
+for every kernel. Then remove that exact version, and only that version:
+
+```bash
+# Operator-run, attended. Names the stale version explicitly; never 0.13.1.
+sudo dkms remove -m msi_ec -v 0.13 --all
+sudo dkms status -m msi_ec
+```
+
+Afterwards only `msi_ec/0.13.1` may remain, and the readiness check no longer
+warns. Archive its `/usr/src/msi_ec-0.13` source only after a successful
+removal. Never run `dkms remove` without `-v`, or with `-v 0.13.1` outside the
+documented driver removal.

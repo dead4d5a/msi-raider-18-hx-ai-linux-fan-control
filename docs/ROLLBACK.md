@@ -3,7 +3,10 @@
 ## Before BIOS or EC firmware updates
 
 Do not leave a model-specific custom curve active across an unvalidated firmware
-update.
+update. A System Firmware update offered by the Ubuntu Firmware Updater, GNOME
+Software or `fwupdmgr` is a BIOS/EC update too. Do not accept it from a
+notification; follow this procedure first. Blocking that device in fwupd is an
+operator choice.
 
 ```bash
 sudo msi-fan-profile factory-auto
@@ -24,6 +27,54 @@ cat /sys/devices/platform/msi-ec/fw_version
 
 If BIOS or EC differs from the exact tested values, do not modify the checks or
 force the old `firmware=` table. Wait for explicit validation/support.
+
+## Before an Ubuntu release upgrade
+
+Defer release upgrades, such as the offered upgrade to Ubuntu 26.04. Only Ubuntu
+24.04 with Python 3.12, systemd 255 and DKMS 3.0.11 is validated. A release
+upgrade replaces all of them and the kernel series in one step. Nothing in the
+installed controller checks the Ubuntu, Python or systemd version. Declining
+the prompt, or setting `Prompt=never` in `/etc/update-manager/release-upgrades`,
+is an operator choice.
+
+If you upgrade anyway, first switch the controller off while cool, as for a
+BIOS update:
+
+```bash
+sudo msi-fan-profile factory-auto
+sudo systemctl disable msi-fan-profile.service
+```
+
+Afterwards, keep it disabled until all of these pass on the new release:
+
+```bash
+. /etc/os-release && echo "$VERSION_ID"
+python3 --version
+systemctl --version | head -n 1
+dkms --version
+/usr/local/libexec/msi-fan-kernel-readiness
+./scripts/preflight.sh            # from a checkout
+./scripts/verify-release.sh       # from a checkout, as a normal user
+```
+
+Treat any version that differs from the validated one as unsupported. Run
+`sudo msi-fan-profile apply-default` only after an attended review, and record
+the result in `VALIDATION.md`.
+
+## Before a kernel update or reboot
+
+1. Run `/usr/local/libexec/msi-fan-kernel-readiness` as a normal user; it
+   checks the kernel `/boot/vmlinuz` points to. Do not reboot while it reports a
+   `FAIL`. After an unattended kernel installation, also read
+   `sudo journalctl -t msi-fan-profile --no-pager`.
+2. Reboot when cool. A hot shutdown logs
+   `factory restored; Boost release unsafe` and ends in Candidate
+   14/`advanced` with Cooler Boost on, instead of
+   `successful candidate14 service left thermally verified factory auto/off`.
+   That is the safe, intended variant (see `SAFETY.md`), and the next boot
+   starts normally.
+3. After boot, confirm the driver as described below and run
+   `msi-fan-profile status`.
 
 ## Kernel updates
 
@@ -62,7 +113,8 @@ need `sudo`, and only when they report that they cannot read their inputs.
   so it is harmless while `0.13.1` stays registered, but any window in which
   `0.13.1` is unregistered would let it build an unpatched driver for a new
   kernel. Remove such a registration in an attended session, after confirming
-  it is installed for no kernel (`dkms status -m msi_ec`);
+  it is installed for no kernel (`dkms status -m msi_ec`), as described under
+  [Stale DKMS registrations](DRIVER_INSTALL.md#stale-dkms-registrations);
 - another installed kernel with no `msi_ec/0.13.1` build. Booting it from the
   GRUB advanced menu leaves the fans on firmware control. Prefer a fallback
   kernel the check passes for, or build the module for it in an attended
@@ -76,7 +128,7 @@ and also printed as a warning in the package manager's output. The hook always
 exits `0` and can never fail a kernel installation. Read its result with:
 
 ```bash
-journalctl -t msi-fan-profile --no-pager
+sudo journalctl -t msi-fan-profile --no-pager
 ```
 
 If header packages were configured after the kernel image, DKMS may build the
@@ -105,6 +157,26 @@ gives the same reason. Neither the controller nor its recovery helper writes to
 the EC in that state, the keeper is skipped, and the fans stay on the firmware's
 own automatic control. Repair the driver for that kernel or boot the previous
 kernel, then run `sudo msi-fan-profile apply-default`.
+
+## If a profile upgrade stopped while hot
+
+When `upgrade-profile.sh` reports that the existing manager did not reach
+verified factory `auto/off`, it replaced nothing. Usually the machine was too
+hot to release Cooler Boost: the EC is on the factory curve in `auto` mode with
+Boost on, and the controller is stopped by the runtime factory override. To get
+out of that state:
+
+```bash
+sudo msi-fan-profile apply-default     # resume Candidate 14
+msi-fan-profile status                 # wait until it exits 0, Boost off
+sudo ./scripts/upgrade-profile.sh      # rerun once the machine is cool
+```
+
+`apply-default` keeps a retained recovery-Boost marker as an automatic latch
+that releases after 30 continuously valid, cool seconds. Managers older than
+this release also disable the service on that failure; `apply-default`
+re-enables it. If `apply-default` fails as well, the cause is not heat: inspect
+both units and the journal before doing anything else.
 
 ## Remove profile service only
 
