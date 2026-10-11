@@ -29,6 +29,8 @@ source_files=(
   "$repo/src/msi-fan-profiled"
   "$repo/src/msi-gpu-recover"
   "$repo/src/msi_fan_control.py"
+  "$repo/scripts/check-kernel-readiness.sh"
+  "$repo/kernel/postinst.d/zz-msi-fan-profile-readiness"
   "$repo/systemd/msi-fan-profile.service"
   "$repo/systemd/msi-fan-profile-keeper.service"
   "$repo/tmpfiles/msi-fan-profile.conf"
@@ -41,6 +43,8 @@ target_files=(
   /usr/local/libexec/msi-fan-profiled
   /usr/local/libexec/msi-gpu-recover
   /usr/local/libexec/msi_fan_control.py
+  /usr/local/libexec/msi-fan-kernel-readiness
+  /etc/kernel/postinst.d/zz-msi-fan-profile-readiness
   /etc/systemd/system/msi-fan-profile.service
   /etc/systemd/system/msi-fan-profile-keeper.service
   /etc/tmpfiles.d/msi-fan-profile.conf
@@ -48,8 +52,8 @@ target_files=(
   /usr/local/share/doc/msi-fan-profile/OPERATIONS.md
   /usr/local/share/doc/msi-fan-profile/SAFETY.md
 )
-modes=(0755 0755 0755 0644 0644 0644 0644 0644 0644 0644)
-must_exist=(yes yes yes no yes no yes no no no)
+modes=(0755 0755 0755 0644 0755 0755 0644 0644 0644 0644 0644 0644)
+must_exist=(yes yes yes no no no yes no yes no no no)
 record_target=/usr/local/share/doc/msi-fan-profile/INSTALL_RECORD
 
 for index in "${!source_files[@]}"; do
@@ -140,8 +144,9 @@ for target in "${target_files[@]}" "$record_target"; do
   fi
 done
 
-# Replace all executable, unit, tmpfiles, and documentation artifacts from the
-# verified stage while the controller is disabled and factory-safe.
+# Replace all executable, kernel hook, unit, tmpfiles, and documentation
+# artifacts from the verified stage while the controller is disabled and
+# factory-safe.
 for index in "${!target_files[@]}"; do
   target=${target_files[$index]}
   install -D -o root -g root -m "${modes[$index]}" "$stage$target" "$target"

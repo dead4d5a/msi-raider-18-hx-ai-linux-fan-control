@@ -21,9 +21,10 @@ PYTHONPYCACHEPREFIX="$verify_cache" python3 -m py_compile \
     src/msi-fan-profile src/msi-fan-profiled src/msi-gpu-recover src/msi_fan_control.py
 PYTHONDONTWRITEBYTECODE=1 PYTHONPYCACHEPREFIX="$verify_cache" \
     python3 -m unittest discover -s tests -p 'test_*.py'
-bash -n scripts/*.sh
+kernel_hook=kernel/postinst.d/zz-msi-fan-profile-readiness
+bash -n scripts/*.sh "$kernel_hook"
 if command -v shellcheck >/dev/null; then
-    shellcheck scripts/*.sh
+    shellcheck scripts/*.sh "$kernel_hook"
 fi
 python3 -m json.tool data/results.json >/dev/null
 
@@ -96,6 +97,10 @@ for filename in ("scripts/preflight.sh", "scripts/uninstall-profile.sh"):
     assert "fan_control_snapshot" in script, filename
 driver_build = Path("scripts/verify-driver-build.sh").read_text()
 assert all(source in driver_build for source in builds.values())
+# The readiness check imports the pins from the shared helper; never a copy.
+readiness = Path("scripts/check-kernel-readiness.sh").read_text()
+assert not any(source in readiness for source in builds.values())
+assert "SUPPORTED_SRCVERSIONS" in readiness
 print("exact driver ABI pins: OK")
 PY
 

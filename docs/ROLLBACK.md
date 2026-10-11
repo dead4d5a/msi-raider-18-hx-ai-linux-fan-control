@@ -24,8 +24,62 @@ force the old `firmware=` table. Wait for explicit validation/support.
 
 ## Kernel updates
 
-DKMS attempts to rebuild for new kernels; success is not guaranteed. Before
-relying on the service after a new kernel boots:
+DKMS attempts to rebuild for new kernels; success is not guaranteed. A build
+failure fails the kernel package's configuration, which leaves the previous
+kernel as the boot default. A signing failure does not: DKMS 3.0.11 only prints
+that the module will not be signed and still reports it `installed`, and if
+`/var/lib/shim-signed/mok/MOK.priv` or `MOK.der` is missing it silently signs
+with a newly generated key that is not enrolled. The new kernel then becomes
+the boot default, and Secure Boot lockdown refuses the module at the next boot.
+
+Check the next boot kernel **before every reboot**, as a normal user:
+
+```bash
+/usr/local/libexec/msi-fan-kernel-readiness             # /boot/vmlinuz target
+/usr/local/libexec/msi-fan-kernel-readiness 7.0.0-38-generic
+```
+
+From a checkout, `./scripts/check-kernel-readiness.sh` is the same check. It is
+read-only and exits `0` only without a `FAIL` line. It checks that
+`msi_ec/0.13.1` is DKMS-installed for that kernel, that `modinfo` resolves
+`msi_ec` to that build under `updates/dkms` with exactly one `modules.dep`
+entry, version `0.13.1`, a source version pinned in `msi_fan_control.py`, and a
+matching `vermagic`. It also checks that the module is signed by the
+`MOK.der` certificate (its `sig_key` equals the certificate serial) and that
+`mokutil` reports that certificate as enrolled, that `msi_wmi_platform` and
+`coretemp` exist, and that no `modprobe.d` entry blacklists, replaces or adds
+options to those modules or to `ec_sys`. With Secure Boot disabled, signing
+problems are reported as `WARN`. Only the certificate and enrollment checks can
+need `sudo`, and only when they report that they cannot read their inputs.
+
+`WARN` lines do not fail the check:
+
+- another registered `msi_ec` DKMS version with `AUTOINSTALL` set, such as an
+  old unpatched `msi_ec/0.13`. DKMS builds only the newest registered version,
+  so it is harmless while `0.13.1` stays registered, but any window in which
+  `0.13.1` is unregistered would let it build an unpatched driver for a new
+  kernel. Remove such a registration in an attended session, after confirming
+  it is installed for no kernel (`dkms status -m msi_ec`);
+- another installed kernel with no `msi_ec/0.13.1` build. Booting it from the
+  GRUB advanced menu leaves the fans on firmware control. Prefer a fallback
+  kernel the check passes for, or build the module for it in an attended
+  session (`sudo dkms install -m msi_ec -v 0.13.1 -k <release>`).
+
+The installer also adds `/etc/kernel/postinst.d/zz-msi-fan-profile-readiness`.
+After the `dkms` hook, it runs the same check for every kernel the package
+manager installs, including unattended upgrades, and logs each line to the
+journal under the `msi-fan-profile` tag; a failure is logged at `err` priority
+and also printed as a warning in the package manager's output. The hook always
+exits `0` and can never fail a kernel installation. Read its result with:
+
+```bash
+journalctl -t msi-fan-profile --no-pager
+```
+
+If header packages were configured after the kernel image, DKMS may build the
+module after the hook ran; run the check again by hand before rebooting.
+
+After a new kernel boots, confirm the loaded driver:
 
 ```bash
 KVER=$(uname -r)

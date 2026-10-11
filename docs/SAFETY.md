@@ -172,7 +172,11 @@ with a journal reason such as `msi_ec driver not loaded for kernel <release>`.
 `ExecStopPost` logs the same reason and writes nothing. The keeper keeps its
 `fan_curve` condition, so it is skipped when the driver interface is absent and
 refuses to write when an unpinned driver is present. The EC then stays on its
-own firmware fan control until the driver is repaired.
+own firmware fan control until the driver is repaired. To catch this before a
+reboot, a read-only kernel readiness check, also run by a kernel postinst hook
+that can never fail a kernel installation, reports whether the next kernel has
+the pinned, MOK-signed DKMS build (see the kernel update section of
+`ROLLBACK.md`).
 
 At startup only, the daemon gives udev coldplug up to 10 seconds, polled every
 0.5 seconds with watchdog heartbeats, to register the `msi_wmi_platform` and

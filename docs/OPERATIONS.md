@@ -31,6 +31,23 @@ When the pinned driver is not loaded, status exits `1` with
 `ERROR: msi_ec driver not loaded for kernel <release>`. See the kernel update
 section of `ROLLBACK.md`.
 
+## Kernel updates
+
+Before rebooting into a newly installed kernel, run the read-only readiness
+check; it exits `0` only when that kernel will load the pinned, signed driver:
+
+```bash
+/usr/local/libexec/msi-fan-kernel-readiness [KERNEL_RELEASE]
+```
+
+Without an argument it checks the kernel `/boot/vmlinuz` points to. The kernel
+postinst hook `/etc/kernel/postinst.d/zz-msi-fan-profile-readiness` runs it for
+every installed kernel and logs the result with the `msi-fan-profile` tag
+(`journalctl -t msi-fan-profile`). A DKMS signing failure does not fail a kernel
+installation, so a `FAIL` here is often the only warning before the reboot. Do
+not reboot into a kernel that fails; the fans would stay on firmware control.
+The kernel update section of `ROLLBACK.md` explains each check and warning.
+
 ## Optional timing diagnostics (testing only)
 
 Timing diagnostics are **off by default** in both services. Only

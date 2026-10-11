@@ -216,7 +216,8 @@ class UpgradeSandboxTestCase(unittest.TestCase):
             path.chmod(0o755)
             for relative in (
                 "src/msi-fan-profile", "src/msi-fan-profiled", "src/msi-gpu-recover",
-                "src/msi_fan_control.py",
+                "src/msi_fan_control.py", "scripts/check-kernel-readiness.sh",
+                "kernel/postinst.d/zz-msi-fan-profile-readiness",
                 "systemd/msi-fan-profile.service", "systemd/msi-fan-profile-keeper.service",
                 "tmpfiles/msi-fan-profile.conf", "README.md", "docs/OPERATIONS.md", "docs/SAFETY.md",
                 "SHA256SUMS",
@@ -267,6 +268,12 @@ class UpgradeSandboxTestCase(unittest.TestCase):
                 self.verify["in_place"] = self.verify["tree"] == str(release)
                 self.verify["tree_remaining"] = pathlib.Path(self.verify["tree"]).exists()
             self.latch_remaining = latch.exists()
+            self.deployed = {
+                str(path.relative_to(sandbox)): format(path.stat().st_mode & 0o777, "o")
+                for prefix in ("etc", "usr") for path in (sandbox / prefix).rglob("*")
+                if path.is_file()}
+            record = sandbox / "usr/local/share/doc/msi-fan-profile/INSTALL_RECORD"
+            self.record = record.read_text() if record.exists() else ""
             return result, state, calls
 
 
@@ -305,6 +312,15 @@ class UpgradeCoolingPreservationTests(UpgradeSandboxTestCase):
         self.assertEqual(state["enabled"], "enabled")
         self.assertLess(calls.index(["msi-fan-profile", "factory-auto"]),
                         calls.index(["msi-fan-profile", "apply-default"]))
+
+    def test_upgrade_adds_the_kernel_readiness_check_and_hook(self):
+        result, _, _ = self.run_upgrade("")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        for target in ("usr/local/libexec/msi-fan-kernel-readiness",
+                       "etc/kernel/postinst.d/zz-msi-fan-profile-readiness"):
+            with self.subTest(target=target):
+                self.assertEqual(self.deployed.get(target), "755")
+                self.assertRegex(self.record, r"(?m)^[0-9a-f]{64}  \S*/" + target + "$")
 
     def test_unsafe_recovery_latch_stops_before_activation_and_is_kept(self):
         result, state, calls = self.run_upgrade("", latch_mode=0o644)

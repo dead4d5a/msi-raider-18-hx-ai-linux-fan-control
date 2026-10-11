@@ -39,8 +39,8 @@ Before submitting:
 
 ```bash
 python3 -m py_compile src/msi-fan-profile src/msi-fan-profiled src/msi-gpu-recover
-bash -n scripts/*.sh
-shellcheck scripts/*.sh
+bash -n scripts/*.sh kernel/postinst.d/zz-msi-fan-profile-readiness
+shellcheck scripts/*.sh kernel/postinst.d/zz-msi-fan-profile-readiness
 python3 -m json.tool data/results.json >/dev/null
 ./scripts/verify-release.sh
 ```

@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+- Add a read-only pre-reboot kernel readiness check,
+  `scripts/check-kernel-readiness.sh`, installed as
+  `/usr/local/libexec/msi-fan-kernel-readiness`. For the `/boot/vmlinuz` target
+  or a given kernel it fails unless `msi_ec/0.13.1` is DKMS-installed, resolves
+  under `updates/dkms` with one `modules.dep` entry, carries a source version
+  pinned in `msi_fan_control.py` and a matching `vermagic`, and is signed by the
+  enrolled MOK certificate; it also checks `msi_wmi_platform`, `coretemp` and
+  `modprobe.d` overrides. It warns about other `msi_ec` DKMS registrations with
+  `AUTOINSTALL` and installed kernels without a build. DKMS signing failures do
+  not fail a kernel installation, so this is the check that catches them.
+- Install a kernel postinst hook,
+  `/etc/kernel/postinst.d/zz-msi-fan-profile-readiness`, that runs the check
+  after DKMS for every installed kernel, logs to the journal under the
+  `msi-fan-profile` tag, warns on stderr on failure and always exits 0. Install,
+  upgrade (including backup), uninstall and `INSTALL_RECORD` cover both files.
 - Restore the deployed legacy driver patch from the initial release as
   `patches/msi-ec-0.13.1-legacy-fan-curve.patch` with its own pinned digest, so
   a lost `/usr/src/msi_ec-0.13.1` can be regenerated. `verify-driver-build.sh`

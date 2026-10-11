@@ -12,6 +12,8 @@ paths=(
   /usr/local/libexec/msi-fan-profiled
   /usr/local/libexec/msi-gpu-recover
   /usr/local/libexec/msi_fan_control.py
+  /usr/local/libexec/msi-fan-kernel-readiness
+  /etc/kernel/postinst.d/zz-msi-fan-profile-readiness
   /etc/systemd/system/msi-fan-profile.service
   /etc/systemd/system/msi-fan-profile-keeper.service
   /run/systemd/system/msi-fan-profile.service
@@ -53,10 +55,12 @@ rollback() {
     rm -f /etc/systemd/system/msi-fan-profile.service
     rm -f /etc/systemd/system/msi-fan-profile-keeper.service
     rm -f /etc/tmpfiles.d/msi-fan-profile.conf
+    rm -f /etc/kernel/postinst.d/zz-msi-fan-profile-readiness
     rm -f /usr/local/sbin/msi-fan-profile
     rm -f /usr/local/libexec/msi-fan-profiled
     rm -f /usr/local/libexec/msi-gpu-recover
     rm -f /usr/local/libexec/msi_fan_control.py
+    rm -f /usr/local/libexec/msi-fan-kernel-readiness
     rm -rf /usr/local/share/doc/msi-fan-profile
     rm -f /run/msi-fan-profile.factory-auto /run/msi-fan-profile.ack /run/msi-fan-profile.recovery-boost
     rm -f /run/msi-fan-profile-manager.lock /run/msi-fanctl.lock
@@ -72,6 +76,9 @@ install -o root -g root -m 0755 "$repo/src/msi-fan-profile" /usr/local/sbin/msi-
 install -o root -g root -m 0755 "$repo/src/msi-fan-profiled" /usr/local/libexec/msi-fan-profiled
 install -o root -g root -m 0755 "$repo/src/msi-gpu-recover" /usr/local/libexec/msi-gpu-recover
 install -o root -g root -m 0644 "$repo/src/msi_fan_control.py" /usr/local/libexec/msi_fan_control.py
+install -o root -g root -m 0755 "$repo/scripts/check-kernel-readiness.sh" /usr/local/libexec/msi-fan-kernel-readiness
+install -o root -g root -m 0755 "$repo/kernel/postinst.d/zz-msi-fan-profile-readiness" \
+  /etc/kernel/postinst.d/zz-msi-fan-profile-readiness
 install -o root -g root -m 0644 "$repo/systemd/msi-fan-profile.service" /etc/systemd/system/msi-fan-profile.service
 install -o root -g root -m 0644 "$repo/systemd/msi-fan-profile-keeper.service" /etc/systemd/system/msi-fan-profile-keeper.service
 install -o root -g root -m 0644 "$repo/tmpfiles/msi-fan-profile.conf" /etc/tmpfiles.d/msi-fan-profile.conf
@@ -103,6 +110,8 @@ fi
       /usr/local/libexec/msi-fan-profiled \
       /usr/local/libexec/msi-gpu-recover \
       /usr/local/libexec/msi_fan_control.py \
+      /usr/local/libexec/msi-fan-kernel-readiness \
+      /etc/kernel/postinst.d/zz-msi-fan-profile-readiness \
       /etc/systemd/system/msi-fan-profile.service \
       /etc/systemd/system/msi-fan-profile-keeper.service \
       /etc/tmpfiles.d/msi-fan-profile.conf \
@@ -124,4 +133,6 @@ Profile files installed and enabled, but not started.
 Start and verify with:
   sudo msi-fan-profile apply-default
   msi-fan-profile status
+Before rebooting into a new kernel, check its msi_ec build with:
+  /usr/local/libexec/msi-fan-kernel-readiness KERNEL_RELEASE
 EOF

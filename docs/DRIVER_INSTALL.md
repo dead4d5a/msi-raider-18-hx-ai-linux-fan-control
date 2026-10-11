@@ -42,6 +42,9 @@ installation. Verify it without installing anything:
 ./scripts/verify-driver-build.sh /path/to/pinned-msi-ec-checkout "$(uname -r)" legacy
 ```
 
+Before rebooting into any new kernel, run the readiness check described in
+[Rollback](ROLLBACK.md#kernel-updates).
+
 > [!CAUTION]
 > Stop if any identity differs. Never use the driver's `firmware=` override,
 > `debug=1`, `ec_sys write_support=1`, or raw EC tools to force compatibility.

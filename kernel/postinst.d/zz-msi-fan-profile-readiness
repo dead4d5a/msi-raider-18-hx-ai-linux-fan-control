@@ -1,0 +1,52 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Kernel postinst hook, installed as
+# /etc/kernel/postinst.d/zz-msi-fan-profile-readiness. run-parts calls it with
+# the new kernel release after the dkms hook. It reports to the journal whether
+# that kernel will load the pinned, signed msi_ec, and warns on stderr when it
+# will not. It only reads, and always exits 0 so it can never fail a kernel
+# installation. No set -e/-u: an unexpected error must not change the status.
+
+export PATH=/usr/sbin:/usr/bin:/sbin:/bin
+check=/usr/local/libexec/msi-fan-kernel-readiness
+documentation=/usr/local/share/doc/msi-fan-profile/OPERATIONS.md
+kernel_release=${1:-}
+
+log() {
+    timeout 5 logger -t msi-fan-profile -p "user.$1" -- "$2" 2>/dev/null
+}
+
+if [[ -z $kernel_release ]]; then
+    log warning 'kernel postinst hook ran without a kernel release; msi_ec readiness not checked'
+    exit 0
+fi
+if [[ ! -x $check ]]; then
+    log warning "msi_ec readiness for kernel $kernel_release not checked: $check is missing"
+    exit 0
+fi
+
+output=$(timeout 120 "$check" "$kernel_release" 2>&1 </dev/null)
+status=$?
+while IFS= read -r line; do
+    [[ -n $line ]] || continue
+    case "$line" in
+        FAIL*|'KERNEL READINESS FAILED'*) log err "kernel $kernel_release: $line" ;;
+        WARN*) log warning "kernel $kernel_release: $line" ;;
+        *) log info "kernel $kernel_release: $line" ;;
+    esac
+done <<<"$output"
+
+if ((status == 0)); then
+    log info "msi_ec readiness PASSED for kernel $kernel_release"
+    printf 'msi-fan-profile: msi_ec readiness PASSED for kernel %s\n' "$kernel_release"
+else
+    log err "msi_ec readiness FAILED for kernel $kernel_release (status $status): do not reboot into it until $check $kernel_release passes"
+    {
+        printf 'msi-fan-profile: WARNING: kernel %s is not ready for the pinned msi_ec driver;\n' "$kernel_release"
+        printf 'the fan controller will not run on it. Do not reboot into it yet.\n'
+        printf '%s\n' "$output" | grep -E '^(FAIL|WARN) '
+        printf 'Re-check with: %s %s\n' "$check" "$kernel_release"
+        printf 'See the kernel update section of %s.\n' "$documentation"
+    } >&2
+fi
+exit 0

@@ -40,6 +40,10 @@ The script:
 - runs the release checks, including the unit tests, without root: as the
   invoking sudo user, or as `nobody` on a private copy of the checkout;
 - installs root-owned executables and their shared read-only ABI helper;
+- installs the read-only kernel readiness check
+  `/usr/local/libexec/msi-fan-kernel-readiness` and a kernel postinst hook that
+  runs it, logs the result, and never fails a kernel installation (see the
+  kernel update section of [Rollback](ROLLBACK.md#kernel-updates));
 - installs a root-only tmpfiles lock;
 - installs the matching README, operations, and safety documentation used by
   the systemd unit;
@@ -80,8 +84,9 @@ The upgrade command verifies the source manifest and exact platform (running
 the release checks without root, as the installer does), stages all
 artifacts, moves the existing controller to verified factory `auto/off`,
 disables it for the replacement window, keeps a root-only backup, refreshes the
-manager/daemon/recovery helper/unit/tmpfiles/documentation as one release, and
-reactivates only through the new guarded manager. Fresh installs and upgrades
+manager/daemon/recovery helper/readiness check/kernel hook/unit/tmpfiles/
+documentation as one release (adding the readiness check and kernel hook to
+older deployments), and reactivates only through the new guarded manager. Fresh installs and upgrades
 write an `INSTALL_RECORD` with the deployed artifact hashes under
 `/usr/local/share/doc/msi-fan-profile/`.
 If the upgrade stops before activation after entering the safe state, it leaves

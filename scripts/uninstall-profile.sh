@@ -94,10 +94,12 @@ fi
 rm -f /etc/systemd/system/msi-fan-profile.service
 rm -f /etc/systemd/system/msi-fan-profile-keeper.service
 rm -f /etc/tmpfiles.d/msi-fan-profile.conf
+rm -f /etc/kernel/postinst.d/zz-msi-fan-profile-readiness
 rm -f /usr/local/sbin/msi-fan-profile
 rm -f /usr/local/libexec/msi-fan-profiled
 rm -f /usr/local/libexec/msi-gpu-recover
 rm -f /usr/local/libexec/msi_fan_control.py
+rm -f /usr/local/libexec/msi-fan-kernel-readiness
 rm -rf /usr/local/share/doc/msi-fan-profile
 rm -f /run/msi-fan-profile.factory-auto /run/msi-fan-profile.ack /run/msi-fan-profile.recovery-boost /run/msi-fan-profile.health.json
 rm -f /run/msi-fan-profile-manager.lock /run/msi-fanctl.lock
