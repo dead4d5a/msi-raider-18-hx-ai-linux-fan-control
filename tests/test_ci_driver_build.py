@@ -12,6 +12,7 @@ load, or inspect a real kernel module.
 from __future__ import annotations
 
 import ast
+import hashlib
 import json
 import os
 import pathlib
@@ -25,10 +26,26 @@ import unittest
 
 ROOT = pathlib.Path(__file__).parents[1]
 RELEASE = "6.8.0-101-generic"
+HWE_RELEASE = "7.0.0-38-generic"
 HEADERS_PACKAGE = "linux-headers-" + RELEASE
+HWE_HEADERS_PACKAGE = "linux-headers-" + HWE_RELEASE
+GENERIC_META = "linux-headers-generic"
+HWE_META = "linux-headers-generic-hwe-24.04"
 INSTALLED = "install ok installed"
 SNAPSHOT_SRCVERSION = "9086C45007CBB7FA1264430"
 CI_68_SRCVERSION = "123635EB33D32BA9FCFABCA"
+LEGACY_SRCVERSION = "AB0BFAE2391B5ADD66E01BD"
+LEGACY_CI_68_SRCVERSION = "518BD36E89E2B3026A56490"
+# (build, Kbuild layout) -> the only fingerprint the offline verifier accepts.
+# Relative (Linux >= 6.13) fingerprints are the runtime pins; absolute ones
+# (older Kbuild, CI's 6.8 GA headers) are offline build checks only.
+BUILD_SRCVERSIONS = {
+    ("snapshot", "relative"): SNAPSHOT_SRCVERSION,
+    ("snapshot", "absolute"): CI_68_SRCVERSION,
+    ("legacy", "relative"): LEGACY_SRCVERSION,
+    ("legacy", "absolute"): LEGACY_CI_68_SRCVERSION,
+}
+LAYOUT_RELEASES = {"absolute": RELEASE, "relative": HWE_RELEASE}
 EXPORTS = "".join(
     f"0x01234567\t{symbol}\tdrivers/acpi/battery\tEXPORT_SYMBOL_GPL\t\n"
     for symbol in ("battery_hook_register", "battery_hook_unregister")
@@ -108,19 +125,20 @@ class TemporaryCommandFixture(unittest.TestCase):
 class GenericKernelSelectionTests(TemporaryCommandFixture):
     def select(self, *, dependencies=HEADERS_PACKAGE,
                meta_status=INSTALLED, concrete_status=INSTALLED,
-               meta_error=None, dependencies_error=None, extra_packages=None):
+               meta_error=None, dependencies_error=None, extra_packages=None,
+               arguments=(), meta=GENERIC_META, concrete=HEADERS_PACKAGE):
         packages = {
-            "linux-headers-generic": {"status": meta_status, "depends": dependencies},
-            HEADERS_PACKAGE: {"status": concrete_status},
+            meta: {"status": meta_status, "depends": dependencies},
+            concrete: {"status": concrete_status},
         }
         if meta_error is not None:
-            packages["linux-headers-generic"]["error_status"] = meta_error
+            packages[meta]["error_status"] = meta_error
         if dependencies_error is not None:
-            packages["linux-headers-generic"]["error_depends"] = dependencies_error
+            packages[meta]["error_depends"] = dependencies_error
         packages.update(extra_packages or {})
         (self.folder / "packages.json").write_text(json.dumps(packages), encoding="ascii")
         (self.folder / "calls.jsonl").write_text("", encoding="ascii")
-        return self.run_script(ROOT / "scripts/select-ci-kernel.sh")
+        return self.run_script(ROOT / "scripts/select-ci-kernel.sh", *arguments)
 
     def assert_rejected(self, result):
         self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
@@ -142,6 +160,41 @@ class GenericKernelSelectionTests(TemporaryCommandFixture):
             ["dpkg-query", "-W", "-f=${Depends}", "linux-headers-generic"],
             ["dpkg-query", "-W", "-f=${Status}", HEADERS_PACKAGE],
         ])
+
+    def test_explicit_generic_and_hwe_metapackages_select_their_own_dependency(self):
+        for meta, concrete, release in ((GENERIC_META, HEADERS_PACKAGE, RELEASE),
+                                        (HWE_META, HWE_HEADERS_PACKAGE, HWE_RELEASE)):
+            with self.subTest(meta=meta):
+                other = HEADERS_PACKAGE if concrete == HWE_HEADERS_PACKAGE else HWE_HEADERS_PACKAGE
+                result = self.select(
+                    arguments=(meta,), meta=meta, concrete=concrete,
+                    dependencies=concrete + " (= 1.0)",
+                    extra_packages={other: {"status": INSTALLED}},
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout, release + "\n")
+                self.assertEqual(self.calls(), [
+                    ["dpkg-query", "-W", "-f=${Status}", meta],
+                    ["dpkg-query", "-W", "-f=${Depends}", meta],
+                    ["dpkg-query", "-W", "-f=${Status}", concrete],
+                ])
+
+    def test_only_the_ga_and_hwe_24_04_metapackages_are_accepted(self):
+        for arguments in (("",), ("linux-headers-generic-hwe-22.04",),
+                          ("linux-headers-azure",), ("linux-headers-oem-24.04",),
+                          ("linux-headers-generic ",), ("../linux-headers-generic",),
+                          (GENERIC_META, HWE_META)):
+            with self.subTest(arguments=arguments):
+                result = self.select(arguments=arguments)
+                self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual(result.stdout, "")
+                self.assertEqual(self.calls(), [], "reject before any package query")
+
+    def test_hwe_metapackage_is_not_satisfied_by_the_ga_metapackage(self):
+        result = self.select(arguments=(HWE_META,))
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(self.calls(), [["dpkg-query", "-W", "-f=${Status}", HWE_META]])
 
     def test_native_versioned_dependency_without_version_constraint_is_accepted(self):
         result = self.select(dependencies="  " + HEADERS_PACKAGE + "  ")
@@ -188,15 +241,37 @@ class GenericKernelSelectionTests(TemporaryCommandFixture):
         workflow = (ROOT / ".github/workflows/checks.yml").read_text(encoding="ascii")
         self.assertIn("./scripts/select-ci-kernel.sh", workflow)
         self.assertNotRegex(workflow, r"find\s+/lib/modules")
-        selected = re.search(r"([A-Za-z_][A-Za-z0-9_]*)=\$\(\./scripts/select-ci-kernel\.sh\)",
-                             workflow)
+        selected = re.search(
+            r"([A-Za-z_][A-Za-z0-9_]*)=\$\(\./scripts/select-ci-kernel\.sh"
+            r"\s+\"\$HEADERS\"\)", workflow)
         self.assertIsNotNone(selected, "capture the selector output, not a global directory scan")
         variable = selected.group(1)
         self.assertRegex(
             workflow,
             r"\./scripts/verify-driver-build\.sh\s+\.driver-build-source\s+\"\$(?:" +
-            re.escape(variable) + r"|\{" + re.escape(variable) + r"\})\"",
+            re.escape(variable) + r"|\{" + re.escape(variable) + r"\})\"\s+\"\$BUILD\"",
         )
+
+    def test_workflow_builds_both_patches_on_ga_and_hwe_headers_weekly(self):
+        workflow = (ROOT / ".github/workflows/checks.yml").read_text(encoding="ascii")
+        self.assertRegex(workflow, r"(?m)^  schedule:\n    - cron: '[0-9]+ [0-9]+ \* \* [0-6]'$")
+        self.assertRegex(workflow, r"(?m)^  push:$")
+        self.assertRegex(workflow, r"(?m)^  pull_request:$")
+        self.assertIn("        headers: [" + GENERIC_META + ", " + HWE_META + "]\n", workflow)
+        self.assertIn("        build: [snapshot, legacy]\n", workflow)
+        self.assertIn("      fail-fast: false\n", workflow)
+        self.assertEqual(workflow.count("HEADERS: ${{ matrix.headers }}"), 2)
+        self.assertEqual(workflow.count("BUILD: ${{ matrix.build }}"), 1)
+        self.assertIn('sudo apt-get install -y build-essential "$HEADERS" kmod', workflow)
+        self.assertNotIn("linux-headers-generic kmod", workflow)
+        # Matrix values reach shell only through the environment.
+        for line in workflow.splitlines():
+            if "${{" in line:
+                self.assertRegex(line, r"^\s+(name: driver-build \(|[A-Z]+: \$\{\{ matrix\.\w+ \}\}$)")
+        uses = re.findall(r"uses:\s*(\S+)", workflow)
+        self.assertTrue(uses)
+        for action in uses:
+            self.assertRegex(action, r"^[\w.-]+/[\w.-]+@[0-9a-f]{40}$", "pin actions by commit")
 
 
 class DriverHeaderPreflightTests(TemporaryCommandFixture):
@@ -248,6 +323,21 @@ class DriverHeaderPreflightTests(TemporaryCommandFixture):
                 self.assertEqual(self.calls(), [
                     ["git", "-C", str(self.source), "rev-parse", "HEAD"],
                 ])
+
+    def test_legacy_build_reaches_only_fake_git(self):
+        (self.folder / "calls.jsonl").write_text("", encoding="ascii")
+        result = self.run_script(self.script, self.source, RELEASE, "legacy")
+        self.assertNotEqual(result.returncode, 0, "fake git deliberately stops the build")
+        self.assertEqual(self.calls(), [["git", "-C", str(self.source), "rev-parse", "HEAD"]])
+
+    def test_unknown_build_or_unversioned_release_is_rejected_before_preflight(self):
+        for arguments in ((RELEASE, "Legacy"), (RELEASE, ""), (RELEASE, "snapshot", "extra"),
+                          ("generic", "snapshot"), ("6-8.0-generic", "legacy")):
+            with self.subTest(arguments=arguments):
+                (self.folder / "calls.jsonl").write_text("", encoding="ascii")
+                result = self.run_script(self.script, self.source, *arguments)
+                self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+                self.assertEqual(self.calls(), [])
 
     def test_missing_makefile_is_rejected(self):
         (self.headers / "Makefile").unlink()
@@ -302,57 +392,95 @@ class OfflineModuleIdentityTests(TemporaryCommandFixture):
         self.module_directory = self.folder / "module-build"
         self.module = self.module_directory / "driver/msi-ec.ko"
         original = (ROOT / "scripts/verify-driver-build.sh").read_text(encoding="ascii")
+        # Execute the actual build/layout selection and the actual post-build
+        # verification tail, without the header preflight, git, or make.
+        start, end = "build=snapshot\n", "kernel_build=/lib/modules/$kernel_release/build\n"
         boundary = "\nmodule=$verify_dir/driver/msi-ec.ko\n"
-        self.assertEqual(original.count(boundary), 1, "execute the actual post-build verification tail")
+        for marker in (start, end, boundary):
+            self.assertEqual(original.count(marker), 1, marker)
+        selection = start + original.partition(start)[2].partition(end)[0]
         tail = original.partition(boundary)[2]
         self.script = self.folder / "verify-module-tail.sh"
         self.script.write_text(
             "set -Eeuo pipefail\n"
+            "kernel_release=$2\n" + selection +
             "verify_dir=" + shlex.quote(str(self.module_directory)) + "\n"
-            "kernel_release=" + shlex.quote(RELEASE) + "\n"
             "module=$verify_dir/driver/msi-ec.ko\n" + tail,
             encoding="ascii",
         )
 
-    def verify_identity(self, **overrides):
+    def verify_identity(self, build="snapshot", release=RELEASE, **overrides):
         fields = {"name": "msi_ec", "version": "0.13.1",
                   "srcversion": SNAPSHOT_SRCVERSION,
-                  "vermagic": RELEASE + " SMP preempt mod_unload modversions "}
+                  "vermagic": release + " SMP preempt mod_unload modversions "}
         fields.update(overrides)
         (self.folder / "module-info.json").write_text(json.dumps(fields), encoding="ascii")
         (self.folder / "calls.jsonl").write_text("", encoding="ascii")
         self.assertFalse(self.module.exists(), "there is no real module for modinfo to inspect")
-        result = self.run_script(self.script)
+        result = self.run_script(self.script, "unused-source", release, build)
         self.assertTrue(self.calls(), "actual tail must query the fake metadata")
         self.assertTrue(all(call[0] == "modinfo" and call[-1] == str(self.module)
                             for call in self.calls()), self.calls())
         self.assertFalse(self.module.exists(), "verification must not generate a module")
         return result
 
-    def test_both_exact_offline_build_checksums_are_accepted(self):
-        for source in (SNAPSHOT_SRCVERSION, CI_68_SRCVERSION):
-            with self.subTest(source=source):
-                result = self.verify_identity(srcversion=source)
-                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-                self.assertIn("verification: PASS", result.stdout)
+    def test_each_build_accepts_only_its_fingerprint_for_the_kbuild_layout(self):
+        for (build, layout), source in BUILD_SRCVERSIONS.items():
+            for candidate in BUILD_SRCVERSIONS.values():
+                with self.subTest(build=build, layout=layout, candidate=candidate):
+                    result = self.verify_identity(build, LAYOUT_RELEASES[layout],
+                                                  srcversion=candidate)
+                    if candidate == source:
+                        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                        self.assertIn(f"Pinned {build} driver patch and unprivileged build "
+                                      "verification: PASS", result.stdout)
+                    else:
+                        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+                        self.assertNotIn("verification: PASS", result.stdout)
+
+    def test_linux_6_13_is_the_first_relative_layout_release(self):
+        for release, layout in (("6.8.0-101-generic", "absolute"), ("6.12.0-1-generic", "absolute"),
+                                ("6.13.0-1-generic", "relative"), ("6.17.0-40-generic", "relative"),
+                                ("7.0.0-38-generic", "relative"), ("10.1.0-1-generic", "relative"),
+                                ("6.13", "relative"), ("5.15.0-1-generic", "absolute")):
+            for build in ("snapshot", "legacy"):
+                with self.subTest(release=release, build=build):
+                    result = self.verify_identity(
+                        build, release, srcversion=BUILD_SRCVERSIONS[build, layout])
+                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
     def test_unknown_empty_or_extended_source_checksum_is_rejected(self):
-        for source in ("", "0" * 24, CI_68_SRCVERSION + "0", CI_68_SRCVERSION.lower()):
-            with self.subTest(source=source):
-                result = self.verify_identity(srcversion=source)
-                self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
-                self.assertNotIn("verification: PASS", result.stdout)
-
-    def test_both_known_checksums_still_require_name_version_and_vermagic(self):
-        for source in (SNAPSHOT_SRCVERSION, CI_68_SRCVERSION):
-            for field, value in (("name", "untrusted_driver"), ("version", "0.13.2"),
-                                 ("vermagic", "6.17.0-1001-azure SMP "),
-                                 ("vermagic", RELEASE + "-other SMP "),
-                                 ("vermagic", "")):
-                with self.subTest(source=source, field=field, value=value):
-                    result = self.verify_identity(srcversion=source, **{field: value})
+        for source in ("", "0" * 24, CI_68_SRCVERSION + "0", CI_68_SRCVERSION.lower(),
+                       LEGACY_CI_68_SRCVERSION[:-1]):
+            for build in ("snapshot", "legacy"):
+                with self.subTest(source=source, build=build):
+                    result = self.verify_identity(build, srcversion=source)
                     self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
                     self.assertNotIn("verification: PASS", result.stdout)
+
+    def test_known_checksums_still_require_name_version_and_vermagic(self):
+        for (build, layout), source in BUILD_SRCVERSIONS.items():
+            release = LAYOUT_RELEASES[layout]
+            for field, value in (("name", "untrusted_driver"), ("version", "0.13.2"),
+                                 ("vermagic", "6.17.0-1001-azure SMP "),
+                                 ("vermagic", release + "-other SMP "),
+                                 ("vermagic", "")):
+                with self.subTest(build=build, layout=layout, field=field, value=value):
+                    result = self.verify_identity(build, release, srcversion=source,
+                                                  **{field: value})
+                    self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+                    self.assertNotIn("verification: PASS", result.stdout)
+
+    def test_each_build_verifies_its_own_pinned_patch_digest(self):
+        script = (ROOT / "scripts/verify-driver-build.sh").read_text(encoding="ascii")
+        for name in ("msi-ec-0.13.1-exact-fan-curve.patch", "msi-ec-0.13.1-legacy-fan-curve.patch"):
+            with self.subTest(name=name):
+                digest = hashlib.sha256((ROOT / "patches" / name).read_bytes()).hexdigest()
+                block = re.search(r"patch_name=" + re.escape(name) +
+                                  r"\n\s+expected_patch=([0-9a-f]{64})\n", script)
+                self.assertIsNotNone(block, name)
+                self.assertEqual(block.group(1), digest)
+        self.assertIn('patch_file=$repo/patches/$patch_name\n', script)
 
     def test_ci_only_checksum_does_not_expand_runtime_build_trust(self):
         tree = ast.parse((ROOT / "src/msi_fan_control.py").read_text(encoding="ascii"))
@@ -363,8 +491,9 @@ class OfflineModuleIdentityTests(TemporaryCommandFixture):
         self.assertIsInstance(supported_node, (ast.Tuple, ast.List))
         supported = tuple(ast.literal_eval(assignments[item.id]) if isinstance(item, ast.Name)
                           else ast.literal_eval(item) for item in supported_node.elts)
-        self.assertEqual(supported, ("AB0BFAE2391B5ADD66E01BD", SNAPSHOT_SRCVERSION))
+        self.assertEqual(supported, (LEGACY_SRCVERSION, SNAPSHOT_SRCVERSION))
         self.assertNotIn(CI_68_SRCVERSION, supported)
+        self.assertNotIn(LEGACY_CI_68_SRCVERSION, supported)
 
 
 if __name__ == "__main__":

@@ -65,26 +65,41 @@ kernel headers, verify application/build without installing or loading:
 
 ```bash
 ./scripts/verify-driver-build.sh /path/to/pinned-msi-ec-checkout "$(uname -r)"
+./scripts/verify-driver-build.sh /path/to/pinned-msi-ec-checkout "$(uname -r)" legacy
 ```
 
-The script requires upstream commit `d7fbbd88e6831e56801b860e46475cbf8ddbc7c1`
-and verifies its tree/archive and patch digests. It builds only a temporary
-copy, checks module identity/vermagic, and removes the temporary build. Source
-checkout and installed modules remain untouched. This is a build check, not a
-simulated EC transaction fault test or thermal compatibility claim.
+The optional third argument selects the current `snapshot` patch (default) or
+the deployed `legacy` patch. The script requires upstream commit
+`d7fbbd88e6831e56801b860e46475cbf8ddbc7c1` and verifies its tree/archive and
+the selected patch's digest. It builds only a temporary copy, checks module
+identity/vermagic, and removes the temporary build. Source checkout and
+installed modules remain untouched. This is a build check, not a simulated EC
+transaction fault test or thermal compatibility claim.
 
-CI resolves its build target from the installed `linux-headers-generic`
-metapackage's exact dependency with `scripts/select-ci-kernel.sh`. It must not
-pick the runner's running or highest-version kernel: a cloud/Azure kernel may
-lack the ACPI battery-hook exports that `msi_ec` requires. The verifier checks
-the header release, module/battery configuration and symbol exports before
-building; it never suppresses unresolved-symbol failures or relaxes runtime ABI
-pins. The offline verifier recognizes two exact checksums reproduced from the
-same pinned driver source: `9086C45007CBB7FA1264430` with the tested 7.0 relative
-dependency layout, and `123635EB33D32BA9FCFABCA` with the CI 6.8 absolute layout.
-Kbuild's source-version calculation includes the local configuration header in
-the latter layout but not the former. Archive/patch digests, name, version, and
-target vermagic remain mandatory. The CI checksum is **not** added to the
+CI builds both patches against the 24.04 GA headers (`linux-headers-generic`)
+and the HWE series this laptop tracks (`linux-headers-generic-hwe-24.04`), on
+every push and pull request and weekly, so a newly published kernel is built
+without a push. `scripts/select-ci-kernel.sh [METAPACKAGE]` resolves the target
+from that installed metapackage's exact dependency; it accepts only those two
+metapackages. It must not pick the runner's running or highest-version kernel:
+a cloud/Azure kernel may lack the ACPI battery-hook exports that `msi_ec`
+requires. The verifier checks the header release, module/battery configuration
+and symbol exports before building; it never suppresses unresolved-symbol
+failures or relaxes runtime ABI pins. Kbuild's source-version calculation
+includes the local configuration header with the absolute dependency layout of
+kernels before 6.13 (CI's 6.8 GA headers), but not with the relative layout of
+6.13 and later, so the verifier accepts exactly one checksum per patch and
+layout:
+
+| Patch | 6.13+ relative layout (runtime pin) | Before 6.13, absolute layout (CI only) |
+| --- | --- | --- |
+| snapshot | `9086C45007CBB7FA1264430` | `123635EB33D32BA9FCFABCA` |
+| legacy | `AB0BFAE2391B5ADD66E01BD` | `518BD36E89E2B3026A56490` |
+
+The legacy absolute-layout value was computed with the unchanged Linux checksum
+implementation from the 7.0 headers, which reproduces the other three measured
+values from the same sources. Archive/patch digests, name, version, and target
+vermagic remain mandatory. The CI checksums are **not** added to the
 controller's runtime allowlist, and a successful CI build is not hardware
 validation or permission to deploy a different module.
 

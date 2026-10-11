@@ -26,15 +26,21 @@ if command -v shellcheck >/dev/null; then
     shellcheck scripts/*.sh
 fi
 python3 -m json.tool data/results.json >/dev/null
-if git apply --check --reverse \
-    patches/msi-ec-0.13.1-exact-fan-curve.patch >/dev/null 2>&1; then
-    echo 'Unexpected: patch appears applied to the repository root.' >&2
-    exit 1
-fi
 
-expected_patch=0b27ad8fb03613fe3bdbdc39598dc59c438c30f78c311eb125076f7562069f37
-actual_patch=$(sha256sum patches/msi-ec-0.13.1-exact-fan-curve.patch | awk '{print $1}')
-[[ $actual_patch == "$expected_patch" ]]
+# The snapshot patch is the current driver; the legacy patch is the deployed
+# build that DKMS rebuilds for every new kernel. Each digest is pinned.
+declare -A expected_patches=(
+    [patches/msi-ec-0.13.1-exact-fan-curve.patch]=0b27ad8fb03613fe3bdbdc39598dc59c438c30f78c311eb125076f7562069f37
+    [patches/msi-ec-0.13.1-legacy-fan-curve.patch]=16b421b04dd40a3b26f14438a8f95f83c2602692ac8700d40ccc5c6e5bb14a2d
+)
+for patch in "${!expected_patches[@]}"; do
+    if git apply --check --reverse "$patch" >/dev/null 2>&1; then
+        echo "Unexpected: patch appears applied to the repository root: $patch" >&2
+        exit 1
+    fi
+    actual_patch=$(sha256sum "$patch" | awk '{print $1}')
+    [[ $actual_patch == "${expected_patches[$patch]}" ]]
+done
 
 # Prohibit classes of files that must never be published.
 if find . -path ./.git -prune -o -type f \
@@ -88,7 +94,8 @@ for filename in ("scripts/preflight.sh", "scripts/uninstall-profile.sh"):
     script = Path(filename).read_text()
     assert all(source in script for source in builds.values()), filename
     assert "fan_control_snapshot" in script, filename
-assert builds["SNAPSHOT_SRCVERSION"] in Path("scripts/verify-driver-build.sh").read_text()
+driver_build = Path("scripts/verify-driver-build.sh").read_text()
+assert all(source in driver_build for source in builds.values())
 print("exact driver ABI pins: OK")
 PY
 

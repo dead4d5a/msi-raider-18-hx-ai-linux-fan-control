@@ -3,6 +3,10 @@ name: checks
 on:
   push:
   pull_request:
+  # Build against newly published GA and HWE kernel headers between pushes.
+  schedule:
+    - cron: '23 5 * * 1'
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -18,7 +22,13 @@ jobs:
         run: ./scripts/verify-release.sh
 
   driver-build:
+    name: driver-build (${{ matrix.headers }}, ${{ matrix.build }})
     runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        headers: [linux-headers-generic, linux-headers-generic-hwe-24.04]
+        build: [snapshot, legacy]
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Pinned upstream driver
@@ -29,10 +39,15 @@ jobs:
           path: .driver-build-source
           persist-credentials: false
       - name: Build prerequisites
-        run: sudo apt-get update && sudo apt-get install -y build-essential linux-headers-generic kmod
+        env:
+          HEADERS: ${{ matrix.headers }}
+        run: sudo apt-get update && sudo apt-get install -y build-essential "$HEADERS" kmod
       - name: Verify patch and build without installing or loading
         shell: bash
+        env:
+          HEADERS: ${{ matrix.headers }}
+          BUILD: ${{ matrix.build }}
         run: |
-          kernel_release=$(./scripts/select-ci-kernel.sh)
-          printf 'Selected generic kernel headers: %s\n' "$kernel_release"
-          ./scripts/verify-driver-build.sh .driver-build-source "$kernel_release"
+          kernel_release=$(./scripts/select-ci-kernel.sh "$HEADERS")
+          printf 'Selected %s kernel headers: %s\n' "$HEADERS" "$kernel_release"
+          ./scripts/verify-driver-build.sh .driver-build-source "$kernel_release" "$BUILD"

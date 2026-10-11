@@ -3,8 +3,8 @@
 set -Eeuo pipefail
 
 repo=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
-if (($# < 1 || $# > 2)); then
-  echo "Usage: $0 PINNED_UPSTREAM_CHECKOUT [KERNEL_RELEASE]" >&2
+if (($# < 1 || $# > 3)); then
+  echo "Usage: $0 PINNED_UPSTREAM_CHECKOUT [KERNEL_RELEASE [snapshot|legacy]]" >&2
   exit 2
 fi
 driver_source=$(cd -- "$1" && pwd)
@@ -13,6 +13,39 @@ kernel_release=${2:-$(uname -r)}
   echo 'Invalid kernel release.' >&2
   exit 2
 }
+# snapshot is the current patch; legacy is the deployed fan_curve-only build.
+build=snapshot
+if (($# == 3)); then
+  build=$3
+fi
+case "$build" in
+  snapshot)
+    patch_name=msi-ec-0.13.1-exact-fan-curve.patch
+    expected_patch=0b27ad8fb03613fe3bdbdc39598dc59c438c30f78c311eb125076f7562069f37
+    ;;
+  legacy)
+    patch_name=msi-ec-0.13.1-legacy-fan-curve.patch
+    expected_patch=16b421b04dd40a3b26f14438a8f95f83c2602692ac8700d40ccc5c6e5bb14a2d
+    ;;
+  *)
+    echo 'Invalid driver build: expected snapshot or legacy.' >&2
+    exit 2
+    ;;
+esac
+# Linux 6.13 builds external modules from their own directory, so Kbuild
+# records the local header relatively and leaves it out of srcversion. Older
+# Kbuild records it absolutely and includes it.
+[[ $kernel_release =~ ^([0-9]+)\.([0-9]+)([^0-9]|$) ]] || {
+  echo 'Invalid kernel release.' >&2
+  exit 2
+}
+major=$((10#${BASH_REMATCH[1]}))
+minor=$((10#${BASH_REMATCH[2]}))
+if ((major > 6 || (major == 6 && minor >= 13))); then
+  layout=relative
+else
+  layout=absolute
+fi
 kernel_build=/lib/modules/$kernel_release/build
 [[ -d $kernel_build && -f $kernel_build/Makefile ]] || {
   echo "Matching kernel headers are missing: $kernel_build" >&2
@@ -46,7 +79,6 @@ printf 'Verified kernel build prerequisites: %s (%s)\n' \
 expected_commit=d7fbbd88e6831e56801b860e46475cbf8ddbc7c1
 expected_tree=072c10a344c22372665a729add6c10faada7c6da
 expected_archive=ee49828ce69a9aa9c500d3efcb923d0ba77b570e1a83351647e074a4c039eb6b
-expected_patch=0b27ad8fb03613fe3bdbdc39598dc59c438c30f78c311eb125076f7562069f37
 [[ $(git -C "$driver_source" rev-parse HEAD) == "$expected_commit" ]]
 [[ $(git -C "$driver_source" rev-parse 'HEAD^{tree}') == "$expected_tree" ]]
 [[ -z $(git -C "$driver_source" status --porcelain) ]] || {
@@ -54,7 +86,7 @@ expected_patch=0b27ad8fb03613fe3bdbdc39598dc59c438c30f78c311eb125076f7562069f37
   exit 1
 }
 [[ $(git -C "$driver_source" archive --format=tar HEAD | sha256sum | awk '{print $1}') == "$expected_archive" ]]
-patch_file=$repo/patches/msi-ec-0.13.1-exact-fan-curve.patch
+patch_file=$repo/patches/$patch_name
 [[ $(sha256sum "$patch_file" | awk '{print $1}') == "$expected_patch" ]]
 
 verify_dir=$(mktemp -d)
@@ -77,15 +109,19 @@ done
 [[ $(modinfo -F name "$module") == msi_ec ]]
 [[ $(modinfo -F version "$module") == 0.13.1 ]]
 # Kbuild's relative/absolute dependency layouts hash local headers differently.
-# Both fingerprints were reproduced from byte-identical pinned source. These
-# are offline build checks only: do not add the CI variant to runtime ABI pins.
+# Each fingerprint was reproduced from byte-identical pinned source. The
+# relative ones are the runtime ABI pins; the absolute ones are offline build
+# checks only: do not add them to runtime ABI pins.
 module_srcversion=$(modinfo -F srcversion "$module")
-case "$module_srcversion" in
-  9086C45007CBB7FA1264430|123635EB33D32BA9FCFABCA) ;;
+case "$build:$layout:$module_srcversion" in
+  snapshot:relative:9086C45007CBB7FA1264430) ;;
+  snapshot:absolute:123635EB33D32BA9FCFABCA) ;;
+  legacy:relative:AB0BFAE2391B5ADD66E01BD) ;;
+  legacy:absolute:518BD36E89E2B3026A56490) ;;
   *)
-    echo "Unexpected pinned-source module checksum: $module_srcversion" >&2
+    echo "Unexpected pinned-source $build module checksum for the $layout Kbuild layout: $module_srcversion" >&2
     exit 1
     ;;
 esac
 [[ $(modinfo -F vermagic "$module") == "$kernel_release "* ]]
-echo "Pinned driver patch and unprivileged build verification: PASS ($kernel_release)"
+echo "Pinned $build driver patch and unprivileged build verification: PASS ($kernel_release)"

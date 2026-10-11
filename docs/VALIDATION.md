@@ -74,8 +74,9 @@
 
 Reproduce default checks with `./scripts/verify-release.sh`. The optional
 systemd and driver checks are documented in `CONTRIBUTING.md`. CI additionally
-builds the pinned driver against installed runner headers; that CI job is not
-evidence of attended thermal compatibility on another kernel.
+builds the snapshot and deployed legacy patches against the runner's 24.04 GA
+and HWE kernel headers, also weekly; that CI job is not evidence of attended
+thermal compatibility on another kernel.
 
 ## Pending
 

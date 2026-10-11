@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- Restore the deployed legacy driver patch from the initial release as
+  `patches/msi-ec-0.13.1-legacy-fan-curve.patch` with its own pinned digest, so
+  a lost `/usr/src/msi_ec-0.13.1` can be regenerated. `verify-driver-build.sh`
+  takes `snapshot` (default) or `legacy` and accepts only that patch's
+  checksum for the kernel's Kbuild layout.
+- Build both patches in CI against the 24.04 GA and HWE kernel headers, on every
+  push and pull request and weekly; `select-ci-kernel.sh` takes the header
+  metapackage.
 - Stop skipping the controller silently when its driver is unusable: the
   primary unit no longer has a `fan_curve` condition, so a missing, rejected or
   unpinned `msi_ec` after a kernel update fails the unit visibly at identity

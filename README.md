@@ -167,9 +167,10 @@ These do not replace attended hardware validation or prove thermal optimality.
 The original service/manager code in this repository is licensed under
 GPL-3.0-or-later; see [Licensing](LICENSE.md).
 
-`patches/msi-ec-0.13.1-exact-fan-curve.patch` modifies the GPL-2.0-or-later
+`patches/msi-ec-0.13.1-exact-fan-curve.patch` and the deployed legacy
+`patches/msi-ec-0.13.1-legacy-fan-curve.patch` modify the GPL-2.0-or-later
 [BeardOverflow/msi-ec](https://github.com/BeardOverflow/msi-ec) project. The
-patch retains that upstream licensing and attribution. See [NOTICE](NOTICE).
+patches retain that upstream licensing and attribution. See [NOTICE](NOTICE).
 
 MSI is a trademark of Micro-Star INT'L CO., LTD. This is an independent
 community project and is not affiliated with or endorsed by MSI.

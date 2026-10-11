@@ -29,6 +29,19 @@ requires a protected backup and deliberate staging, not a broad `remove --all`.
 Old daemon/keeper releases reject the new source version. These notes describe
 the required sequence, not an instruction to perform it unattended.
 
+The deployed legacy build's patch is kept as
+`patches/msi-ec-0.13.1-legacy-fan-curve.patch`, SHA-256
+`16b421b04dd40a3b26f14438a8f95f83c2602692ac8700d40ccc5c6e5bb14a2d`. Applied to
+the pinned upstream commit below, it reproduces the source files of a legacy
+`/usr/src/msi_ec-0.13.1` byte for byte and builds to
+`AB0BFAE2391B5ADD66E01BD`. DKMS rebuilds that source for every new kernel, so
+use this patch only to restore a lost legacy source tree, never for a fresh
+installation. Verify it without installing anything:
+
+```bash
+./scripts/verify-driver-build.sh /path/to/pinned-msi-ec-checkout "$(uname -r)" legacy
+```
+
 > [!CAUTION]
 > Stop if any identity differs. Never use the driver's `firmware=` override,
 > `debug=1`, `ec_sys write_support=1`, or raw EC tools to force compatibility.
@@ -214,6 +227,11 @@ Patch SHA-256:
 Verify before applying:
 
 The preceding `sha256sum "$PATCH"` command must match that value.
+
+Only when restoring a lost legacy source tree, apply
+`msi-ec-0.13.1-legacy-fan-curve.patch` instead, with SHA-256
+`16b421b04dd40a3b26f14438a8f95f83c2602692ac8700d40ccc5c6e5bb14a2d`; step 5 must
+then report `AB0BFAE2391B5ADD66E01BD`.
 
 ## 5. Unprivileged test build
 
