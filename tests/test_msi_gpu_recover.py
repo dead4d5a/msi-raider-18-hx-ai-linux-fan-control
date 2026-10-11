@@ -4,8 +4,10 @@
 
 from __future__ import annotations
 
+import contextlib
 import errno
 import fcntl
+import gc
 import importlib.machinery
 import importlib.util
 import io
@@ -33,11 +35,13 @@ def load_recovery_helper():
 
 
 RECOVER = load_recovery_helper()
+REAL_RECOVERY_READ = RECOVER.read
 REAL_RECOVERY_WRITE = RECOVER.write
 REAL_MARK_RECOVERY_LATCH = RECOVER.mark_recovery_latch
 REAL_RECOVERY_LATCH_PRESENT = RECOVER.recovery_latch_present
 REAL_ACQUIRE_LOCK = RECOVER.acquire_lock
 HOST_PATH_PREFIXES = ("/run/", "/sys/", "/proc/", "/dev/", "/etc/", "/var/")
+REAL_PATH_OPEN = pathlib.Path.open
 
 
 class HardwareIsolatedTestCase(unittest.TestCase):
@@ -1077,6 +1081,114 @@ class RecoveryLockTests(HardwareIsolatedTestCase):
             with self.assertRaisesRegex(RuntimeError, "unsafe fan-control lock"):
                 RECOVER.acquire_lock(0.1)
         opened.assert_not_called()
+
+
+class KeeperLoopMemoryTests(HardwareIsolatedTestCase):
+    """Bound allocator growth across the whole keeper loop.
+
+    The real run_keeper() runs thousands of passes against a private
+    file-backed sysfs tree: real identity checks, control reads, guarded
+    writes with readback and RPM classification, with timing diagnostics,
+    through a repeating cycle of external Boost-off toggles, low, invalid and
+    missing RPM, curve drift and a resume. Every fake is a plain function: a
+    Mock records each call and would itself grow by far more than a leak.
+    """
+
+    WARMUP = 1000
+    PASSES = 4000
+    CYCLE = 60
+
+    def test_whole_keeper_loop_retains_no_memory_per_pass(self):
+        ec = RECOVER.BASE
+        wmi = ec.parent / "wmi"
+
+        def put(path, value):
+            # Path.open stays blocked by the suite guard outside the loop.
+            with open(path, "w", encoding="ascii") as stream:
+                stream.write(value + "\n")
+
+        for path, value in {
+            ec / "fw_version": RECOVER.fan_control.FIRMWARE,
+            ec / "fan_curve": RECOVER.DEFAULT,
+            ec / "fan_mode": "advanced",
+            ec / "cooler_boost": "on",
+            wmi / "fan1_input": "4400",
+            wmi / "fan2_input": "4400",
+        }.items():
+            path.parent.mkdir(parents=True, exist_ok=True)
+            put(path, value)
+        private = str(ec.parent) + "/"
+        legacy = {RECOVER.fan_control.SOURCE_PATH: RECOVER.fan_control.LEGACY_SRCVERSION}
+        clock = {"now": 0.0, "offset": 0.0, "passes": 0}
+        measured = {}
+
+        def private_open(path, *args, **kwargs):
+            if not str(path).startswith(private):
+                raise AssertionError(f"host open blocked: {path}")
+            return REAL_PATH_OPEN(path, *args, **kwargs)
+
+        def host_identity(_read, _base):
+            return dict(legacy)
+
+        def scenario(phase):
+            fans = {10: "1000", 15: "4400", 20: "65535", 25: "4400"}
+            if phase in (5, 35):
+                put(ec / "cooler_boost", "off")
+            elif phase in fans:
+                put(wmi / "fan1_input", fans[phase])
+                put(wmi / "fan2_input", fans[phase])
+            elif phase == 30:
+                (wmi / "fan1_input").unlink()
+            elif phase == 31:
+                put(wmi / "fan1_input", "4400")
+            elif phase == 40:
+                put(ec / "fan_mode", "auto")
+                put(ec / "fan_curve", RECOVER.FACTORY)
+            elif phase == 50:
+                clock["offset"] += 100.0
+
+        def sleep(seconds):
+            clock["now"] += seconds
+            clock["passes"] += 1
+            if clock["passes"] == self.WARMUP:
+                gc.collect()
+                measured["before"] = sys.getallocatedblocks()
+            elif clock["passes"] == self.WARMUP + self.PASSES:
+                gc.collect()
+                measured["after"] = sys.getallocatedblocks()
+                RECOVER.STOP = True
+            scenario(clock["passes"] % self.CYCLE)
+
+        original_stop = RECOVER.STOP
+        RECOVER.STOP = False
+        try:
+            with contextlib.ExitStack() as stack:
+                stack.enter_context(mock.patch.dict(
+                    RECOVER.os.environ, {"MSI_FAN_TIMING_METRICS": "1"}))
+                for name, value in (
+                        ("read", REAL_RECOVERY_READ), ("write", REAL_RECOVERY_WRITE),
+                        ("one_hwmon", lambda _name: wmi),
+                        ("notify", lambda _message: None),
+                        ("mark_recovery_latch", lambda _profile: None)):
+                    stack.enter_context(mock.patch.object(RECOVER, name, value))
+                stack.enter_context(mock.patch.object(pathlib.Path, "open", private_open))
+                stack.enter_context(mock.patch.object(
+                    RECOVER.fan_control, "host_identity", host_identity))
+                for name, value in (
+                        ("monotonic", lambda: clock["now"]),
+                        ("clock_gettime", lambda _clock: clock["now"] + clock["offset"]),
+                        ("sleep", sleep)):
+                    stack.enter_context(mock.patch.object(RECOVER.time, name, value))
+                sink = stack.enter_context(open(os.devnull, "w", encoding="ascii"))
+                stack.enter_context(mock.patch.object(RECOVER.sys, "stderr", sink))
+                self.assertEqual(RECOVER.run_keeper("candidate14"), 0)
+        finally:
+            RECOVER.STOP = original_stop
+
+        for name, value in (("fan_curve", RECOVER.DEFAULT), ("fan_mode", "advanced"),
+                            ("cooler_boost", "on")):
+            self.assertEqual(read_private(ec / name), f"{value}\n".encode("ascii"))
+        self.assertLess(measured["after"] - measured["before"], self.PASSES // 10)
 
 
 if __name__ == "__main__":

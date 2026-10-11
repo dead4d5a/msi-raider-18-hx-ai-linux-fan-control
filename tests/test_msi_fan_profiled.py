@@ -1648,6 +1648,168 @@ class HealthPublicationTests(unittest.TestCase):
         self.assertLess(growth, publications // 10)
 
 
+class RootOwnedPath(pathlib.PosixPath):
+    """A private temporary path whose metadata reports root ownership."""
+
+    @staticmethod
+    def as_root(info):
+        return types.SimpleNamespace(
+            st_mode=info.st_mode, st_uid=0, st_gid=0, st_nlink=info.st_nlink,
+            st_dev=info.st_dev, st_ino=info.st_ino)
+
+    def lstat(self):
+        return self.as_root(DAEMON.os.lstat(self))
+
+    def stat(self, *, follow_symlinks=True):
+        return self.as_root(DAEMON.os.stat(self, follow_symlinks=follow_symlinks))
+
+
+class MainLoopMemoryTests(HardwareFreeMainLoopTests):
+    """Bound allocator growth across the whole 1 Hz loop, not only publication.
+
+    The real main() runs thousands of passes against a private file-backed
+    sysfs tree: real control reads, identity-guarded writes with readback,
+    sampling, timing metrics and health publication, through a repeating
+    cycle of a manual request and queued release, a sustained alarm and its
+    automatic latch, a keyboard off, degraded telemetry, a resume reapply and
+    an observation gap. Only the clock, notification, acknowledgement, hwmon
+    discovery, host identity and root ownership are virtual. Every fake is a
+    plain function: a Mock records each call and would itself grow by far
+    more than the leak being measured.
+    """
+
+    WARMUP = 1000
+    PASSES = 4000
+    CYCLE = 120
+
+    def test_whole_main_loop_retains_no_memory_per_pass(self):
+        ec, wmi, core = DAEMON.BASE, self.runtime / "wmi", self.runtime / "core"
+        for path, value in {
+            ec / "fw_version": DAEMON.fan_control.FIRMWARE,
+            ec / "shift_mode": "comfort",
+            ec / "fan_curve": DAEMON.DEFAULT,
+            ec / "fan_mode": "advanced",
+            ec / "cooler_boost": "off",
+            ec / "cpu/realtime_temperature": "50",
+            ec / "gpu/realtime_temperature": "40",
+            wmi / "fan1_input": "4400",
+            wmi / "fan2_input": "4400",
+            core / "temp1_input": "50000",
+        }.items():
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(value + "\n")
+        lock = RootOwnedPath(DAEMON.LOCK)
+        lock.touch()
+        lock.chmod(0o600)
+        private = str(self.runtime) + "/"
+        cgroup = pathlib.Path("/proc/self/cgroup")
+        real_read = DAEMON.read
+        real_open = DAEMON.os.open
+        legacy = {DAEMON.fan_control.SOURCE_PATH: DAEMON.fan_control.LEGACY_SRCVERSION}
+        clock = {"now": 0.0, "offset": 0.0, "passes": 0}
+        measured = {}
+        lock_descriptors = []
+        states = dict.fromkeys(("normal", "cooling", "degraded"), 0)
+
+        def private_read(path):
+            if path == cgroup:
+                return "0::/system.slice/msi-fan-profile.service"
+            if not str(path).startswith(private):
+                raise AssertionError(f"host read blocked: {path}")
+            return real_read(path)
+
+        def host_identity(_read, _base):
+            return dict(legacy)
+
+        def lock_tracking_open(path, flags, mode=0o777, *, dir_fd=None):
+            # main() keeps its lock descriptor open until the process exits.
+            descriptor = real_open(path, flags, mode, dir_fd=dir_fd)
+            if path is lock:
+                lock_descriptors.append(descriptor)
+            return descriptor
+
+        def publish(payload):
+            states[payload["state"]] += 1
+            self.real_health_publisher(payload)
+
+        def scenario(phase):
+            if phase == 20:
+                DAEMON.on_boost(0, None)
+            elif phase == 25:
+                DAEMON.on_release(0, None)
+            elif phase == 30:
+                (core / "temp1_input").write_text("99000\n")
+            elif phase == 56:
+                (core / "temp1_input").write_text("90000\n")
+            elif phase == 60:
+                (ec / "cooler_boost").write_text("off\n")
+            elif phase == 62:
+                (ec / "cpu/realtime_temperature").write_text("255\n")
+            elif phase == 70:
+                (ec / "cpu/realtime_temperature").write_text("50\n")
+                (core / "temp1_input").write_text("50000\n")
+            elif phase == 110:
+                clock["offset"] += 100.0
+            elif phase == 115:
+                clock["now"] += 3.0
+
+        def sleep(seconds):
+            clock["now"] += seconds
+            clock["passes"] += 1
+            if clock["passes"] == self.WARMUP:
+                gc.collect()
+                measured["before"] = sys.getallocatedblocks()
+            elif clock["passes"] == self.WARMUP + self.PASSES:
+                gc.collect()
+                measured["after"] = sys.getallocatedblocks()
+                DAEMON.STOP = True
+            scenario(clock["passes"] % self.CYCLE)
+
+        original_stop = DAEMON.STOP
+        original_boost_request = DAEMON.BOOST_REQUEST
+        original_release_request = DAEMON.RELEASE_REQUEST
+        DAEMON.STOP = False
+        DAEMON.BOOST_REQUEST = False
+        DAEMON.RELEASE_REQUEST = False
+        try:
+            with contextlib.ExitStack() as stack:
+                stack.enter_context(mock.patch.dict(
+                    DAEMON.os.environ, {"MSI_FAN_TIMING_METRICS": "1"}))
+                for name, value in (
+                        ("read", private_read), ("LOCK", lock),
+                        ("HEALTH", RootOwnedPath(DAEMON.HEALTH)),
+                        ("publish_health", publish),
+                        ("one_hwmon", lambda name: wmi if name == "msi_wmi_platform" else core),
+                        ("notify", lambda _message: None),
+                        ("acknowledge", lambda _action: None)):
+                    stack.enter_context(mock.patch.object(DAEMON, name, value))
+                stack.enter_context(mock.patch.object(
+                    DAEMON.fan_control, "host_identity", host_identity))
+                for name, value in (("geteuid", lambda: 0),
+                                    ("fchown", lambda _fd, _uid, _gid: None),
+                                    ("open", lock_tracking_open)):
+                    stack.enter_context(mock.patch.object(DAEMON.os, name, value))
+                for name, value in (
+                        ("monotonic", lambda: clock["now"]),
+                        ("clock_gettime", lambda _clock: clock["now"] + clock["offset"]),
+                        ("sleep", sleep)):
+                    stack.enter_context(mock.patch.object(DAEMON.time, name, value))
+                sink = stack.enter_context(open(DAEMON.os.devnull, "w", encoding="ascii"))
+                stack.enter_context(contextlib.redirect_stderr(sink))
+                self.assertEqual(DAEMON.main(), 0)
+        finally:
+            for descriptor in lock_descriptors:
+                DAEMON.os.close(descriptor)
+            DAEMON.STOP = original_stop
+            DAEMON.BOOST_REQUEST = original_boost_request
+            DAEMON.RELEASE_REQUEST = original_release_request
+
+        self.assertEqual(len(lock_descriptors), 1)
+        self.assertTrue(all(count > self.PASSES // 20 for count in states.values()), states)
+        self.assertEqual((ec / "cooler_boost").read_text(), "off\n")
+        self.assertLess(measured["after"] - measured["before"], self.PASSES // 10)
+
+
 class RecoveryLatchValidationTests(unittest.TestCase):
     def test_unsafe_recovery_marker_fails_closed_before_opening_it(self):
         unsafe = mock.Mock()

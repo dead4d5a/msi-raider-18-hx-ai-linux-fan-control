@@ -19,6 +19,10 @@
   for fan-response evidence. A steady legacy pass drops from 57 to 44 EC bytes
   in the daemon and from 52 to 40 in the keeper. Every write and the manager's
   status keep their own `fw_version` read.
+- Test allocator growth across thousands of passes of the real daemon main loop
+  and keeper loop on a private file-backed sysfs tree, with plain-function
+  fakes, so a per-pass leak anywhere in either loop fails the suite, not only
+  one in health publication.
 - Stop `factory-auto` from disabling the service when it is merely too hot to
   release Cooler Boost. When the verified factory curve and auto mode are in
   place and only the cool release is refused (heat, or invalid or unavailable
