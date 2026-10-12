@@ -142,6 +142,16 @@ for index in "${!source_files[@]}"; do
   cmp -s "${source_files[$index]}" "$staged"
 done
 
+# Describe the tree the release checks verified and the stage now holds, not
+# whatever the checkout holds after the cool-down wait.
+commit=$(git -C "$repo" rev-parse --verify HEAD 2>/dev/null || printf 'unavailable')
+if [[ -n $(git -C "$repo" status --porcelain 2>/dev/null || true) ]]; then
+  dirty=yes
+else
+  dirty=no
+fi
+manifest_sum=$(sha256sum "$repo/SHA256SUMS" | awk '{print $1}')
+
 # Read one sysfs attribute into reading; empty if it is missing or unreadable.
 read_attribute() {
   reading=''
@@ -236,6 +246,17 @@ if ((waiting)); then
   echo "Cooled below $cool_limits after $waited s: $(cooling_readings)"
 fi
 
+# The wait can last minutes, during which the operator may pull or edit the
+# checkout. The post-install check compares the deployed artifacts with the
+# source, so hand over only while the source still matches the verified stage;
+# otherwise that check would fail after factory-auto and the replacement.
+for index in "${!source_files[@]}"; do
+  cmp -s "${source_files[$index]}" "$stage${target_files[$index]}" || {
+    echo "Upgrade not started: ${source_files[$index]} changed during the cool-down wait. No installed file, service or fan setting was changed; rerun." >&2
+    exit 1
+  }
+done
+
 # A reload clears stale manager metadata before the old manager takes the
 # controller to its guarded factory-auto state.
 systemctl daemon-reload
@@ -300,16 +321,10 @@ for index in "${!source_files[@]}"; do
   [[ $(stat -c '%U:%G:%a' "${target_files[$index]}") == "root:root:$expected_mode" ]]
 done
 
-commit=$(git -C "$repo" rev-parse --verify HEAD 2>/dev/null || printf 'unavailable')
-if [[ -n $(git -C "$repo" status --porcelain 2>/dev/null || true) ]]; then
-  dirty=yes
-else
-  dirty=no
-fi
 {
   printf 'source_commit=%s\n' "$commit"
   printf 'source_tree_dirty=%s\n' "$dirty"
-  printf 'source_manifest_sha256=%s\n' "$(sha256sum "$repo/SHA256SUMS" | awk '{print $1}')"
+  printf 'source_manifest_sha256=%s\n' "$manifest_sum"
   for index in "${!source_files[@]}"; do
     printf '%s  %s\n' "$(sha256sum "${target_files[$index]}" | awk '{print $1}')" \
       "${target_files[$index]}"

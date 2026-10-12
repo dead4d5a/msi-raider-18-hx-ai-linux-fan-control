@@ -13,6 +13,10 @@
   counting an unreadable or invalid reading such as the EC's 255 as cool. It
   prints the readings every 30 seconds, and after 600 seconds
   (`MSI_FAN_UPGRADE_COOL_TIMEOUT`, 10 to 86400) exits `1` with nothing changed.
+  If a deployed source file changes during the wait, for example through a
+  `git pull`, it also exits `1` with nothing changed instead of failing its
+  post-install check after `factory-auto`, and `INSTALL_RECORD` names the commit
+  and manifest from before the wait.
 - Document what a clean stop does while hot: the daemon exits `1` with
   `factory restored; Boost release unsafe`, and recovery returns the EC to
   Candidate 14/`advanced` with Cooler Boost on. Record the 2026-10-10/11 field

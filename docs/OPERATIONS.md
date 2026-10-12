@@ -297,7 +297,8 @@ keeper keeps cooling:
    until the CPU package and EC CPU are below 80 °C and the EC GPU below 65 °C
    for 10 seconds before it touches the controller; if that takes longer than
    600 seconds (`MSI_FAN_UPGRADE_COOL_TIMEOUT`), it exits with nothing changed.
-   Stop heavy workloads and rerun it. Afterwards,
+   Stop heavy workloads and rerun it. Do not pull or edit the checkout while it
+   waits; a changed source file also stops it with nothing changed. Afterwards,
    check `controller_memory.memory_peak_bytes` over several days; it should
    stay far below 64 MiB.
 

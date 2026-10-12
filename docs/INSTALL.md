@@ -106,7 +106,12 @@ CPU package (coretemp) and EC CPU are below 80 °C and the EC GPU is below 65 °
 An unreadable or invalid reading, such as the EC's 255, never counts as cool.
 It prints the readings about every 30 seconds. After 600 seconds it exits `1`
 with `did not cool below ... within 600 s; stop heavy workloads and rerun`,
-having changed nothing. To wait longer, set a timeout from 10 to 86400 seconds:
+having changed nothing. Leave the checkout alone while it waits: if a file it
+deploys no longer matches the verified stage when the wait ends, it exits `1`
+with `... changed during the cool-down wait`, also having changed nothing, and
+the upgrade has to be rerun. `INSTALL_RECORD` describes the commit and manifest
+as they were before the wait. To wait longer, set a timeout from 10 to 86400
+seconds:
 
 ```bash
 sudo env MSI_FAN_UPGRADE_COOL_TIMEOUT=1200 ./scripts/upgrade-profile.sh

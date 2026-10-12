@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import pathlib
@@ -167,7 +168,8 @@ elif command == "install":
 
 # The cool-down gate's one-second wait. It records the call and advances the
 # scripted sensor readings to the next sample instead of waiting; bash keeps
-# each of the many samples cheap.
+# each of the many samples cheap. On the first wait it can also edit a file in
+# the source checkout, as an operator's git pull or editor would.
 SLEEP_SHIM = textwrap.dedent(r'''\
 #!/usr/bin/env bash
 set -euo pipefail
@@ -177,9 +179,13 @@ printf '%s\n' '["sleep", "1"]' >> "$root/calls.jsonl"
 slept=1
 [[ ! -f $root/slept ]] || slept=$(($(<"$root/slept") + 1))
 printf '%s\n' "$slept" > "$root/slept"
+if ((slept == 1)) && [[ -n ${UPGRADE_TEST_EDIT_DURING_WAIT-} ]]; then
+    printf 'edited during the cool-down wait\n' >> "$UPGRADE_TEST_EDIT_DURING_WAIT"
+fi
 mapfile -t samples <<< "${UPGRADE_TEST_TEMPERATURES-}"
 if ((slept < ${#samples[@]})); then
-    read -r package cpu gpu <<< "${samples[slept]}"
+    # Comma-separated, so an empty (unreadable) reading keeps its position.
+    IFS=, read -r package cpu gpu <<< "${samples[slept]}"
     printf '%s\n' "$package" > "$root/sys/class/hwmon/hwmon8/temp1_input"
     printf '%s\n' "$cpu" > "$root/sys/devices/platform/msi-ec/cpu/realtime_temperature"
     printf '%s\n' "$gpu" > "$root/sys/devices/platform/msi-ec/gpu/realtime_temperature"
@@ -203,14 +209,17 @@ LATCH_PAYLOAD = "candidate14\n"
 class UpgradeSandboxTestCase(unittest.TestCase):
     def run_upgrade(self, failure, *, sudo=("4242", "4343"), unreadable=False,
                     latch_mode=None, initial=None, marker=False, temperatures=(COOL,),
-                    hwmon=None, cool_timeout=None):
+                    hwmon=None, cool_timeout=None, edit_during_wait=None):
         """Run the sandboxed upgrade.
 
         temperatures holds one (package, EC CPU, EC GPU) sample per cool-down
         gate sample; the first is written here verbatim (None leaves the file
-        missing), each later one by the sleep shim, and the last one persists.
-        hwmon maps hwmon directory names to their reported name.
+        missing), each later one by the sleep shim ("" is an unreadable
+        reading), and the last one persists. hwmon maps hwmon directory names
+        to their reported name. edit_during_wait names a release file the
+        first cool-down wait appends to.
         """
+        self.assertNotIn(None, [reading for sample in temperatures[1:] for reading in sample])
         with tempfile.TemporaryDirectory() as temporary:
             sandbox = pathlib.Path(temporary)
             release = sandbox / "release"
@@ -325,12 +334,14 @@ class UpgradeSandboxTestCase(unittest.TestCase):
                 environment["UPGRADE_TEST_UNREADABLE"] = str(release)
             if cool_timeout is not None:
                 environment["MSI_FAN_UPGRADE_COOL_TIMEOUT"] = cool_timeout
+            if edit_during_wait is not None:
+                environment["UPGRADE_TEST_EDIT_DURING_WAIT"] = str(release / edit_during_wait)
             environment.update(PATH=str(mock_bin) + os.pathsep + str(allowed_bin),
                                UPGRADE_TEST_ROOT=str(sandbox), UPGRADE_TEST_FAIL_AT=failure,
                                UPGRADE_TEST_FACTORY=FACTORY, UPGRADE_TEST_DEFAULT=DEFAULT,
                                # Line N is the sample after the Nth sleep.
                                UPGRADE_TEST_TEMPERATURES="\n".join(
-                                   ["written above", *map(" ".join, temperatures[1:])]))
+                                   ["written above", *map(",".join, temperatures[1:])]))
             self.deployed_before = self.deployed_files(sandbox)
             result = subprocess.run(["bash", str(release / "scripts/upgrade-profile.sh")],
                                     env=environment, text=True, capture_output=True, timeout=30)
@@ -346,7 +357,7 @@ class UpgradeSandboxTestCase(unittest.TestCase):
             self.latch_remaining = latch.exists()
             self.deployed_after = self.deployed_files(sandbox)
             self.deployed = {path: mode for path, (mode, _) in self.deployed_after.items()}
-            record =sandbox / "usr/local/share/doc/msi-fan-profile/INSTALL_RECORD"
+            record = sandbox / "usr/local/share/doc/msi-fan-profile/INSTALL_RECORD"
             self.record = record.read_text() if record.exists() else ""
             return result, state, calls
 
@@ -566,6 +577,49 @@ class UpgradeCoolDownGateTests(UpgradeSandboxTestCase):
                 self.assertIn(reading, result.stderr.split("Last readings: ")[1])
                 self.assertIn("An unreadable or invalid reading never counts as cool",
                               result.stderr)
+
+    def test_invalid_sample_restarts_the_cool_count(self):
+        # Like a hot one, an unreadable or invalid sample in the middle of a
+        # cool streak restarts the count of consecutive cool samples.
+        for bad, reading in ((("52000", "255", "40"), "EC CPU invalid (255)"),
+                             (("", "50", "40"), "CPU package unreadable"),
+                             (("52000", "50", "-1"), "EC GPU invalid (-1)")):
+            with self.subTest(bad=bad):
+                samples = [COOL] * 9 + [bad] + [COOL] * 10
+                result, state, calls = self.run_upgrade("", temperatures=samples)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assert_gate_precedes_live_changes(calls, sleeps=len(samples) - 1)
+                self.assertRegex(result.stdout, r"Waiting up to 600 s .*: .*" + re.escape(reading))
+                self.assertIn(f"Cooled below {self.LIMITS} after 19 s", result.stdout)
+                self.assertEqual((state["curve"], state["mode"], state["boost"]),
+                                 (DEFAULT, "advanced", "off"))
+
+    def test_source_change_during_the_wait_stops_before_any_live_change(self):
+        # The wait can last minutes, and the operator may pull or edit the
+        # checkout meanwhile. The stage then no longer matches the source, so the
+        # upgrade stops before factory-auto rather than after replacing artifacts.
+        for relative, temperatures, sleeps in (("README.md", (HOT, *[COOL] * 10), 10),
+                                               ("src/msi-fan-profiled", (COOL,), 9),
+                                               ("docs/OPERATIONS.md", (COOL,), 9)):
+            with self.subTest(relative=relative):
+                result, state, calls = self.run_upgrade(
+                    "", temperatures=temperatures, edit_during_wait=relative)
+                self.assert_nothing_changed(result, state, calls)
+                self.assertEqual(calls.count(["sleep", "1"]), sleeps)
+                self.assertRegex(result.stderr, r"Upgrade not started: \S*/release/"
+                                 + re.escape(relative) + r" changed during the cool-down "
+                                 r"wait\. No installed file, service or fan setting was "
+                                 r"changed; rerun\.")
+
+    def test_install_record_names_the_manifest_verified_before_the_wait(self):
+        # A manifest change during the wait leaves every deployed artifact as
+        # verified, and the record still names the manifest the checks used.
+        result, _, calls = self.run_upgrade("", temperatures=(HOT, *[COOL] * 10),
+                                            edit_during_wait="SHA256SUMS")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assert_gate_precedes_live_changes(calls, sleeps=10)
+        verified = hashlib.sha256(b"test artifact\n").hexdigest()
+        self.assertIn(f"source_manifest_sha256={verified}\n", self.record)
 
     def test_invalid_cool_down_timeout_is_rejected_before_any_change(self):
         for value in ("", "0", "9", "86401", "-5", "010", "1.5", "60s", "abc"):
