@@ -41,9 +41,10 @@
 
 ## Field evidence on 2026-10-10 and 2026-10-11
 
-These are unattended production events on the signed legacy driver
-`AB0BFAE2391B5ADD66E01BD`, taken from the journal (America/Denver). They are
-field observations, not attended or injected-fault tests.
+These are production events on the signed legacy driver
+`AB0BFAE2391B5ADD66E01BD`, taken from the journal (America/Denver). All but the
+operator-run upgrade attempt at 19:02 were unattended. They are field
+observations, not attended or injected-fault tests.
 
 - Memory-limit kill: the 2026-09-30 build's daemon, started at the 2026-10-03
   boot, ran until 2026-10-10 11:30:34, six days and 20 hours, when
@@ -76,6 +77,18 @@ field observations, not attended or injected-fault tests.
 - A cool reboot on 7.0.0-38 at 14:40 left verified factory auto/off. On the next
   boot `systemd-tmpfiles-setup` finished at 8.8 s and Candidate 14 was applied
   at 13.4 s.
+- Upgrade attempt on 2026-10-11 at 19:02 under bursty load (six database insert
+  processes at about 80% CPU each): the upgrade's cool-down gate passed with 10
+  consecutive one-second samples, the last at CPU package 59 °C, EC CPU 60 °C
+  and EC GPU 44 °C. 0.26 s later the installed 6ed5498 daemon's single-reading
+  release check found it not cool, so the daemon exited with
+  `factory restored; Boost release unsafe`, `ExecStopPost` staged Candidate
+  14/`advanced` with Boost and the recovery marker, and that release's manager
+  refused `factory-auto` and disabled the service. The upgrade replaced
+  nothing. The operator reports that these sensors are flaky: the coretemp
+  package reading jumps 20 °C or more within milliseconds under bursty load,
+  and the EC sometimes returns junk such as 255 °C, 65535 RPM or an empty
+  value. The unreleased cool confirmation in `CHANGELOG.md` responds to this.
 
 ## Automated validation on 2026-09-30
 

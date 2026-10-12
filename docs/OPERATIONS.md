@@ -196,7 +196,8 @@ This:
 2. Stops the profile daemon.
 3. Restores the captured factory curve.
 4. Selects firmware auto mode.
-5. Verifies Cooler Boost is off only when temperatures permit.
+5. Releases Cooler Boost only after six consecutive valid, cool samples 0.5 s
+   apart, within 10 seconds, and verifies that it is off.
 
 The profile remains enabled, but the `/run` marker blocks starts for this boot.
 Because `/run` is temporary, Candidate 14 returns automatically after reboot.
@@ -204,13 +205,21 @@ Run `apply-default` to return without rebooting. `factory-auto` never changes
 boot enablement, so it also succeeds for a persistently disabled service, and
 `status` accepts the factory override either way.
 
-If the machine is too hot to release Cooler Boost (CPU package or EC CPU at or
-above 85 °C, or EC GPU at or above 70 °C), or the temperature telemetry is
+One reading never decides the release; `SAFETY.md` describes the shared
+confirmation. The daemon's clean stop and its `ExecStopPost` helper confirm the
+same way before the manager does, so a cool `factory-auto` takes about 7.5
+seconds longer than a single reading did. A spike or a junk value, such as the
+EC's 255, only restarts the count.
+
+If no six consecutive samples within 10 seconds are valid and cool, because
+the machine stays too hot to release Cooler Boost (CPU package or EC CPU at or
+above 85 °C, or EC GPU at or above 70 °C) or the temperature telemetry stays
 invalid or unavailable, `factory-auto` exits `1` with
-`factory staged with Boost on; ... rerun factory-auto when cool`. The verified
-factory curve and auto mode are in place with Cooler Boost on. The marker,
-boot enablement, and any recovery-Boost marker are left as they were, so
-`status` exits `1` until the transition completes. Rerun `factory-auto` once the
+`factory staged with Boost on; ... rerun factory-auto when cool`. The line
+before it, `Cooler Boost release not confirmed: ...`, names the most recent
+unsafe sample. The verified factory curve and auto mode are in place with
+Cooler Boost on. The marker, boot enablement, and any recovery-Boost marker are
+left as they were, so `status` exits `1` until the transition completes. Rerun `factory-auto` once the
 machine is cool, or run `apply-default` to resume Candidate 14; a retained
 recovery marker then makes its Boost an automatic 30-second-cooldown latch.
 Any other failure, such as an identity, stop, lock, EC readback, or
@@ -222,10 +231,23 @@ same clean-stop path as for the stop request, not a fault exit.
 
 ## Stopping or rebooting while hot
 
-A clean stop releases Cooler Boost only when it is cool. When a
-`systemctl stop` or a reboot catches the machine hot, the journal shows
-`ERROR ProfileError: factory restored; Boost release unsafe`, followed by
-`runtime recovery verified Candidate14/advanced with Cooler Boost on`. This is
+A clean stop releases Cooler Boost only once six consecutive valid samples,
+0.5 s apart within 10 seconds, are cool. The journal then shows
+`Cooler Boost release confirmed: 6 consecutive valid cool samples ...`, and
+`ExecStopPost` confirms the same way before it logs
+`successful candidate14 service left thermally verified factory auto/off`.
+While it waits, the daemon's status reads
+`Factory auto restored; confirming cool before Cooler Boost release: N/6 ...`.
+When a `systemctl stop` or a reboot catches the machine hot for that whole
+window, the journal shows
+`WARNING Cooler Boost release refused: no 6 consecutive valid cool samples ...`
+and `ERROR ProfileError: factory restored; Boost release unsafe`, followed by
+`runtime recovery verified Candidate14/advanced with Cooler Boost on`. If the
+machine heats up again after the daemon released Boost, `ExecStopPost` switches
+Boost back on at its first unsafe sample and, without a new confirmed window,
+logs `Boost release refused: ...` and
+`successful service ended factory auto/off while too hot; Boost re-enabled`;
+the unit then fails like a hot stop. This is
 intended. While the system keeps running, the unit is failed, the keeper holds
 full cooling, and `status` exits `1`; run `sudo msi-fan-profile apply-default`
 once the machine is cool. At shutdown the keeper cannot start, and systemd logs

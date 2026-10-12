@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 set -Eeuo pipefail
 
+repo=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 [[ $EUID -eq 0 ]] || { echo 'Run with sudo.' >&2; exit 1; }
 base=/sys/devices/platform/msi-ec
 factory='58 64 70 76 82 88 0 25 35 44 58 70 75 52 58 64 70 76 82 0 25 35 44 58 70 75'
@@ -69,19 +70,16 @@ printf 'on\n' > "$base/cooler_boost"
 [[ $(cat "$base/fan_curve") == "$factory" ]]
 [[ $(cat "$base/cooler_boost") == on ]]
 
-core=''
-for h in /sys/class/hwmon/hwmon*; do
-  [[ $(cat "$h/name" 2>/dev/null) == coretemp ]] && core=$h
-done
-[[ -n $core ]]
-package=$(cat "$core/temp1_input")
-ec_cpu=$(cat "$base/cpu/realtime_temperature")
-ec_gpu=$(cat "$base/gpu/realtime_temperature")
-(( package < 85000 && ec_cpu < 85 && (ec_gpu == 0 || ec_gpu < 70) )) || {
-  echo 'Factory restored, but machine is too hot to release Cooler Boost.' >&2
+# One reading never releases Boost. The shared, read-only helper requires
+# consecutive valid, cool samples, exactly as the controllers do; an empty,
+# junk or hot reading restarts the count, and it gives up within 10 seconds.
+if ! /usr/bin/python3 -I -B "$repo/src/msi_fan_control.py" confirm-cool \
+    /sys/class/hwmon "$base"; then
+  printf 'on\n' > "$base/cooler_boost" 2>/dev/null || true
+  echo 'Factory restored, but machine is too hot to release Cooler Boost, or its temperature telemetry is invalid.' >&2
   echo 'Files were not removed. Cool down and retry.' >&2
   exit 1
-}
+fi
 printf 'off\n' > "$base/cooler_boost"
 if [[ $(cat "$base/fan_mode" 2>/dev/null) != auto ||
       $(cat "$base/fan_curve" 2>/dev/null) != "$factory" ||

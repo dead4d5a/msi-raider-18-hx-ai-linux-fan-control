@@ -274,6 +274,11 @@ def hw():
     }
 
 
+def reassert_boost(_reading=None):
+    if read(BASE / 'cooler_boost') != 'on':
+        write(BASE / 'cooler_boost', 'on')
+
+
 def restore_factory_locked(release=True):
     for path, value in (
             (BASE / 'cooler_boost', 'on'), (BASE / 'fan_mode', 'auto'),
@@ -290,19 +295,29 @@ def restore_factory_locked(release=True):
     try:
         core = [path for path in pathlib.Path('/sys/class/hwmon').glob('hwmon*')
                 if (path / 'name').exists() and read(path / 'name') == 'coretemp']
-        if len(core) != 1:
-            raise FactoryReleaseRefused(
-                'factory restored but coretemp discovery failed; Boost retained')
-        package = int(read(core[0] / 'temp1_input'))
-        cpu = int(read(BASE / 'cpu/realtime_temperature'))
-        gpu = int(read(BASE / 'gpu/realtime_temperature'))
     except (OSError, ValueError) as error:
         raise FactoryReleaseRefused(
             f'factory restored but telemetry is unavailable: {error}; Boost retained') from error
-    if not (0 <= package <= 110000 and 0 <= cpu <= 110 and 0 <= gpu <= 110):
-        raise FactoryReleaseRefused('factory restored but telemetry is invalid; Boost retained')
-    if max(package, cpu * 1000) >= 85000 or not (gpu == 0 or gpu < 70):
-        raise FactoryReleaseRefused('factory restored but too hot to release Boost')
+    if len(core) != 1:
+        raise FactoryReleaseRefused(
+            'factory restored but coretemp discovery failed; Boost retained')
+    # One reading never releases Boost: confirm over consecutive valid, cool
+    # samples, and reassert Boost at once if anything turned it off meanwhile.
+    confirmation = fan_control.confirm_cool(
+        fan_control.cool_sampler(read, core[0], BASE),
+        on_unsafe=reassert_boost)
+    if not confirmation.cool:
+        print(f'Cooler Boost release not confirmed: {confirmation.reason}', file=sys.stderr)
+        unsafe = confirmation.unsafe
+        if unsafe is not None and unsafe.state == 'hot':
+            raise FactoryReleaseRefused('factory restored but too hot to release Boost')
+        if unsafe is not None and unsafe.state == 'invalid':
+            raise FactoryReleaseRefused(
+                'factory restored but telemetry is invalid; Boost retained')
+        detail = (unsafe.detail.removeprefix('telemetry unavailable: ') if unsafe
+                  else confirmation.reason)
+        raise FactoryReleaseRefused(
+            f'factory restored but telemetry is unavailable: {detail}; Boost retained')
     write(BASE / 'fan_mode', 'auto')
     write(BASE / 'cooler_boost', 'off')
     hardware = hw()

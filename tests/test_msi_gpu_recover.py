@@ -932,59 +932,91 @@ class ExecStopPostDecisionTests(HardwareIsolatedTestCase):
 
 
 class ReleaseBoostIfCoolTests(HardwareIsolatedTestCase):
+    COOL = ("60000", "60", "50")
+    HOT = ("90000", "60", "50")
+
     def release(self, package="60000", ec_cpu="60", ec_gpu="50", *, readback=None,
-                core=pathlib.Path("/fake/core")):
-        state = {"fan_mode": "auto", "fan_curve": RECOVER.FACTORY, "cooler_boost": "on",
-                 "temp1_input": package}
-        temperatures = {"cpu": ec_cpu, "gpu": ec_gpu}
+                core=pathlib.Path("/fake/core"), script=None, boost="on",
+                real_request=False):
+        """Replay one reading per sample (the last repeats) on a fake clock."""
+        readings = script or [(package, ec_cpu, ec_gpu)]
+        state = {"fan_mode": "auto", "fan_curve": RECOVER.FACTORY, "cooler_boost": boost}
+        clock = {"now": 0.0}
         self.writes = []
+        self.write_times = []
+        self.samples = []
 
         def fake_read(path):
+            if path.name == "temp1_input":
+                self.samples.append(clock["now"])
+            current = readings[max(0, min(len(self.samples), len(readings)) - 1)]
+            if path.name == "temp1_input":
+                return current[0]
             if path.name == "realtime_temperature":
-                return temperatures[path.parent.name]
+                return current[1 if path.parent.name == "cpu" else 2]
             if readback and path.name in readback and ("cooler_boost", "off") in self.writes:
                 return readback[path.name]
             return state[path.name]
 
         def fake_write(path, value):
             self.writes.append((path.name, value))
+            self.write_times.append(clock["now"])
             state[path.name] = value
+
+        def sleep(seconds):
+            clock["now"] += seconds
 
         hwmon = ({"side_effect": core} if isinstance(core, Exception)
                  else {"return_value": core})
-        with mock.patch.object(RECOVER, "one_hwmon", **hwmon), \
-                mock.patch.object(RECOVER, "read", side_effect=fake_read), \
-                mock.patch.object(RECOVER, "write", side_effect=fake_write), \
-                mock.patch.object(RECOVER, "request_boost_best_effort") as self.request, \
-                mock.patch.object(RECOVER.sys, "stderr", io.StringIO()):
-            return RECOVER.release_boost_if_cool()
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(mock.patch.object(RECOVER, "one_hwmon", **hwmon))
+            stack.enter_context(mock.patch.object(RECOVER, "read", side_effect=fake_read))
+            stack.enter_context(mock.patch.object(RECOVER, "write", side_effect=fake_write))
+            stack.enter_context(mock.patch.object(
+                RECOVER.time, "monotonic", side_effect=lambda: clock["now"]))
+            stack.enter_context(mock.patch.object(RECOVER.time, "sleep", side_effect=sleep))
+            if real_request:
+                self.request = None
+            else:
+                self.request = stack.enter_context(
+                    mock.patch.object(RECOVER, "request_boost_best_effort"))
+            self.stderr = stack.enter_context(
+                mock.patch.object(RECOVER.sys, "stderr", io.StringIO()))
+            result = RECOVER.release_boost_if_cool()
+        self.state = state
+        return result
 
     def test_cool_valid_telemetry_releases_to_factory_auto_off(self):
         for gpu in ("50", "0"):
             with self.subTest(gpu=gpu):
                 self.assertTrue(self.release(ec_gpu=gpu))
                 self.assertEqual(self.writes, [("fan_mode", "auto"), ("cooler_boost", "off")])
+                self.assertEqual(self.samples, [index * 0.5 for index in range(6)])
 
     def test_heat_at_any_release_threshold_never_writes(self):
         for telemetry in (("85000", "60", "50"), ("60000", "85", "50"), ("60000", "60", "70")):
             with self.subTest(telemetry=telemetry):
                 self.assertFalse(self.release(*telemetry))
                 self.assertEqual(self.writes, [])
+                self.request.assert_called_with()
 
     def test_invalid_telemetry_never_writes(self):
         for telemetry in (("60000", "255", "50"), ("110001", "60", "50"),
-                          ("60000", "60", "111")):
+                          ("60000", "60", "111"), ("0", "60", "50"), ("", "60", "50")):
             with self.subTest(telemetry=telemetry):
                 self.assertFalse(self.release(*telemetry))
                 self.assertEqual(self.writes, [])
+                self.assertIn("Boost release refused: no 6 consecutive valid cool samples",
+                              self.stderr.getvalue())
 
     def test_unreadable_telemetry_reasserts_boost(self):
-        for kwargs in ({"ec_cpu": "-1"}, {"package": "hot"},
-                       {"core": RuntimeError("expected one coretemp hwmon; found 0")}):
+        for kwargs, requests in (({"ec_cpu": "-1"}, 16), ({"package": "hot"}, 16),
+                                 ({"core": RuntimeError("expected one coretemp hwmon; "
+                                                        "found 0")}, 1)):
             with self.subTest(kwargs=kwargs):
                 self.assertFalse(self.release(**kwargs))
                 self.assertEqual(self.writes, [])
-                self.request.assert_called_once_with()
+                self.assertEqual(self.request.call_count, requests)
 
     def test_failed_final_readback_turns_boost_back_on(self):
         for readback in ({"cooler_boost": "on"}, {"fan_mode": "advanced"},
@@ -992,6 +1024,40 @@ class ReleaseBoostIfCoolTests(HardwareIsolatedTestCase):
             with self.subTest(readback=readback):
                 self.assertFalse(self.release(readback=readback))
                 self.assertEqual(self.writes[-1], ("cooler_boost", "on"))
+
+    def test_spike_right_after_a_clean_stop_switches_boost_on_then_releases_once_cool(self):
+        # The daemon left auto/off; one spike must neither leave Boost off while
+        # it is unsafe nor refuse a release once six cool samples agree.
+        self.assertTrue(self.release(script=[self.HOT, self.COOL], boost="off",
+                                     real_request=True))
+        self.assertEqual(self.samples, [index * 0.5 for index in range(7)])
+        self.assertEqual(list(zip(self.write_times, self.writes)), [
+            (0.0, ("cooler_boost", "on")), (3.0, ("fan_mode", "auto")),
+            (3.0, ("cooler_boost", "off"))])
+        self.assertEqual(self.state["cooler_boost"], "off")
+
+    def test_persistent_heat_switches_boost_on_at_once_and_refuses(self):
+        self.assertFalse(self.release(script=[self.HOT], boost="off", real_request=True))
+        self.assertEqual(list(zip(self.write_times, self.writes)),
+                         [(0.0, ("cooler_boost", "on"))])
+        self.assertEqual(self.state["cooler_boost"], "on")
+        self.assertEqual(len(self.samples), 16)
+
+    def test_spikes_every_few_samples_refuse_release(self):
+        self.assertFalse(self.release(script=[self.COOL] * 3 + [self.HOT] + [self.COOL] * 4 +
+                                      [self.HOT] + [self.COOL] * 5 + [self.HOT] * 2 +
+                                      [self.COOL] * 5 + [self.HOT], boost="off",
+                                      real_request=True))
+        self.assertNotIn(("cooler_boost", "off"), self.writes)
+        self.assertEqual(self.state["cooler_boost"], "on")
+        self.assertLessEqual(self.samples[-1], 10.0)
+
+    def test_junk_values_reset_the_count_and_a_cool_window_still_releases(self):
+        for junk in (("60000", "255", "50"), ("", "60", "50"), ("60000", "60", "x")):
+            with self.subTest(junk=junk):
+                self.assertTrue(self.release(script=[self.COOL, self.COOL, junk, self.COOL]))
+                self.assertEqual(len(self.samples), 9)
+                self.assertEqual(self.writes, [("fan_mode", "auto"), ("cooler_boost", "off")])
 
 
 class RecoveryLatchFileTests(HardwareIsolatedTestCase):

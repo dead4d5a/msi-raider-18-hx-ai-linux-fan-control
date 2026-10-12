@@ -227,15 +227,77 @@ inserts its fixed helper directory explicitly.
 Explicit `factory-auto`, a clean service stop, manager setup errors before a
 service start is attempted, and installation or upgrade staging remain
 intentional factory `auto/off` transitions. They are not used as a response to
-a runtime fault. Each switches Boost off only when it is cool.
+a runtime fault. Each switches Boost off only when coolness is confirmed as
+described next.
+
+## Confirming cool before a release
+
+Every decision that switches Cooler Boost off, or leaves the factory envelope
+at `auto/off`, outside the runtime cooldown uses one shared, read-only helper
+in `msi_fan_control.py`: the daemon's clean stop, the `ExecStopPost` helper
+after a successful stop, the manager's `factory-auto`, and
+`uninstall-profile.sh`. One reading never decides. Under bursty load the
+coretemp package reading on this laptop jumps 20 °C or more for milliseconds,
+and the EC sometimes returns junk such as 255 °C or an empty value.
+
+- A sample reads the coretemp package (`temp1_input`, m°C) and the EC CPU and
+  GPU realtime temperatures (°C), each through the caller's own reader.
+- A sample is valid only if each value is one to six ASCII digits within 1 to
+  110,000 m°C (package), 1 to 110 °C (EC CPU) or 0 to 110 °C (EC GPU). The
+  EC's 255 sentinel, an empty, signed or non-numeric value, and a CPU at 0 °C
+  are invalid; an unreadable attribute is unavailable.
+- A valid sample is cool when the package and EC CPU are below 85 °C and the EC
+  GPU is below 70 °C (0, a powered-off dGPU, counts as cool). These are the
+  release limits used before; they did not change.
+- Release requires six consecutive valid, cool samples started at least 0.5 s
+  apart, so at least 2.5 s of agreement. An invalid, unavailable or hot sample
+  restarts the count. The check gives up as soon as six samples can no longer
+  fit in 10 s, which is after about 7.5 s when every sample is hot, and the
+  wait never exceeds 10 s plus one sample.
+
+A single spike or junk value therefore can neither release Boost nor, by
+itself, refuse a release. A cool machine releases after about 2.5 s; a spike
+right after the stop delays it by about 0.5 s. When the window ends without
+agreement, each caller does exactly what one hot reading made it do before:
+Boost stays on, the daemon exits `1`, `factory-auto` reports
+`factory staged with Boost on`, and the uninstall removes nothing. The log
+names the most recent unsafe sample.
+
+Entering cooling never waits for this confirmation. In the daemon, the manager
+and `ExecStopPost`, an unsafe sample reasserts Cooler Boost at once if anything
+switched it off, including a keyboard toggle during the wait. `ExecStopPost`
+runs after the daemon has already released Boost, so there the first unsafe
+sample switches Boost back on before the verdict, and a later confirmed window
+releases it again. The uninstall script keeps the Boost it set just before the
+check and requests it again when it refuses.
+
+The 10 s bound fits every caller. The daemon's clean stop runs under
+`TimeoutStopSec=30s`: one monitoring pass, the factory restore, at most 10 s
+of confirmation and the release. It sends a watchdog heartbeat with every
+sample. That matters when the `factory-auto` marker starts the stop before the
+stop request arrives, because systemd still enforces `WatchdogSec=5s` then.
+`ExecStopPost` runs under the same `TimeoutStopSec=30s`; on its success path it
+spends at most 10 s confirming. The manager has no watchdog, and its 50 s
+`systemctl stop` covers the daemon's and the helper's waits. A cool clean stop
+takes about 2.5 s longer than before, and a cool `factory-auto`, which confirms
+three times, about 7.5 s longer.
+
+The runtime release of an automatic latch or a queued manual release is not
+changed: it already requires 30 continuously valid, cool seconds, and an
+invalid sample enters the degraded state and resets the cooldown. Its own
+plausibility ranges still accept 0 for the package and the EC CPU, but a
+single such sample cannot complete 30 continuous seconds while the other
+samples are hot.
 
 ## Clean stop while hot
 
 A clean stop is a `systemctl stop`, a shutdown or reboot, or the stop inside
 `factory-auto` or an upgrade. The daemon first restores the factory curve and
-`auto` mode with Cooler Boost on. It then releases Boost only when the CPU
-package and EC CPU are below 85 °C and the EC GPU is below 70 °C. When it is
-hotter, the stop deliberately ends in full cooling instead:
+`auto` mode with Cooler Boost on. It then releases Boost only once six
+consecutive valid samples, 0.5 s apart within 10 s, show the CPU package and
+EC CPU below 85 °C and the EC GPU below 70 °C (see the previous section). When
+it stays hotter, or the telemetry stays invalid, the stop deliberately ends in
+full cooling instead:
 
 1. The daemon exits `1` with `factory restored; Boost release unsafe`, so
    systemd records a failed stop.

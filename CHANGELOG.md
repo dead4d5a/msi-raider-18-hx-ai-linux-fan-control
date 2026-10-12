@@ -2,6 +2,45 @@
 
 ## Unreleased
 
+- Confirm coolness over several valid samples before releasing Cooler Boost.
+  Every check that switches Boost off, or leaves the factory envelope at
+  `auto/off`, used to decide from one instantaneous reading: the daemon's clean
+  stop, the `ExecStopPost` helper after that stop, the manager's `factory-auto`
+  and `uninstall-profile.sh`. On this laptop the coretemp package reading jumps
+  20 °C or more for milliseconds under bursty load, and the EC sometimes
+  returns junk such as 255 °C or an empty value. On 2026-10-11 one such reading
+  0.26 s after the upgrade's cool-down gate passed made the installed daemon
+  refuse its clean stop and aborted the upgrade. All four now use one shared,
+  read-only helper in `msi_fan_control.py`: Boost is released only after six
+  consecutive valid samples, 0.5 s apart (at least 2.5 s of agreement), show
+  the CPU package and EC CPU below 85 °C and the EC GPU below 70 °C (0, a
+  powered-off dGPU, counts as cool). An invalid, unreadable or hot sample
+  restarts the count, and the check gives up once six samples can no longer fit
+  in 10 s (after about 7.5 s when every sample is hot). A cool machine releases
+  after about 2.5 s, and one spike or junk value restarts the count instead of
+  refusing the release; it can never release Boost by itself either. The
+  limits are unchanged. A valid sample has one to six ASCII digits within 1 to
+  110,000 m°C for the package, 1 to 110 °C for the EC CPU and 0 to 110 °C for
+  the EC GPU, so a CPU at 0 °C, which all three programs accepted as cool,
+  values such as `+50000` or `5_0000`, which the manager's `int()` accepted, and
+  an empty reading, which `uninstall-profile.sh` evaluated as 0, are now
+  invalid. On refusal each program does exactly what it did before (Boost
+  on; the daemon exits `1` with `factory restored; Boost release unsafe`, and
+  `factory-auto` reports `factory staged with Boost on`), and the log names the
+  most recent unsafe sample. Entering cooling is never delayed: in the daemon,
+  the manager and `ExecStopPost` an unsafe sample reasserts Boost at once. That
+  undoes a keyboard off during the wait and, in `ExecStopPost`, where the
+  daemon had already released Boost, switches it back on before the verdict.
+  `uninstall-profile.sh` keeps the Boost it has just set and requests it again
+  when it refuses. The daemon sends a watchdog heartbeat with every sample,
+  because a stop started by the `factory-auto` marker still runs under
+  `WatchdogSec=5s`. A cool clean stop now takes about 2.5 s longer, and a cool
+  `factory-auto`, which confirms three times (daemon, `ExecStopPost`, manager),
+  about 7.5 s longer; each wait ends within about 10 s, inside
+  `TimeoutStopSec=30s`. The runtime 30-second cooldown is unchanged; it already
+  requires continuously valid, cool samples. An upgrade from an earlier release
+  still runs that release's single-reading checks in its `factory-auto`, so the
+  upgrade's cool-down gate stays.
 - Make `upgrade-profile.sh` wait for a cool margin before it changes anything
   on the running system. Its release checks heat the CPU, and the installed
   manager's `factory-auto` refuses to release Cooler Boost at a CPU package or

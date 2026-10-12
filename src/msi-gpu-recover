@@ -358,17 +358,19 @@ def mark_recovery_latch(profile: str) -> None:
 
 
 def release_boost_if_cool() -> bool:
-    """Complete an intentional clean-stop factory transition only when cool."""
+    """Complete an intentional clean-stop factory transition only when cool.
+
+    The daemon left factory auto/off. One reading never confirms that: the
+    shared confirmation needs consecutive valid, cool samples, and an unsafe
+    sample switches Boost back on at once instead of waiting for the verdict.
+    """
     try:
         core = one_hwmon("coretemp")
-        package = read_uint(core / "temp1_input")
-        ec_cpu = read_uint(BASE / "cpu/realtime_temperature")
-        gpu = read_uint(BASE / "gpu/realtime_temperature")
-        if not (0 <= package <= 110000 and 0 <= ec_cpu <= 110 and
-                0 <= gpu <= 110):
-            return False
-        if not (max(package, ec_cpu * 1000) < 85000 and
-                (gpu == 0 or gpu < 70)):
+        confirmation = fan_control.confirm_cool(
+            fan_control.cool_sampler(read, core, BASE),
+            on_unsafe=lambda _reading: request_boost_best_effort())
+        if not confirmation.cool:
+            print(f"Boost release refused: {confirmation.reason}", file=sys.stderr)
             return False
         write(BASE / "fan_mode", "auto")
         if read(BASE / "fan_mode") != "auto":

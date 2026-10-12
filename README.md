@@ -49,9 +49,10 @@ firmware. Related model names alone are not sufficient evidence of compatibility
   telemetry, latch ownership, and cooldown progress; missing temperatures do not
   suppress monitoring of healthy fan channels.
 - Restores the captured factory curve and firmware `auto` mode on clean stop,
-  releasing Cooler Boost only when cool. A stop while hot, including at
-  shutdown, instead exits as a failure, and recovery leaves Candidate 14 in
-  `advanced` mode with Cooler Boost on. This is intended; see
+  releasing Cooler Boost only when six consecutive valid samples, 0.5 s apart,
+  confirm it is cool; one spike or junk reading never decides. A stop while
+  hot, including at shutdown, instead exits as a failure, and recovery leaves
+  Candidate 14 in `advanced` mode with Cooler Boost on. This is intended; see
   [Safety](docs/SAFETY.md#clean-stop-while-hot).
 - On a runtime fault with immutable identity still verified, retains Candidate 14
   in `advanced` mode and deliberately leaves Cooler Boost on; a separate,

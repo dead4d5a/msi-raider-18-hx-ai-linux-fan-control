@@ -188,6 +188,13 @@ sudo ./scripts/uninstall-profile.sh
 
 The script first requires exact factory `auto/off`, then removes the manager,
 daemon, service, and tmpfiles rule. The patched driver remains installed.
+It restores the factory curve and auto mode with Cooler Boost on and releases
+Boost only after the checkout's shared helper (`src/msi_fan_control.py`, run
+with `/usr/bin/python3`) confirms six consecutive valid, cool samples 0.5 s
+apart within 10 seconds, as the controllers do. Otherwise it requests Boost
+again, exits `1` with
+`Factory restored, but machine is too hot to release Cooler Boost, ...` and
+`Files were not removed. Cool down and retry.`, and removes nothing.
 
 ## Manual profile rollback
 

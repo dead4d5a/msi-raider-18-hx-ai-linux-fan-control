@@ -334,17 +334,30 @@ def restore_factory_envelope() -> bool:
     return bool(success)
 
 
-def cool_now(core: pathlib.Path) -> bool:
-    package = read_uint(core / "temp1_input")
-    ec_cpu = read_uint(BASE / "cpu/realtime_temperature")
-    ec_gpu = read_uint(BASE / "gpu/realtime_temperature")
-    return max(package, ec_cpu * 1000) < 85000 and (ec_gpu == 0 or ec_gpu < 70)
+def reassert_boost(_reading: fan_control.CoolReading | None = None) -> None:
+    if read(BASE / "cooler_boost") != "on":
+        write(BASE / "cooler_boost", "on")
 
 
-def release_factory_if_cool(core: pathlib.Path) -> bool:
+def release_factory_if_cool(core: pathlib.Path,
+                            heartbeat: Callable[[str], None]) -> bool:
+    """Leave the restored factory envelope at auto/off only once confirmed cool.
+
+    One reading never decides: the shared confirmation needs consecutive valid,
+    cool samples, heartbeats the watchdog with each one, and reasserts Boost at
+    once on an unsafe sample. Boost stays on unless coolness is confirmed.
+    """
     try:
-        if not cool_now(core):
+        confirmation = fan_control.confirm_cool(
+            fan_control.cool_sampler(read, core, BASE),
+            heartbeat=lambda progress: heartbeat(f"Factory auto restored; {progress}"),
+            on_unsafe=reassert_boost)
+        if not confirmation.cool:
+            print(f"WARNING Cooler Boost release refused: {confirmation.reason}",
+                  file=sys.stderr, flush=True)
             return False
+        print(f"Cooler Boost release confirmed: {confirmation.reason}",
+              file=sys.stderr, flush=True)
         write(BASE / "fan_mode", "auto")
         write(BASE / "cooler_boost", "off")
         if read(BASE / "fan_mode") == "auto" and read(BASE / "cooler_boost") == "off":
@@ -1207,7 +1220,7 @@ def main() -> int:
         heartbeat("Restoring factory auto")
         if not restore_factory_envelope():
             raise ProfileError("factory restoration failed")
-        if not release_factory_if_cool(core):
+        if not release_factory_if_cool(core, heartbeat):
             raise ProfileError("factory restored; Boost release unsafe")
         notify("STOPPING=1\nSTATUS=Factory auto/off restored")
         return 0

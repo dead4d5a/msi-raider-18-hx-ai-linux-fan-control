@@ -945,6 +945,8 @@ class FactoryAutoHost:
     stop models the daemon's clean stop and ExecStopPost: factory auto/off when
     cool; otherwise exit 1, staged Candidate14/advanced/Boost plus the recovery
     latch, and an OnFailure keeper that the factory-auto marker condition skips.
+    A script, if set, replaces the telemetry at each manager package read; the
+    last entry repeats. now is the manager's fake monotonic clock.
     """
 
     def __init__(self, hwmon, *, package=50000, ec_cpu=50, ec_gpu=40,
@@ -964,6 +966,15 @@ class FactoryAutoHost:
         self.failing_identity_checks = set()
         self.calls = []
         self.writes = []
+        self.script = None
+        self.samples = []
+        self.now = 0.0
+
+    def monotonic(self):
+        return self.now
+
+    def sleep(self, seconds):
+        self.now += seconds
 
     def cool(self):
         package, cpu, gpu = (self.telemetry[key] for key in ('package', 'ec_cpu', 'ec_gpu'))
@@ -985,6 +996,10 @@ class FactoryAutoHost:
         if path == self.hwmon / 'name':
             return self.hwmon_name
         if path == self.hwmon / 'temp1_input':
+            if self.script:
+                entry = self.script[min(len(self.samples), len(self.script) - 1)]
+                self.telemetry.update(entry)
+            self.samples.append(self.now)
             return str(self.telemetry['package'])
         relative = str(path.relative_to(MANAGER.BASE))
         if relative == 'cpu/realtime_temperature':
@@ -1078,11 +1093,15 @@ class FactoryAutoStateMachineTests(HardwareIsolatedTestCase):
                                   side_effect=host.clear_recovery_latch), \
                 mock.patch.object(MANAGER.pathlib.Path, 'glob', return_value=[self.hwmon]), \
                 mock.patch.object(MANAGER.os, 'close'), \
+                mock.patch.object(MANAGER.time, 'monotonic', side_effect=host.monotonic), \
+                mock.patch.object(MANAGER.time, 'sleep', side_effect=host.sleep), \
+                contextlib.redirect_stderr(io.StringIO()) as errors, \
                 contextlib.redirect_stdout(io.StringIO()) as output:
             try:
                 return command()
             finally:
                 self.output = output.getvalue()
+                self.errors = errors.getvalue()
 
     def status_snapshot(self, host):
         with mock.patch.object(MANAGER, 'identity', side_effect=host.identity), \
@@ -1178,31 +1197,143 @@ class FactoryAutoStateMachineTests(HardwareIsolatedTestCase):
         self.assertEqual(host.enabled, 'disabled')
         self.assertEqual(host.writes, [])
 
+    def test_spike_right_after_the_factory_restore_still_releases_once_cool(self):
+        # 2026-10-11: one package sample >=85 C under bursty load, then cool.
+        host = self.host()
+        host.script = [{'package': 90000}, {'package': 59000}]
+        self.factory_auto(host)
+        self.assertEqual(host.outcome(), ('auto', 'off', 'enabled', True, False))
+        self.assertEqual(host.samples, [index * 0.5 for index in range(7)])
+        self.assertEqual(host.writes[-2:], [('fan_mode', 'auto'), ('cooler_boost', 'off')])
+        self.assertIn('Factory auto/off is active', self.output)
+
+    def test_junk_right_after_the_factory_restore_still_releases_once_cool(self):
+        host = self.host()
+        host.script = [{'ec_cpu': 255}, {'ec_cpu': 50, 'ec_gpu': 0}]
+        self.factory_auto(host)
+        self.assertEqual(host.outcome(), ('auto', 'off', 'enabled', True, False))
+        self.assertEqual(len(host.samples), 7)
+
+    def test_persistent_spikes_refuse_release_and_keep_boost_on(self):
+        host = self.host()
+        host.script = [{'package': 59000}] * 4 + [{'package': 95000}]
+        host.script *= 10
+        with self.assertRaisesRegex(
+                MANAGER.FactoryReleaseRefused,
+                'too hot to release Boost; factory staged with Boost on;'):
+            self.factory_auto(host)
+        self.assertEqual(host.ec['cooler_boost'], 'on')
+        self.assertNotIn(('cooler_boost', 'off'), host.writes)
+        self.assertNotIn(('disable', MANAGER.SERVICE), host.calls)
+        self.assertLessEqual(host.samples[-1], 10.0)
+        self.assertIn('Cooler Boost release not confirmed: no 6 consecutive valid cool '
+                      'samples 0.5 s apart within 10 s', self.errors)
+
+    def test_boost_switched_off_during_an_unsafe_wait_is_reasserted_at_once(self):
+        host = self.host(package=90000)
+        original_sleep = host.sleep
+
+        def sleep(seconds):
+            original_sleep(seconds)
+            if host.now == 1.0:
+                host.ec['cooler_boost'] = 'off'  # A keyboard toggle.
+
+        host.sleep = sleep
+        # Without the reassertion the postcondition would see Boost off and take
+        # the disabling fail-safe instead of this plain refusal.
+        with self.assertRaises(MANAGER.FactoryReleaseRefused):
+            self.factory_auto(host)
+        self.assertEqual(host.ec['cooler_boost'], 'on')
+        # The restore writes Boost on twice; the third write is the reassertion.
+        self.assertEqual(host.writes.count(('cooler_boost', 'on')), 3)
+        self.assertEqual(host.writes[-1], ('cooler_boost', 'on'))
+        self.assertNotIn(('cooler_boost', 'off'), host.writes)
+        self.assertNotIn(('disable', MANAGER.SERVICE), host.calls)
+
     def test_refusal_exits_nonzero_with_the_retry_instruction(self):
         host = self.host(ec_gpu=75)
-        stderr = io.StringIO()
-        with mock.patch.object(MANAGER.sys, 'argv', ['msi-fan-profile', 'factory-auto']), \
-                mock.patch.object(MANAGER.sys, 'stderr', stderr):
+        with mock.patch.object(MANAGER.sys, 'argv', ['msi-fan-profile', 'factory-auto']):
             self.assertEqual(self.factory_auto(host, MANAGER.entrypoint), 1)
-        self.assertIn('factory staged with Boost on', stderr.getvalue())
-        self.assertIn('rerun factory-auto when cool', stderr.getvalue())
+        self.assertIn('factory staged with Boost on', self.errors)
+        self.assertIn('rerun factory-auto when cool', self.errors)
         self.assertEqual(host.outcome(), ('auto', 'on', 'enabled', True, True))
 
 
 class FactoryReleasePlausibilityTests(HardwareIsolatedTestCase):
+    def release(self, readings, readings_error=None):
+        """Run the release with telemetry replayed per sample (the last repeats)."""
+        core = pathlib.Path('/fake/hwmon3')
+        clock = {'now': 0.0}
+        samples = []
+
+        def fake_read(path):
+            path = pathlib.Path(path)
+            if path == core / 'name':
+                return 'coretemp'
+            if path == core / 'temp1_input':
+                samples.append(clock['now'])
+                if readings_error is not None:
+                    raise readings_error
+            current = readings[min(len(samples), len(readings)) - 1]
+            for position, name in enumerate((core / 'temp1_input',
+                                             MANAGER.BASE / 'cpu/realtime_temperature',
+                                             MANAGER.BASE / 'gpu/realtime_temperature')):
+                if path == name:
+                    return current[position]
+            self.assertEqual(path, MANAGER.BASE / 'cooler_boost')
+            return 'on'
+
+        def sleep(seconds):
+            clock['now'] += seconds
+
+        with mock.patch.object(MANAGER.pathlib.Path, 'glob', return_value=[core]), \
+                mock.patch.object(MANAGER.pathlib.Path, 'exists', return_value=True), \
+                mock.patch.object(MANAGER, 'read', side_effect=fake_read), \
+                mock.patch.object(MANAGER, 'hw', side_effect=[
+                    {'raw': MANAGER.FACTORY, 'mode': 'auto', 'boost': boost}
+                    for boost in ('on', 'off')]), \
+                mock.patch.object(MANAGER, 'write') as write, \
+                mock.patch.object(MANAGER.time, 'monotonic', side_effect=lambda: clock['now']), \
+                mock.patch.object(MANAGER.time, 'sleep', side_effect=sleep), \
+                contextlib.redirect_stderr(io.StringIO()) as stderr:
+            try:
+                MANAGER.restore_factory_locked()
+            finally:
+                self.writes = write.call_args_list
+                self.samples = samples
+                self.stderr = stderr.getvalue()
+
     def test_negative_package_or_ec_telemetry_never_releases_boost(self):
-        core = mock.MagicMock()
-        (core / 'name').exists.return_value = True
         for invalid in (('-1', '50', '40'), ('50000', '-1', '40'), ('50000', '50', '-1')):
-            with self.subTest(telemetry=invalid), \
-                    mock.patch.object(MANAGER.pathlib.Path, 'glob', return_value=[core]), \
-                    mock.patch.object(MANAGER, 'read', side_effect=['coretemp', *invalid]), \
-                    mock.patch.object(MANAGER, 'hw', return_value={
-                        'raw': MANAGER.FACTORY, 'mode': 'auto', 'boost': 'on'}), \
-                    mock.patch.object(MANAGER, 'write') as write:
+            with self.subTest(telemetry=invalid):
                 with self.assertRaisesRegex(MANAGER.FactoryReleaseRefused, 'telemetry is invalid'):
-                    MANAGER.restore_factory_locked()
-            self.assertNotIn(mock.call(MANAGER.BASE / 'cooler_boost', 'off'), write.call_args_list)
+                    self.release([invalid])
+                self.assertNotIn(mock.call(MANAGER.BASE / 'cooler_boost', 'off'), self.writes)
+                self.assertIn('Cooler Boost release not confirmed: no 6 consecutive', self.stderr)
+
+    def test_junk_that_parsed_as_cool_before_is_now_invalid(self):
+        # int() used to accept these; a CPU at 0 C is not plausible either.
+        for invalid in ((' +50000', '50', '40'), ('0', '50', '40'), ('50000', '0', '40'),
+                        ('5_0000', '50', '40'), ('', '50', '40')):
+            with self.subTest(telemetry=invalid):
+                with self.assertRaisesRegex(MANAGER.FactoryReleaseRefused, 'telemetry is invalid'):
+                    self.release([invalid])
+
+    def test_one_junk_or_hot_sample_resets_and_a_cool_window_still_releases(self):
+        for unsafe in (('50000', '255', '40'), ('90000', '50', '40'), ('50000', '50', '')):
+            with self.subTest(unsafe=unsafe):
+                self.release([('50000', '50', '40'), unsafe, ('50000', '50', '0')])
+                self.assertEqual(self.samples, [index * 0.5 for index in range(8)])
+                self.assertEqual(self.writes[-2:], [
+                    mock.call(MANAGER.BASE / 'fan_mode', 'auto'),
+                    mock.call(MANAGER.BASE / 'cooler_boost', 'off')])
+
+    def test_unreadable_telemetry_is_unavailable(self):
+        with self.assertRaisesRegex(
+                MANAGER.FactoryReleaseRefused,
+                r'telemetry is unavailable: \[Errno 5\] I/O error; Boost retained$'):
+            self.release([('50000', '50', '40')], readings_error=OSError(5, 'I/O error'))
+        self.assertEqual(len(self.samples), 16)
 
 
 class HostIsolationTests(HardwareIsolatedTestCase):

@@ -55,6 +55,15 @@ atomic against firmware's own autonomous updates. CPU package and WMI RPM stay
 separate. Every mutation still performs its own fresh identity check. A missing,
 malformed, unsupported or failed new ABI never falls back to legacy controls.
 
+`msi_fan_control.py` also holds the one read-only cool confirmation behind
+every Boost release outside the runtime cooldown, used by the daemon's clean
+stop, the `ExecStopPost` helper, the manager's `factory-auto` and the uninstall
+script. It takes the CPU package and EC CPU/GPU temperatures through the
+caller's own reader, every 0.5 s, and confirms only six consecutive valid, cool
+samples within 10 s; an invalid, unreadable or hot sample restarts the count.
+It writes nothing. Callers pass a heartbeat (the daemon feeds its watchdog with
+every sample) and a hook that reasserts Boost at once on an unsafe sample.
+
 Snapshot acquisition and the remaining telemetry share one two-second freshness
 envelope; resume and reapplication invalidate and reacquire EC temperatures.
 Optional timing diagnostics use an explicit startup environment switch and are
@@ -74,10 +83,14 @@ or observation gaps over two seconds reset cooldown progress.
 
 ## Recovery plane
 
-A clean stop restores factory `auto/off` when it is cool enough to release
-Cooler Boost. When it is not, the daemon exits `1` with
-`factory restored; Boost release unsafe`, and the failed stop takes the
-runtime-fault path below. Recovery restores Candidate 14/`advanced` with Boost
+A clean stop restores factory `auto/off` when the shared confirmation shows it
+is cool enough to release Cooler Boost: six consecutive valid, cool samples
+0.5 s apart within 10 s, never one reading. When it does not, the daemon exits
+`1` with `factory restored; Boost release unsafe`, and the failed stop takes
+the runtime-fault path below. After a successful stop, the `ExecStopPost`
+helper confirms again before it accepts the factory `auto/off` result; its
+first unsafe sample switches Boost back on, and a refused confirmation keeps
+it on and fails the unit. Recovery restores Candidate 14/`advanced` with Boost
 on and the recovery-Boost marker. While the system runs, the keeper then holds
 that state. At shutdown it cannot be started, and the state lasts until
 power-off; Boost does not survive the reboot. The full-cooling result is

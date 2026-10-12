@@ -743,7 +743,7 @@ class RecoveryHandoffMainLoopTests(HardwareFreeMainLoopTests):
                     event_at=None, suspend_offset_at=None, initial_verified=True,
                     clock_gap_at=None, sensor_delay_at=None, timing_setting=None,
                     control_at=None, override_at=None, factory_released=True,
-                    initial_boost="on"):
+                    initial_boost="on", stop_readings_at=None):
         class Clock:
             now = 0.0
 
@@ -784,6 +784,8 @@ class RecoveryHandoffMainLoopTests(HardwareFreeMainLoopTests):
         events = []
         self.control_reads = []
         self.ec_arguments = []
+        self.release_samples = []
+        self.notifications = []
 
         def fake_read(path):
             text = str(path)
@@ -799,9 +801,23 @@ class RecoveryHandoffMainLoopTests(HardwareFreeMainLoopTests):
             if text.endswith("shift_mode"):
                 # Legacy monitoring checks it after the curve read.
                 return "comfort"
+            if stop_readings_at is not None:
+                # Only the real clean-stop release confirmation reads these.
+                package, ec_cpu, ec_gpu = stop_readings_at(clock.now)
+                if text == "/fake/core/temp1_input":
+                    self.release_samples.append(clock.now)
+                    return package
+                if text == "/fake/ec/cpu/realtime_temperature":
+                    return ec_cpu
+                if text == "/fake/ec/gpu/realtime_temperature":
+                    return ec_gpu
             raise AssertionError(f"unexpected text read: {text}")
 
         def fake_write(path, value):
+            if stop_readings_at is not None and str(path).endswith("fan_mode"):
+                writes.append((clock.now, "fan_mode=" + value))
+                state["mode"] = value
+                return
             self.assertTrue(str(path).endswith("cooler_boost"))
             writes.append((clock.now, value))
             state["boost"] = value
@@ -872,9 +888,13 @@ class RecoveryHandoffMainLoopTests(HardwareFreeMainLoopTests):
                 self.acks = stack.enter_context(mock.patch.object(DAEMON, "acknowledge"))
                 self.factory_restore = stack.enter_context(mock.patch.object(
                     DAEMON, "restore_factory_envelope", return_value=True))
-                self.factory_release = stack.enter_context(mock.patch.object(
-                    DAEMON, "release_factory_if_cool", return_value=factory_released))
-                stack.enter_context(mock.patch.object(DAEMON, "notify"))
+                if stop_readings_at is None:
+                    self.factory_release = stack.enter_context(mock.patch.object(
+                        DAEMON, "release_factory_if_cool", return_value=factory_released))
+                stack.enter_context(mock.patch.object(
+                    DAEMON, "notify",
+                    side_effect=lambda message: self.notifications.append(
+                        (clock.now, message))))
                 stack.enter_context(mock.patch.object(
                     DAEMON.os, "geteuid", return_value=0))
                 stack.enter_context(mock.patch.object(DAEMON.os, "open", return_value=9))
@@ -929,6 +949,65 @@ class RecoveryHandoffMainLoopTests(HardwareFreeMainLoopTests):
                              factory_released=False)
         self.factory_restore.assert_called_once_with()
         self.assertIn("treating it as a clean stop request", self.stderr.getvalue())
+
+    HOT_RELEASE = ("90000", "60", "44")
+    COOL_RELEASE = ("59000", "60", "44")
+
+    def stop_heartbeats(self, stop_at):
+        beats = [at for at, message in self.notifications
+                 if "WATCHDOG=1" in message and at >= stop_at]
+        return beats, [later - earlier for earlier, later in zip(beats, beats[1:])]
+
+    def test_clean_stop_spike_right_after_the_stop_request_still_releases_when_cool(self):
+        """2026-10-11: one sample >=85 C just after the stop no longer refuses."""
+        state, writes, *_ = self.run_startup(
+            recovery_latched=False, duration=60.0, override_at=5.0,
+            stop_readings_at=lambda now: (
+                self.HOT_RELEASE if now == 5.0 else self.COOL_RELEASE))
+        self.factory_restore.assert_called_once_with()
+        # The spike, then six consecutive valid cool samples 0.5 s apart.
+        self.assertEqual(self.release_samples, [5.0 + index * 0.5 for index in range(7)])
+        self.assertEqual(writes, [(8.0, "fan_mode=auto"), (8.0, "off")])
+        self.assertEqual(state["boost"], "off")
+        self.assertIn("Cooler Boost release confirmed: 6 consecutive valid cool samples",
+                      self.stderr.getvalue())
+        self.assertNotIn("ProfileError", self.stderr.getvalue())
+        self.assertIn("STOPPING=1", self.notifications[-1][1])
+
+    def test_clean_stop_junk_right_after_the_stop_request_still_releases_when_cool(self):
+        # The EC CPU 255 sentinel, an empty package and a non-numeric EC GPU.
+        junk = {5.0: ("59000", "255", "44"), 5.5: ("", "60", "44"), 6.0: ("59000", "60", "x")}
+        state, writes, *_ = self.run_startup(
+            recovery_latched=False, duration=60.0, override_at=5.0,
+            stop_readings_at=lambda now: junk.get(now, self.COOL_RELEASE))
+        self.assertEqual(writes, [(9.0, "fan_mode=auto"), (9.0, "off")])
+        self.assertEqual(state["boost"], "off")
+
+    def test_clean_stop_refuses_release_while_heat_persists(self):
+        with self.assertRaisesRegex(DAEMON.ProfileError,
+                                    "factory restored; Boost release unsafe"):
+            self.run_startup(recovery_latched=False, duration=60.0, override_at=5.0,
+                             stop_readings_at=lambda now: self.HOT_RELEASE)
+        # Exactly today's outcome: Boost stays on and nothing writes it off.
+        self.assertEqual(self.release_samples, [5.0 + index * 0.5 for index in range(16)])
+        self.assertIn("WARNING Cooler Boost release refused: no 6 consecutive valid cool "
+                      "samples", self.stderr.getvalue())
+        self.assertFalse(any("STOPPING=1" in message for _, message in self.notifications))
+
+    def test_clean_stop_keeps_the_watchdog_fed_throughout_the_confirmation(self):
+        # The factory-auto marker starts this stop while the unit still runs, so
+        # WatchdogSec=5s is enforced; the refused wait lasts longer than that.
+        with self.assertRaises(DAEMON.ProfileError):
+            self.run_startup(recovery_latched=False, duration=60.0, override_at=5.0,
+                             stop_readings_at=lambda now: self.HOT_RELEASE)
+        beats, gaps = self.stop_heartbeats(5.0)
+        self.assertGreaterEqual(beats[-1] - beats[0], 7.5)
+        self.assertLessEqual(max(gaps), 0.5)
+        statuses = [message for at, message in self.notifications if at >= 5.0]
+        self.assertTrue(statuses[0].startswith("WATCHDOG=1\nSTATUS=Restoring factory auto"))
+        self.assertTrue(all("Factory auto restored; confirming cool before Cooler Boost "
+                            "release" in message for message in statuses[1:]))
+        self.assertEqual(len(statuses), 1 + 16)
 
     @staticmethod
     def snapshot_control(now, state):
@@ -1422,6 +1501,92 @@ class RecoveryHandoffMainLoopTests(HardwareFreeMainLoopTests):
         self.health_publisher.side_effect = OSError("publication unavailable")
         state, _, *_ = self.run_startup(False)
         self.assertEqual(state["boost"], "on")
+
+
+class CleanStopReleaseTests(HardwareFreeMainLoopTests):
+    """release_factory_if_cool() against a fake EC, clock and heartbeat."""
+
+    COOL = ("59000", "60", "44")
+    HOT = ("90000", "60", "44")
+
+    def release(self, readings, *, boost_off_at=None, heartbeat=None):
+        clock = {"now": 0.0}
+        state = {"fan_mode": "auto", "fan_curve": DAEMON.FACTORY, "cooler_boost": "on"}
+        self.writes = []
+        self.samples = []
+        self.beats = []
+
+        def fake_read(path):
+            text = str(path)
+            if text == "/fake/core/temp1_input":
+                self.samples.append(clock["now"])
+            index = min(len(self.samples), len(readings)) - 1
+            for position, suffix in enumerate(("/fake/core/temp1_input",
+                                               "/fake/ec/cpu/realtime_temperature",
+                                               "/fake/ec/gpu/realtime_temperature")):
+                if text == suffix:
+                    return readings[index][position]
+            return state[path.name]
+
+        def fake_write(path, value):
+            self.writes.append((clock["now"], path.name, value))
+            state[path.name] = value
+
+        def sleep(seconds):
+            clock["now"] += seconds
+            if boost_off_at is not None and clock["now"] == boost_off_at:
+                state["cooler_boost"] = "off"  # A keyboard toggle during the wait.
+
+        with mock.patch.object(DAEMON, "BASE", pathlib.Path("/fake/ec")), \
+                mock.patch.object(DAEMON, "read", side_effect=fake_read), \
+                mock.patch.object(DAEMON, "write", side_effect=fake_write), \
+                mock.patch.object(DAEMON.time, "monotonic", side_effect=lambda: clock["now"]), \
+                mock.patch.object(DAEMON.time, "sleep", side_effect=sleep), \
+                contextlib.redirect_stderr(io.StringIO()) as stderr:
+            result = DAEMON.release_factory_if_cool(
+                pathlib.Path("/fake/core"), heartbeat or self.beats.append)
+        self.stderr = stderr.getvalue()
+        return result, state
+
+    def test_spike_at_the_first_sample_still_releases_once_cool(self):
+        released, state = self.release([self.HOT, self.COOL])
+        self.assertTrue(released)
+        self.assertEqual(self.samples, [index * 0.5 for index in range(7)])
+        self.assertEqual(self.writes, [(3.0, "fan_mode", "auto"),
+                                       (3.0, "cooler_boost", "off")])
+        self.assertEqual(state["cooler_boost"], "off")
+        self.assertEqual(len(self.beats), 7)
+        self.assertTrue(self.beats[0].startswith(
+            "Factory auto restored; confirming cool before Cooler Boost release: 0/6"))
+
+    def test_persistent_heat_keeps_boost_on_and_writes_nothing(self):
+        released, state = self.release([self.HOT])
+        self.assertFalse(released)
+        self.assertEqual(self.writes, [])
+        self.assertEqual(state["cooler_boost"], "on")
+        self.assertEqual(len(self.samples), 16)
+        self.assertIn("WARNING Cooler Boost release refused", self.stderr)
+
+    def test_spikes_every_few_samples_refuse_release(self):
+        released, state = self.release([self.COOL, self.COOL, self.COOL, self.HOT] * 10)
+        self.assertFalse(released)
+        self.assertNotIn("off", [value for *_, value in self.writes])
+        self.assertEqual(state["cooler_boost"], "on")
+
+    def test_external_boost_off_during_an_unsafe_wait_is_reasserted_at_once(self):
+        released, state = self.release([self.HOT], boost_off_at=1.0)
+        self.assertFalse(released)
+        self.assertEqual(self.writes, [(1.0, "cooler_boost", "on")])
+        self.assertEqual(state["cooler_boost"], "on")
+
+    def test_failed_heartbeat_refuses_release_and_keeps_boost_on(self):
+        def heartbeat(_status):
+            raise DAEMON.ProfileError("NOTIFY_SOCKET is absent")
+
+        released, state = self.release([self.COOL], heartbeat=heartbeat)
+        self.assertFalse(released)
+        self.assertEqual(self.writes, [(0.0, "cooler_boost", "on")])
+        self.assertEqual(state["cooler_boost"], "on")
 
 
 class StartupGuardMainTests(HardwareFreeMainLoopTests):

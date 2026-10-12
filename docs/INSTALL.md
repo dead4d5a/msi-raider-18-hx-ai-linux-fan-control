@@ -99,10 +99,18 @@ write an `INSTALL_RECORD` with the deployed artifact hashes under
 The release checks heat the CPU, and the installed manager's `factory-auto`
 refuses to release Cooler Boost at a CPU package or EC CPU temperature of 85 °C
 or an EC GPU temperature of 70 °C (managers older than this release then also
-disable the service). After the release checks and staging, and before it
-changes anything on the running system, the upgrade therefore waits until the
-CPU package (coretemp) and EC CPU are below 80 °C and the EC GPU is below 65 °C
-(0, a powered-off dGPU, counts as cool) for 10 consecutive one-second samples.
+disable the service). This release confirms that over six consecutive valid
+samples, 0.5 s apart within 10 seconds, in the daemon's clean stop, its
+`ExecStopPost` helper and the manager, so one spike or junk reading neither
+releases nor refuses. The upgrade, however, runs the installed release's
+`factory-auto`. Releases before this one decide from one instantaneous reading:
+on 2026-10-11 one reading 0.26 s after the cool-down gate below had passed made
+the installed daemon refuse its clean stop. The gate makes that less likely
+from such a release but cannot rule it out. After the release checks and
+staging, and before it changes anything on the running system, the upgrade
+waits until the CPU package (coretemp) and EC CPU are below 80 °C and the EC
+GPU is below 65 °C (0, a powered-off dGPU, counts as cool) for 10 consecutive
+one-second samples.
 An unreadable or invalid reading, such as the EC's 255, never counts as cool.
 It prints the readings about every 30 seconds. After 600 seconds it exits `1`
 with `did not cool below ... within 600 s; stop heavy workloads and rerun`,
