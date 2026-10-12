@@ -8,6 +8,7 @@ keeper=msi-fan-profile-keeper.service
 manager=/usr/local/sbin/msi-fan-profile
 marker=/run/msi-fan-profile.factory-auto
 recovery_latch=/run/msi-fan-profile.recovery-boost
+recovery_latch_payload=candidate14
 base=/sys/devices/platform/msi-ec
 hwmon=/sys/class/hwmon
 factory='58 64 70 76 82 88 0 25 35 44 58 70 75 52 58 64 70 76 82 0 25 35 44 58 70 75'
@@ -17,7 +18,11 @@ factory='58 64 70 76 82 88 0 25 35 44 58 70 75 52 58 64 70 76 82 0 25 35 44 58 7
 # temperature of 70 C or more (EC GPU 0 is a powered-off dGPU), and managers
 # before this release then also disable the service. The release checks heat
 # the CPU, so the handover waits for 5 C under each limit over consecutive
-# one-second samples.
+# one-second samples. A sample is valid under the rules of the shared cool
+# confirmation in msi_fan_control.py, and an invalid one restarts the count.
+# Releases before this one still decide from one reading, which a spike can
+# refuse even right after this gate; the full-cooling continuation after
+# factory-auto covers that, and the gate keeps it the exception.
 cool_package_below=80000
 cool_ec_cpu_below=80
 cool_ec_gpu_below=65
@@ -97,6 +102,7 @@ backup=''
 safe_state=0
 factory_transition=0
 factory_verify=0
+boost_retained=0
 enabled_for_startup=0
 activation_started=0
 
@@ -112,16 +118,29 @@ cleanup() {
     echo "Previous artifacts are retained at: $backup" >&2
   elif ((rc != 0 && enabled_for_startup)); then
     systemctl disable "$service" >/dev/null 2>&1 || true
-    echo 'Upgrade stopped before activation; the service was disabled and factory auto mode remains in effect.' >&2
+    if ((boost_retained)); then
+      echo "Upgrade stopped before activation; the service was disabled and factory auto mode remains in effect. Cooler Boost was left on and the recovery Boost latch $recovery_latch was kept." >&2
+    else
+      echo 'Upgrade stopped before activation; the service was disabled and factory auto mode remains in effect.' >&2
+    fi
   elif ((rc != 0 && safe_state)); then
     systemctl disable "$service" >/dev/null 2>&1 || true
-    echo 'Upgrade stopped; the service remains disabled in factory auto mode.' >&2
+    if ((boost_retained)); then
+      echo "Upgrade stopped; the service remains disabled in factory auto mode. Cooler Boost was left on and the recovery Boost latch $recovery_latch was kept." >&2
+    else
+      echo 'Upgrade stopped; the service remains disabled in factory auto mode.' >&2
+    fi
   elif ((rc != 0 && factory_verify)); then
-    # The existing manager reported factory auto/off, but disabling the service
-    # or a later unit, marker, cooling or latch check failed. Nothing was
-    # replaced; keep the service disabled, as this window intended.
+    # The existing manager reported factory auto/off, or left factory auto with
+    # Boost on in the verified full-cooling state, but disabling the service or
+    # a later unit, marker, cooling or latch check failed. Nothing was replaced;
+    # keep the service disabled, as this window intended.
     systemctl disable "$service" >/dev/null 2>&1 || true
-    echo 'Upgrade stopped before replacing any artifact: the existing manager reported factory auto/off, but a later service, marker, cooling or recovery Boost latch check failed.' >&2
+    if ((boost_retained)); then
+      echo "Upgrade stopped before replacing any artifact: the installed manager left factory auto with Cooler Boost on, but a later service, marker, cooling or recovery Boost latch check failed. Cooler Boost was left on and the recovery Boost latch $recovery_latch was kept." >&2
+    else
+      echo 'Upgrade stopped before replacing any artifact: the existing manager reported factory auto/off, but a later service, marker, cooling or recovery Boost latch check failed.' >&2
+    fi
     echo "The service was disabled, so the installed profile will not return at boot. Inspect both units, $marker and $recovery_latch, resolve the failed check, then run 'sudo $manager apply-default' before rebooting and rerun this upgrade." >&2
   elif ((rc != 0 && factory_transition)); then
     # Nothing was replaced. Leave whatever cooling and boot enablement the
@@ -257,13 +276,71 @@ for index in "${!source_files[@]}"; do
   }
 done
 
+# The recovery Boost latch's ownership and mode, as the daemon requires: a
+# root-owned, mode-0600 regular file with one link, not a symlink.
+recovery_latch_safe() {
+  [[ ! -L $recovery_latch ]] &&
+    [[ $(stat -c '%F:%U:%G:%a:%h' "$recovery_latch") == 'regular file:root:root:600:1' ]]
+}
+
+# A latch the new daemon consumes: safe, with exactly the payload it accepts.
+recovery_latch_valid() {
+  [[ -e $recovery_latch ]] && recovery_latch_safe &&
+    cmp -s -- "$recovery_latch" <(printf '%s\n' "$recovery_latch_payload")
+}
+
+refuse_full_cooling() {
+  echo "Not continuing at full cooling: $1." >&2
+  return 1
+}
+
+# Earlier releases decide a Boost release from one reading, which a spike can
+# refuse even right after the cool-down gate. Their factory-auto then leaves
+# the factory curve, auto mode and Cooler Boost on, both units stopped, the
+# factory-auto marker and the recovery Boost latch (managers before this
+# release also disable the service). That is full cooling with no controller
+# running, the safest state in which to replace files, and the new daemon
+# consumes the latch and releases Boost only after 30 continuously valid, cool
+# seconds. Succeed only if exactly that state verifies; every check only reads.
+factory_boost_on_verified() {
+  local unit
+  echo "Checking the exact platform and whether the installed manager left factory auto with Cooler Boost on and no controller running."
+  "$repo/scripts/preflight.sh" || refuse_full_cooling 'the exact-platform check failed' || return 1
+  for unit in "$service" "$keeper"; do
+    [[ $(systemctl show "$unit" -p ActiveState --value 2>/dev/null || true) == inactive &&
+       $(systemctl show "$unit" -p SubState --value 2>/dev/null || true) == dead ]] ||
+      refuse_full_cooling "$unit is not inactive" || return 1
+  done
+  [[ -f $marker && ! -L $marker &&
+     $(stat -c '%U:%G:%a' "$marker" 2>/dev/null || true) == root:root:600 ]] ||
+    refuse_full_cooling "no root-owned, mode-0600 factory-auto marker $marker" || return 1
+  [[ $(cat "$base/fan_curve" 2>/dev/null || true) == "$factory" ]] ||
+    refuse_full_cooling 'the EC is not on the factory curve' || return 1
+  [[ $(cat "$base/fan_mode" 2>/dev/null || true) == auto ]] ||
+    refuse_full_cooling 'fan_mode is not auto' || return 1
+  [[ $(cat "$base/cooler_boost" 2>/dev/null || true) == on ]] ||
+    refuse_full_cooling 'Cooler Boost is not on' || return 1
+  [[ -e $recovery_latch || -L $recovery_latch ]] ||
+    refuse_full_cooling "no recovery Boost latch $recovery_latch" || return 1
+  recovery_latch_valid ||
+    refuse_full_cooling "the recovery Boost latch $recovery_latch is not a root-owned, mode-0600 file with the expected payload" ||
+    return 1
+}
+
 # A reload clears stale manager metadata before the old manager takes the
 # controller to its guarded factory-auto state.
 systemctl daemon-reload
 systemctl stop "$keeper" 2>/dev/null || true
 systemctl reset-failed "$keeper" 2>/dev/null || true
 factory_transition=1
-"$manager" factory-auto
+factory_status=0
+"$manager" factory-auto || factory_status=$?
+if ((factory_status != 0)); then
+  # Any other failure shape stops here, replacing nothing, as before.
+  factory_boost_on_verified || exit "$factory_status"
+  echo 'The installed manager left factory auto with Cooler Boost on (too hot or unconfirmed); continuing the upgrade at full cooling; the new controller will release Boost after its 30 s cool confirmation.' >&2
+  boost_retained=1
+fi
 factory_transition=0
 factory_verify=1
 systemctl disable "$service"
@@ -277,11 +354,18 @@ systemctl reset-failed "$service" 2>/dev/null || true
 [[ $(stat -c '%U:%G:%a' "$marker") == root:root:600 ]]
 [[ $(cat "$base/fan_curve") == "$factory" ]]
 [[ $(cat "$base/fan_mode") == auto ]]
-[[ $(cat "$base/cooler_boost") == off ]]
-if [[ -e $recovery_latch || -L $recovery_latch ]]; then
-  [[ ! -L $recovery_latch ]]
-  [[ $(stat -c '%F:%U:%G:%a:%h' "$recovery_latch") == 'regular file:root:root:600:1' ]]
-  rm -f -- "$recovery_latch"
+if ((boost_retained)); then
+  # Keep the latch: the new daemon consumes it once it has reapplied Candidate
+  # 14, and the inherited Boost becomes its automatic latch.
+  [[ $(cat "$base/cooler_boost") == on ]]
+  [[ $(systemctl show "$keeper" -p ActiveState --value) == inactive ]]
+  recovery_latch_valid
+else
+  [[ $(cat "$base/cooler_boost") == off ]]
+  if [[ -e $recovery_latch || -L $recovery_latch ]]; then
+    recovery_latch_safe
+    rm -f -- "$recovery_latch"
+  fi
 fi
 safe_state=1
 
@@ -299,7 +383,7 @@ done
 
 # Replace all executable, kernel hook, unit, tmpfiles, and documentation
 # artifacts from the verified stage while the controller is disabled and
-# factory-safe.
+# factory-safe: factory auto/off, or factory auto with Cooler Boost on.
 for index in "${!target_files[@]}"; do
   target=${target_files[$index]}
   install -D -o root -g root -m "${modes[$index]}" "$stage$target" "$target"
@@ -342,3 +426,6 @@ activation_started=1
 "$manager" status
 
 echo "Upgrade complete. Previous artifacts are retained at: $backup"
+if ((boost_retained)); then
+  echo "Cooler Boost stays on as the new controller's automatic latch until it has seen 30 continuously valid, cool seconds."
+fi

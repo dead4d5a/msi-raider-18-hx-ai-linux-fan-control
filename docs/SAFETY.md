@@ -228,7 +228,9 @@ Explicit `factory-auto`, a clean service stop, manager setup errors before a
 service start is attempted, and installation or upgrade staging remain
 intentional factory `auto/off` transitions. They are not used as a response to
 a runtime fault. Each switches Boost off only when coolness is confirmed as
-described next.
+described next. An upgrade whose installed manager cannot confirm that instead
+replaces files at full cooling, as described under
+[Upgrade handover at full cooling](#upgrade-handover-at-full-cooling).
 
 ## Confirming cool before a release
 
@@ -317,6 +319,35 @@ full cooling instead:
 This is the intended, safe direction: a stop never leaves a hot machine on the
 quieter factory curve with Boost released. The failed unit after a hot stop is
 not a fault to repair. Let the machine cool, then run `apply-default`.
+
+## Upgrade handover at full cooling
+
+An upgrade hands over through the installed release's `factory-auto`, and
+releases before this one decide a Boost release from one reading, which a
+spike can refuse right after the upgrade's cool-down gate. Their refusal
+leaves the state described above: the factory curve in `auto` mode with Boost
+on, both units stopped, the `factory-auto` marker, and the recovery-Boost
+marker. That is maximum cooling with no controller running, the safest state in
+which to replace files. `upgrade-profile.sh` therefore continues only when, after
+the failed `factory-auto`, all of these verify by reading alone:
+
+- `preflight.sh` passes again: exact product, board, BIOS, EC firmware, pinned
+  driver build, `comfort` shift mode, Secure Boot and no `ec_sys`;
+- the factory curve, `fan_mode` `auto` and `cooler_boost` `on`;
+- the primary service and the keeper are `inactive/dead`;
+- the `factory-auto` marker is a root-owned, mode-`0600` regular file;
+- the recovery-Boost marker is a root-owned, mode-`0600` regular file with one
+  link and exactly the payload the daemon accepts.
+
+It then disables the service for the replacement window, keeps the
+recovery-Boost marker, replaces and records the artifacts, and activates only
+through the new manager. The new daemon validates and consumes the marker after
+it has reapplied Candidate 14, so the inherited Boost becomes its automatic
+latch and is released only after 30 continuously valid, cool seconds. Without a
+valid marker, the daemon would keep the inherited Boost as manual Boost, so a
+missing or invalid marker stops the upgrade, as does any other failed check:
+nothing is replaced and the manager's exit status is kept. The upgrade script
+never writes the EC and never releases Boost itself.
 
 ## Suspend/resume
 

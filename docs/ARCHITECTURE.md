@@ -98,7 +98,11 @@ intended; `SAFETY.md` describes it. An explicit `factory-auto` request,
 a manager setup failure before a service start is attempted, and the attended
 installation/upgrade transition also deliberately use the factory
 configuration. Those are operator-directed state changes, not runtime-fault
-recovery. Once the manager has attempted service start, it deliberately leaves
+recovery. When the installed manager cannot confirm a cool release during an
+upgrade, the upgrade replaces files only after it has verified the factory
+curve and `auto` mode with Boost on, both units stopped, and a valid
+recovery-Boost marker. It keeps that marker, so the new daemon inherits Boost as
+an automatic latch; any other state stops the upgrade with nothing replaced. Once the manager has attempted service start, it deliberately leaves
 the service state and its runtime recovery untouched.
 
 A failed service invokes a separately root-owned `ExecStopPost` helper after

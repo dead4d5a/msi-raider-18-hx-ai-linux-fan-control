@@ -2,6 +2,39 @@
 
 ## Unreleased
 
+- Continue an upgrade at full cooling when the installed manager cannot
+  confirm a cool release. An upgrade runs the installed release's
+  `factory-auto`, and releases before this one decide from one reading, which a
+  spike can refuse even right after the cool-down gate, as on 2026-10-11. That
+  refusal leaves the factory curve in `auto` mode with Cooler Boost on, both
+  units stopped, the `factory-auto` marker and the recovery-Boost marker that
+  `ExecStopPost` wrote after the hot clean stop; those managers also disable
+  the service. The upgrade used to stop there, and the operator had to run
+  `apply-default` and retry, which could loop on a busy machine. When
+  `factory-auto` exits non-zero, `upgrade-profile.sh` now reruns `preflight.sh`
+  and reads both units, the markers and the EC. Only if the exact platform, the
+  factory curve, `auto`, Boost `on`, both units `inactive/dead`, a root-owned,
+  mode-`0600` `factory-auto` marker and a recovery-Boost marker that is a
+  root-owned, mode-`0600` regular file with one link and exactly the payload
+  the daemon accepts (`candidate14` and a newline) all verify, it prints
+  `The installed manager left factory auto with Cooler Boost on (too hot or
+  unconfirmed); continuing the upgrade at full cooling; ...`. It then disables
+  the service as usual, keeps the recovery-Boost marker, replaces and records
+  the artifacts with no controller running, and activates through the new
+  manager's `apply-default`. The new daemon consumes the marker once it has
+  reapplied Candidate 14 and keeps Boost on as its automatic latch until 30
+  continuously valid, cool seconds; the upgrade ends with
+  `Cooler Boost stays on as the new controller's automatic latch ...`. Any
+  other result, including a missing, unsafe or malformed recovery-Boost marker,
+  a failed platform check, another curve, mode or Boost state, a running unit
+  or a missing `factory-auto` marker, stops as before with the manager's exit
+  status and nothing replaced, after a `Not continuing at full cooling: ...`
+  line that names the first failed check. If a later step fails after
+  continuing, the exit message says that Cooler Boost was left on and the
+  recovery-Boost marker kept. The cool handover is unchanged. The cool-down
+  gate stays, so the continuation remains the exception; its samples already
+  follow the shared confirmation's validity rules, and an invalid one restarts
+  its count.
 - Confirm coolness over several valid samples before releasing Cooler Boost.
   Every check that switches Boost off, or leaves the factory envelope at
   `auto/off`, used to decide from one instantaneous reading: the daemon's clean

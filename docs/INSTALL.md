@@ -88,8 +88,10 @@ sudo ./scripts/upgrade-profile.sh
 
 The upgrade command verifies the source manifest and exact platform (running
 the release checks without root, as the installer does), stages all
-artifacts, moves the existing controller to verified factory `auto/off`,
-disables it for the replacement window, keeps a root-only backup, refreshes the
+artifacts, moves the existing controller to verified factory `auto/off` (or,
+when the installed manager cannot confirm a cool release, to verified factory
+`auto` with Cooler Boost on; see below), disables it for the replacement
+window, keeps a root-only backup, refreshes the
 manager/daemon/recovery helper/readiness check/kernel hook/unit/tmpfiles/
 documentation as one release (adding the readiness check and kernel hook to
 older deployments), and reactivates only through the new guarded manager. Fresh installs and upgrades
@@ -106,7 +108,8 @@ releases nor refuses. The upgrade, however, runs the installed release's
 `factory-auto`. Releases before this one decide from one instantaneous reading:
 on 2026-10-11 one reading 0.26 s after the cool-down gate below had passed made
 the installed daemon refuse its clean stop. The gate makes that less likely
-from such a release but cannot rule it out. After the release checks and
+from such a release but cannot rule it out; when it happens anyway, the upgrade
+continues at full cooling as described below. After the release checks and
 staging, and before it changes anything on the running system, the upgrade
 waits until the CPU package (coretemp) and EC CPU are below 80 °C and the EC
 GPU is below 65 °C (0, a powered-off dGPU, counts as cool) for 10 consecutive
@@ -133,13 +136,36 @@ never replaces runtime recovery with factory mode merely because activation or
 status verification failed. Inspect both units before deciding on another action.
 
 If the existing manager cannot complete `factory-auto`, for example because a
-load heated the machine again after the cool-down wait and it is too hot to
-release Cooler Boost, the upgrade stops before replacing
-any artifact, and the script itself changes no boot enablement. Let the machine
-cool and rerun the upgrade. If a cool retry still fails, or to resume the
-installed profile now, run `sudo msi-fan-profile apply-default` and rerun the
-upgrade when cool. Managers older than this release also disable the service on
-that failure, so their cool retry fails until `apply-default` has been run.
+load heated the machine again after the cool-down wait, or because an earlier
+release's single reading caught a spike, the upgrade first checks whether it
+left full cooling with no controller running. A refused hot release normally
+leaves exactly that: the factory curve in `auto` mode with Cooler Boost on,
+both units stopped, the `factory-auto` marker, and the recovery-Boost marker
+written after the hot clean stop. The upgrade reruns `preflight.sh` and reads
+both units, the `factory-auto` marker, the EC curve, mode and Boost, and the
+recovery-Boost marker, which must be a root-owned, mode-`0600` regular file
+with one link and exactly the payload the daemon accepts. Only if all of them
+verify, it prints
+`The installed manager left factory auto with Cooler Boost on (too hot or unconfirmed); continuing the upgrade at full cooling; the new controller will release Boost after its 30 s cool confirmation.`
+It then disables the service for the replacement window as usual, keeps the
+recovery-Boost marker, replaces and records the artifacts, and activates
+through the new manager. The new daemon consumes the marker once it has
+reapplied Candidate 14 and keeps Boost on as its automatic latch until
+telemetry has been valid and cool for 30 continuous seconds, so `status` shows
+`cooler_boost` `on` and health `cooling` until then. If a later step fails
+before activation, the exit message says that Cooler Boost was left on and the
+recovery-Boost marker was kept, and the service stays disabled.
+
+In every other case the upgrade stops before replacing any artifact, with the
+manager's exit status, and the script itself changes no boot enablement. That
+includes a missing recovery-Boost marker (the new daemon would keep the
+inherited Boost as manual Boost), an unsafe or malformed one, a failed platform
+check, and any other curve, mode, Boost or unit state. A line
+`Not continuing at full cooling: ...` names the first check that failed. Let the
+machine cool and rerun the upgrade. If a cool retry still fails, or to resume
+the installed profile now, run `sudo msi-fan-profile apply-default` and rerun
+the upgrade when cool. Managers older than this release also disable the service
+on that failure, so their cool retry fails until `apply-default` has been run.
 
 If `factory-auto` succeeds but a later check fails before any replacement (the
 disable, the stopped units, the runtime marker, factory `auto/off`, or a

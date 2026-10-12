@@ -160,11 +160,16 @@ kernel, then run `sudo msi-fan-profile apply-default`.
 
 ## If a profile upgrade stopped while hot
 
-When `upgrade-profile.sh` reports that the existing manager did not reach
-verified factory `auto/off`, it replaced nothing. Usually the machine was too
-hot to release Cooler Boost: the EC is on the factory curve in `auto` mode with
-Boost on, and the controller is stopped by the runtime factory override. To get
-out of that state:
+A refused hot release that leaves verified full cooling (the factory curve,
+`auto` mode, Boost on, both units stopped and a valid recovery-Boost marker) no
+longer stops the upgrade; it continues at full cooling, as `INSTALL.md`
+describes. When `upgrade-profile.sh` reports that the existing manager did not
+reach verified factory `auto/off`, it replaced nothing, and the line before,
+`Not continuing at full cooling: ...`, names the check that stopped it.
+Usually the machine was too hot to release Cooler Boost and no valid
+recovery-Boost marker was present: the EC is on the factory curve in `auto`
+mode with Boost on, and the controller is stopped by the runtime factory
+override. To get out of that state:
 
 ```bash
 sudo msi-fan-profile apply-default     # resume Candidate 14

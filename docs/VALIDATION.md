@@ -88,7 +88,8 @@ observations, not attended or injected-fault tests.
   nothing. The operator reports that these sensors are flaky: the coretemp
   package reading jumps 20 °C or more within milliseconds under bursty load,
   and the EC sometimes returns junk such as 255 °C, 65535 RPM or an empty
-  value. The unreleased cool confirmation in `CHANGELOG.md` responds to this.
+  value. The unreleased cool confirmation and full-cooling upgrade handover in
+  `CHANGELOG.md` respond to this.
 
 ## Automated validation on 2026-09-30
 
@@ -103,7 +104,9 @@ observations, not attended or injected-fault tests.
   replacement while a manager request waits.
 - Atomic health ownership/mode/schema/freshness validation, including a real
   publisher/manager round trip with only root ownership virtualized.
-- Relocated, mocked full upgrade-script failures before and after activation.
+- Relocated, mocked full upgrade-script failures before and after activation,
+  including a refused hot handover that continues at full cooling with the
+  recovery-Boost marker kept, and every other refusal state that stops it.
 - Opt-in isolated user-systemd tests for a missed watchdog, post-stop-before-
   keeper ordering, exclusive control and keeper yield, and restart-limit
   exhaustion. All use unique user units and fake files, not production helpers

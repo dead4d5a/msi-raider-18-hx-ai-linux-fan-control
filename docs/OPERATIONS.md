@@ -320,7 +320,14 @@ keeper keeps cooling:
    for 10 seconds before it touches the controller; if that takes longer than
    600 seconds (`MSI_FAN_UPGRADE_COOL_TIMEOUT`), it exits with nothing changed.
    Stop heavy workloads and rerun it. Do not pull or edit the checkout while it
-   waits; a changed source file also stops it with nothing changed. Afterwards,
+   waits; a changed source file also stops it with nothing changed. If the
+   installed release's `factory-auto` still refuses to release Cooler Boost
+   after the wait, and the factory curve, `auto` mode, Boost on, both units
+   stopped and a valid recovery-Boost marker verify, the upgrade prints
+   `... continuing the upgrade at full cooling ...` and completes; `status`
+   then shows `cooler_boost` `on` and health `cooling` until the new daemon has
+   seen 30 continuously valid, cool seconds. Otherwise it stops with nothing
+   replaced, after a `Not continuing at full cooling: ...` line. Afterwards,
    check `controller_memory.memory_peak_bytes` over several days; it should
    stay far below 64 MiB.
 

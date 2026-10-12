@@ -73,12 +73,44 @@ elif command == "verify-release.sh":
         "mode": stat.S_IMODE(tree.stat().st_mode)}))
     if failure == "verify":
         sys.exit(26)
+elif command == "preflight.sh":
+    # The exact-platform check: the upgrade runs it first and again before it
+    # continues at full cooling; the identity failure fails the second run.
+    if failure == "identity" and sum(call == ["preflight.sh"] for call in map(
+            json.loads, (root / "calls.jsonl").read_text().splitlines())) > 1:
+        print("FAIL board                    got=<MS-0000> expected=<MS-1824>")
+        print("PREFLIGHT FAILED — do not install.", file=sys.stderr)
+        sys.exit(1)
+    print("PREFLIGHT PASSED")
 elif command == "msi-fan-profile":
     if args == ["factory-auto"]:
         state.update(active="inactive", substate="dead", keeper="inactive")
         marker = root / "run/msi-fan-profile.factory-auto"
         marker.touch()
         marker.chmod(0o600)
+        refusal = os.environ.get("UPGRADE_TEST_REFUSAL")
+        if refusal:
+            # An earlier release's refused handover, as on 2026-10-11: its
+            # daemon's single reading refused the clean stop, ExecStopPost wrote
+            # the recovery latch, and its manager disabled the service and left
+            # factory auto with Boost on. Tests vary what it left behind.
+            left = json.loads(refusal)
+            state.update({key: left[key] for key in ("enabled", "active", "substate", "keeper")})
+            if not left["marker"]:
+                marker.unlink()
+            latch = root / "run/msi-fan-profile.recovery-boost"
+            if left["latch"] is not None:
+                target = root / "run/latch-target" if left["latch_kind"] == "symlink" else latch
+                target.write_text(left["latch"])
+                target.chmod(int(left["latch_mode"], 8))
+                if left["latch_kind"] == "symlink":
+                    latch.symlink_to(target)
+                elif left["latch_kind"] == "hardlink":
+                    os.link(latch, root / "run/latch-link")
+            cooling(left["curve"], left["mode"], left["boost"])
+            print("ERROR: factory-auto failed: factory restored but too hot to release "
+                  "Boost; service disabled, factory auto with Boost on", file=sys.stderr)
+            sys.exit(1)
         if failure == "hot-factory":
             # The current manager's refused release: verified factory auto with
             # Boost on; marker, enablement and recovery latch are left as they were.
@@ -89,12 +121,23 @@ elif command == "msi-fan-profile":
         cooling(os.environ["UPGRADE_TEST_FACTORY"], "auto", "off")
     elif args == ["apply-default"]:
         (root / "run/msi-fan-profile.factory-auto").unlink()
+        # Record what the new daemon finds. It consumes a recovery latch once it
+        # has reapplied Candidate14, and the inherited Boost becomes its
+        # automatic latch until 30 continuously valid, cool seconds.
+        latch = root / "run/msi-fan-profile.recovery-boost"
+        latched = latch.is_file() and not latch.is_symlink()
+        state["at_activation"] = {
+            "boost": state["boost"], "enabled": state["enabled"],
+            "latch": latch.read_text() if latched else None,
+            "latch_mode": format(stat.S_IMODE(latch.stat().st_mode), "o") if latched else None}
         if failure == "activation":
             state.update(active="failed", substate="failed", keeper="active")
             cooling(os.environ["UPGRADE_TEST_DEFAULT"], "advanced", "on")
             sys.exit(23)
+        if latched:
+            latch.unlink()
         state.update(active="active", substate="running", keeper="inactive")
-        cooling(os.environ["UPGRADE_TEST_DEFAULT"], "advanced", "off")
+        cooling(os.environ["UPGRADE_TEST_DEFAULT"], "advanced", "on" if latched else "off")
     elif args == ["status"] and failure == "status":
         state.update(active="failed", substate="failed", keeper="active")
         cooling(os.environ["UPGRADE_TEST_DEFAULT"], "advanced", "on")
@@ -119,8 +162,13 @@ elif command == "systemctl":
         save()
     elif action == "show":
         field = args[args.index("-p") + 1]
-        print({"ActiveState": state["active"], "SubState": state["substate"],
-               "NeedDaemonReload": "no"}[field])
+        if "keeper" in args[1]:
+            print({"ActiveState": state["keeper"],
+                   "SubState": {"inactive": "dead", "active": "running"}.get(
+                       state["keeper"], state["keeper"])}[field])
+        else:
+            print({"ActiveState": state["active"], "SubState": state["substate"],
+                   "NeedDaemonReload": "no"}[field])
 elif command == "systemd-analyze":
     if failure == "preactivation":
         sys.exit(25)
@@ -133,7 +181,8 @@ elif command == "stat":
     fmt, path = args[1], pathlib.Path(args[2])
     info = path.stat()
     kind = "regular file" if info.st_size else "regular empty file"
-    values = {"%F": kind, "%U": "root", "%G": "root",
+    owner = "tester" if str(path) == os.environ.get("UPGRADE_TEST_NOT_ROOT") else "root"
+    values = {"%F": kind, "%U": owner, "%G": owner,
               "%a": format(stat.S_IMODE(info.st_mode), "o"), "%h": str(info.st_nlink)}
     for key, value in values.items():
         fmt = fmt.replace(key, value)
@@ -204,12 +253,20 @@ ROOT_GUARD = "[[ $EUID -eq 0 ]] || { echo 'Run with sudo.' >&2; exit 1; }"
 HOST_REFERENCE = re.compile(
     r"(?<![\w./-])/(?:bin|boot|dev|etc|lib|lib64|proc|run|sbin|sys|usr|var)(?![\w-])")
 LATCH_PAYLOAD = "candidate14\n"
+# What an earlier release's refused hot handover left on 2026-10-11: factory
+# auto with Cooler Boost on, both units stopped, the service disabled, the
+# factory-auto marker, and the recovery latch ExecStopPost wrote after the hot
+# clean stop. Tests override single entries.
+OLD_REFUSAL = {"curve": FACTORY, "mode": "auto", "boost": "on", "enabled": "disabled",
+               "active": "inactive", "substate": "dead", "keeper": "inactive",
+               "marker": True, "latch": LATCH_PAYLOAD, "latch_mode": "600", "latch_kind": "file"}
 
 
 class UpgradeSandboxTestCase(unittest.TestCase):
     def run_upgrade(self, failure, *, sudo=("4242", "4343"), unreadable=False,
                     latch_mode=None, initial=None, marker=False, temperatures=(COOL,),
-                    hwmon=None, cool_timeout=None, edit_during_wait=None):
+                    hwmon=None, cool_timeout=None, edit_during_wait=None, refusal=None,
+                    not_root=None):
         """Run the sandboxed upgrade.
 
         temperatures holds one (package, EC CPU, EC GPU) sample per cool-down
@@ -217,7 +274,10 @@ class UpgradeSandboxTestCase(unittest.TestCase):
         missing), each later one by the sleep shim ("" is an unreadable
         reading), and the last one persists. hwmon maps hwmon directory names
         to their reported name. edit_during_wait names a release file the
-        first cool-down wait appends to.
+        first cool-down wait appends to. refusal makes the installed manager's
+        factory-auto fail like an earlier release's refused hot handover,
+        leaving OLD_REFUSAL updated with it. not_root names a sandbox path that
+        stat reports as owned by a regular user.
         """
         self.assertNotIn(None, [reading for sample in temperatures[1:] for reading in sample])
         with tempfile.TemporaryDirectory() as temporary:
@@ -282,7 +342,7 @@ class UpgradeSandboxTestCase(unittest.TestCase):
                 script_path.chmod(0o755)
 
             path = release / "scripts/preflight.sh"
-            path.write_text("#!/usr/bin/env bash\nexit 0\n")
+            path.write_text(COMMAND_SHIM)
             path.chmod(0o755)
             path = release / "scripts/verify-release.sh"
             path.write_text(COMMAND_SHIM)
@@ -336,6 +396,10 @@ class UpgradeSandboxTestCase(unittest.TestCase):
                 environment["MSI_FAN_UPGRADE_COOL_TIMEOUT"] = cool_timeout
             if edit_during_wait is not None:
                 environment["UPGRADE_TEST_EDIT_DURING_WAIT"] = str(release / edit_during_wait)
+            if refusal is not None:
+                environment["UPGRADE_TEST_REFUSAL"] = json.dumps({**OLD_REFUSAL, **refusal})
+            if not_root is not None:
+                environment["UPGRADE_TEST_NOT_ROOT"] = str(sandbox / not_root)
             environment.update(PATH=str(mock_bin) + os.pathsep + str(allowed_bin),
                                UPGRADE_TEST_ROOT=str(sandbox), UPGRADE_TEST_FAIL_AT=failure,
                                UPGRADE_TEST_FACTORY=FACTORY, UPGRADE_TEST_DEFAULT=DEFAULT,
@@ -354,7 +418,9 @@ class UpgradeSandboxTestCase(unittest.TestCase):
             if self.verify is not None:
                 self.verify["in_place"] = self.verify["tree"] == str(release)
                 self.verify["tree_remaining"] = pathlib.Path(self.verify["tree"]).exists()
-            self.latch_remaining = latch.exists()
+            self.latch_remaining = latch.exists() or latch.is_symlink()
+            self.latch_after = (latch.read_text() if latch.is_file() and not latch.is_symlink()
+                                else None)
             self.deployed_after = self.deployed_files(sandbox)
             self.deployed = {path: mode for path, (mode, _) in self.deployed_after.items()}
             record = sandbox / "usr/local/share/doc/msi-fan-profile/INSTALL_RECORD"
@@ -398,18 +464,21 @@ class UpgradeCoolingPreservationTests(UpgradeSandboxTestCase):
         self.assertEqual(state["enabled"], "disabled")
         self.assertNotIn(["msi-fan-profile", "apply-default"], calls)
 
-    def test_hot_factory_refusal_replaces_nothing_and_says_how_to_retry(self):
-        result, state, calls = self.run_upgrade("hot-factory", latch_mode=0o600)
+    def test_hot_factory_refusal_without_a_latch_replaces_nothing_and_says_how_to_retry(self):
+        # Without a recovery latch the new daemon would keep the inherited Boost
+        # as manual Boost, so the upgrade does not continue at full cooling.
+        result, state, calls = self.run_upgrade("hot-factory")
         self.assertEqual(result.returncode, 27, result.stdout + result.stderr)
+        self.assertIn("Not continuing at full cooling: no recovery Boost latch", result.stderr)
         self.assertIn("did not reach verified factory auto/off", result.stderr)
         self.assertIn("let the machine cool and rerun this upgrade", result.stderr)
         self.assertRegex(result.stderr, r"run 'sudo \S*/usr/local/sbin/msi-fan-profile "
                                         r"apply-default' and rerun this upgrade when cool")
-        # Boot enablement, staged Boost and the recovery latch are left alone, so
-        # the installed profile still returns at boot and releases Boost when cool.
+        # Boot enablement and staged Boost are left alone, so the installed
+        # profile still returns at boot and releases Boost when cool.
         self.assertEqual((state["curve"], state["mode"], state["boost"], state["enabled"]),
                          (FACTORY, "auto", "on", "enabled"))
-        self.assertTrue(self.latch_remaining)
+        self.assertFalse(self.latch_remaining)
         self.assertNotIn(["systemctl", "disable", "msi-fan-profile.service"], calls)
         self.assertNotIn(["msi-fan-profile", "apply-default"], calls)
         self.assertNotIn("usr/local/libexec/msi-fan-kernel-readiness", self.deployed)
@@ -471,6 +540,228 @@ class UpgradeCoolingPreservationTests(UpgradeSandboxTestCase):
         result, state, calls = self.run_upgrade("disable")
         self.assert_stopped_after_verified_factory(result, state, calls)
         self.assertEqual(calls.count(["systemctl", "disable", "msi-fan-profile.service"]), 2)
+
+
+class UpgradeFullCoolingHandoverTests(UpgradeSandboxTestCase):
+    """An earlier release's factory-auto decides a Boost release from one
+    reading, so a spike can refuse the handover right after the cool-down gate.
+    When the installed manager verifiably left full cooling with no controller
+    running (exact platform, factory curve, auto mode, Boost on, both units
+    stopped, the marker and a valid recovery latch), the upgrade continues and
+    keeps the latch for the new daemon. Any other shape stops as before."""
+
+    CONTINUING = ("The installed manager left factory auto with Cooler Boost on (too hot or "
+                  "unconfirmed); continuing the upgrade at full cooling; the new controller "
+                  "will release Boost after its 30 s cool confirmation.")
+    LATCH = "run/msi-fan-profile.recovery-boost"
+    INVALID_LATCH = (r"Not continuing at full cooling: the recovery Boost latch \S*/" + LATCH +
+                     r" is not a root-owned, mode-0600 file with the expected payload\.")
+    # The handover through the old manager, its replacement and activation,
+    # exactly as before this change, for a cool, confirmed factory auto/off.
+    COOL_HANDOVER = [
+        ["preflight.sh"],
+        ["systemctl", "daemon-reload"],
+        ["systemctl", "stop", "msi-fan-profile-keeper.service"],
+        ["systemctl", "reset-failed", "msi-fan-profile-keeper.service"],
+        ["msi-fan-profile", "factory-auto"],
+        ["systemctl", "disable", "msi-fan-profile.service"],
+        ["systemctl", "stop", "msi-fan-profile.service"],
+        ["systemctl", "reset-failed", "msi-fan-profile.service"],
+        ["systemctl", "is-enabled", "msi-fan-profile.service"],
+        ["systemctl", "show", "msi-fan-profile.service", "-p", "ActiveState", "--value"],
+        ["systemctl", "show", "msi-fan-profile.service", "-p", "SubState", "--value"],
+        ["systemd-tmpfiles", "--create", "/etc/tmpfiles.d/msi-fan-profile.conf"],
+        ["systemd-analyze", "verify", "/etc/systemd/system/msi-fan-profile.service",
+         "/etc/systemd/system/msi-fan-profile-keeper.service"],
+        ["systemctl", "daemon-reload"],
+        ["systemctl", "show", "msi-fan-profile.service", "-p", "NeedDaemonReload", "--value"],
+        ["systemctl", "enable", "msi-fan-profile.service"],
+        ["systemctl", "is-enabled", "msi-fan-profile.service"],
+        ["msi-fan-profile", "apply-default"],
+        ["msi-fan-profile", "status"],
+    ]
+
+    @staticmethod
+    def replacements(calls):
+        """Indexes of installs onto the live deployment, not into the stage."""
+        return [index for index, call in enumerate(calls) if call[0] == "install" and
+                "-d" not in call and "/run/msi-fan-profile-upgrade." not in call[-1]]
+
+    @staticmethod
+    def live(calls):
+        """Service, manager and platform-check calls, with sandbox paths removed."""
+        return [[re.sub(r"^\S*/(?=(?:etc|run)/)", "/", arg) for arg in call] for call in calls
+                if call[0] in ("preflight.sh", "systemctl", "msi-fan-profile",
+                               "systemd-analyze", "systemd-tmpfiles")]
+
+    def assert_continued_at_full_cooling(self, result, state, calls):
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn(self.CONTINUING, result.stderr)
+        self.assertNotIn("Upgrade stopped", result.stderr)
+        # The exact-platform check runs again after the refusal and before the
+        # upgrade changes anything; the service stays disabled while every
+        # artifact is replaced and recorded, and only the new manager activates.
+        refused = calls.index(["msi-fan-profile", "factory-auto"])
+        self.assertEqual(calls.count(["preflight.sh"]), 2)
+        self.assertEqual(calls[refused + 1], ["preflight.sh"])
+        disable = calls.index(["systemctl", "disable", "msi-fan-profile.service"])
+        replaced = self.replacements(calls)
+        enable = calls.index(["systemctl", "enable", "msi-fan-profile.service"])
+        activation = calls.index(["msi-fan-profile", "apply-default"])
+        self.assertTrue(all(call[0] in ("preflight.sh", "stat") or call[:2] == ["systemctl", "show"]
+                            for call in calls[refused + 1:disable]), calls[refused + 1:disable])
+        self.assertLess(disable, replaced[0])
+        self.assertLess(replaced[-1], enable)
+        self.assertLess(enable, activation)
+        self.assertEqual(calls[activation + 1], ["msi-fan-profile", "status"])
+        self.assertEqual(self.deployed.get("usr/local/libexec/msi-fan-kernel-readiness"), "755")
+        self.assertRegex(self.record, r"(?m)^source_commit=")
+        self.assertTrue(self.backup_created)
+        # Boost stayed on and the latch was kept, unchanged, until the new
+        # manager's apply-default; the new daemon consumed it and holds Boost as
+        # its automatic latch.
+        self.assertEqual(state["at_activation"], {"boost": "on", "enabled": "enabled",
+                                                  "latch": LATCH_PAYLOAD, "latch_mode": "600"})
+        self.assertFalse(self.latch_remaining)
+        self.assertEqual((state["curve"], state["mode"], state["boost"], state["enabled"],
+                          state["active"], state["keeper"]),
+                         (DEFAULT, "advanced", "on", "enabled", "active", "inactive"))
+        self.assertIn("Upgrade complete.", result.stdout)
+        self.assertIn("Cooler Boost stays on as the new controller's automatic latch until it "
+                      "has seen 30 continuously valid, cool seconds.", result.stdout)
+
+    def test_old_manager_hot_refusal_continues_at_full_cooling_and_keeps_the_latch(self):
+        result, state, calls = self.run_upgrade("", refusal={})
+        self.assert_continued_at_full_cooling(result, state, calls)
+
+    def test_current_manager_refusal_with_a_valid_latch_also_continues(self):
+        # This release's manager keeps boot enablement on a refused release; the
+        # upgrade still disables the service for the replacement window.
+        result, state, calls = self.run_upgrade("hot-factory", latch_mode=0o600)
+        self.assert_continued_at_full_cooling(result, state, calls)
+
+    def assert_stopped_as_before(self, result, state, calls, reason, **expected):
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertRegex(result.stderr, reason)
+        self.assertNotIn("continuing the upgrade at full cooling", result.stderr)
+        self.assertNotIn("Cooler Boost was left on", result.stderr)
+        self.assertIn("did not reach verified factory auto/off", result.stderr)
+        self.assertIn("let the machine cool and rerun this upgrade", result.stderr)
+        self.assertRegex(result.stderr, r"run 'sudo \S*/usr/local/sbin/msi-fan-profile "
+                                        r"apply-default' and rerun this upgrade when cool")
+        # After the refusal the upgrade only read; it replaced and recorded
+        # nothing and left what the installed manager left.
+        refused = calls.index(["msi-fan-profile", "factory-auto"])
+        self.assertTrue(all(call[0] in ("preflight.sh", "stat") or call[:2] == ["systemctl", "show"]
+                            for call in calls[refused + 1:]), calls[refused + 1:])
+        self.assertEqual(self.deployed_after, self.deployed_before)
+        self.assertEqual(self.record, "")
+        self.assertFalse(self.backup_created)
+        self.assertFalse(self.stages_remaining)
+        left = {**OLD_REFUSAL, **expected}
+        self.assertEqual((state["curve"], state["mode"], state["boost"], state["enabled"],
+                          state["active"], state["keeper"]),
+                         tuple(left[key] for key in ("curve", "mode", "boost", "enabled",
+                                                     "active", "keeper")))
+
+    def test_missing_latch_stops_as_before(self):
+        result, state, calls = self.run_upgrade("", refusal={"latch": None})
+        self.assert_stopped_as_before(
+            result, state, calls, r"Not continuing at full cooling: no recovery Boost latch \S*/" +
+            self.LATCH + r"\.")
+        self.assertFalse(self.latch_remaining)
+
+    def test_unsafe_or_invalid_latch_stops_as_before_and_is_kept(self):
+        for name, options in (
+                ("mode 0644", {"refusal": {"latch_mode": "644"}}),
+                ("owner", {"refusal": {}, "not_root": self.LATCH}),
+                ("symlink", {"refusal": {"latch_kind": "symlink"}}),
+                ("second link", {"refusal": {"latch_kind": "hardlink"}}),
+                ("other profile", {"refusal": {"latch": "candidate13\n"}}),
+                ("no newline", {"refusal": {"latch": "candidate14"}}),
+                ("extra newline", {"refusal": {"latch": "candidate14\n\n"}}),
+                ("empty", {"refusal": {"latch": ""}}),
+        ):
+            with self.subTest(name=name):
+                result, state, calls = self.run_upgrade("", **options)
+                self.assert_stopped_as_before(result, state, calls, self.INVALID_LATCH)
+                self.assertTrue(self.latch_remaining)
+                if options["refusal"].get("latch_kind", "file") == "file":
+                    self.assertEqual(self.latch_after, {**OLD_REFUSAL, **options["refusal"]}["latch"])
+
+    def test_any_other_state_after_the_refusal_stops_as_before(self):
+        for left, reason in (
+                ({"curve": DEFAULT}, "the EC is not on the factory curve"),
+                ({"curve": DEFAULT, "mode": "advanced"}, "the EC is not on the factory curve"),
+                ({"mode": "advanced"}, "fan_mode is not auto"),
+                ({"boost": "off"}, "Cooler Boost is not on"),
+                ({"active": "active", "substate": "running"},
+                 "msi-fan-profile.service is not inactive"),
+                ({"active": "failed", "substate": "failed"},
+                 "msi-fan-profile.service is not inactive"),
+                ({"keeper": "active"}, "msi-fan-profile-keeper.service is not inactive"),
+                ({"marker": False}, "no root-owned, mode-0600 factory-auto marker"),
+        ):
+            with self.subTest(left=left):
+                result, state, calls = self.run_upgrade("", refusal=left)
+                self.assert_stopped_as_before(
+                    result, state, calls, "Not continuing at full cooling: " + re.escape(reason),
+                    **left)
+                self.assertTrue(self.latch_remaining)
+                self.assertEqual(self.latch_after, LATCH_PAYLOAD)
+
+    def test_failed_platform_check_after_the_refusal_stops_with_nothing_replaced(self):
+        result, state, calls = self.run_upgrade("identity", refusal={})
+        self.assert_stopped_as_before(
+            result, state, calls,
+            r"Not continuing at full cooling: the exact-platform check failed\.")
+        self.assertIn("PREFLIGHT FAILED", result.stderr)
+        self.assertEqual(calls.count(["preflight.sh"]), 2)
+        self.assertTrue(self.latch_remaining)
+        self.assertEqual(self.latch_after, LATCH_PAYLOAD)
+
+    def test_cool_handover_is_unchanged(self):
+        result, state, calls = self.run_upgrade("", latch_mode=0o600)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self.live(calls), self.COOL_HANDOVER)
+        self.assertNotIn("full cooling", result.stdout + result.stderr)
+        self.assertNotIn("Cooler Boost stays on", result.stdout)
+        # The verified auto/off state completes the handover; the latch goes.
+        self.assertFalse(self.latch_remaining)
+        self.assertEqual(state["at_activation"], {"boost": "off", "enabled": "enabled",
+                                                  "latch": None, "latch_mode": None})
+        self.assertEqual((state["curve"], state["mode"], state["boost"], state["enabled"]),
+                         (DEFAULT, "advanced", "off", "enabled"))
+
+    def test_failure_after_continuing_says_boost_was_left_on_and_the_latch_kept(self):
+        latch = r" \S*/" + self.LATCH + " was kept"
+        for failure, code, message, replaced in (
+                ("preactivation", 25,
+                 r"Upgrade stopped; the service remains disabled in factory auto mode\. Cooler "
+                 r"Boost was left on and the recovery Boost latch" + latch + r"\.", True),
+                ("disable", 1,
+                 r"Upgrade stopped before replacing any artifact: the installed manager left "
+                 r"factory auto with Cooler Boost on, but a later service, marker, cooling or "
+                 r"recovery Boost latch check failed\. Cooler Boost was left on and the "
+                 r"recovery Boost latch" + latch + r"\.", False),
+        ):
+            with self.subTest(failure=failure):
+                result, state, calls = self.run_upgrade(failure, refusal={})
+                self.assertEqual(result.returncode, code, result.stdout + result.stderr)
+                self.assertIn(self.CONTINUING, result.stderr)
+                self.assertRegex(result.stderr, message)
+                self.assertNotIn("did not reach verified factory auto/off", result.stderr)
+                self.assertNotIn("reported factory auto/off", result.stderr)
+                self.assertEqual((state["curve"], state["mode"], state["boost"], state["enabled"]),
+                                 (FACTORY, "auto", "on", "disabled"))
+                self.assertTrue(self.latch_remaining)
+                self.assertEqual(self.latch_after, LATCH_PAYLOAD)
+                self.assertNotIn(["msi-fan-profile", "apply-default"], calls)
+                self.assertEqual(bool(self.replacements(calls)), replaced)
+                if not replaced:
+                    self.assertEqual(self.deployed_after, self.deployed_before)
+                    self.assertIn("The service was disabled, so the installed profile will "
+                                  "not return at boot.", result.stderr)
 
 
 class UpgradeCoolDownGateTests(UpgradeSandboxTestCase):
@@ -687,8 +978,10 @@ class UnprivilegedReleaseCheckTests(UpgradeSandboxTestCase):
         result, state, calls = self.run_upgrade("verify")
         self.assertEqual(result.returncode, 26, result.stdout + result.stderr)
         self.assertEqual(self.verify["uid"], "4242")
-        # Only the read-only manager ownership check precedes the release checks.
-        self.assertEqual({call[0] for call in calls}, {"stat", "setpriv", "verify-release.sh"})
+        # Only the read-only manager ownership and platform checks precede the
+        # release checks.
+        self.assertEqual({call[0] for call in calls},
+                         {"stat", "preflight.sh", "setpriv", "verify-release.sh"})
         self.assertEqual((state["curve"], state["mode"], state["boost"], state["enabled"]),
                          (DEFAULT, "advanced", "off", "enabled"))
 
