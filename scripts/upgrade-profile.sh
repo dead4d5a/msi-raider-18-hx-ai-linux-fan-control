@@ -9,7 +9,21 @@ manager=/usr/local/sbin/msi-fan-profile
 marker=/run/msi-fan-profile.factory-auto
 recovery_latch=/run/msi-fan-profile.recovery-boost
 base=/sys/devices/platform/msi-ec
+hwmon=/sys/class/hwmon
 factory='58 64 70 76 82 88 0 25 35 44 58 70 75 52 58 64 70 76 82 0 25 35 44 58 70 75'
+
+# The installed manager's factory-auto refuses to release Cooler Boost at a
+# coretemp package or EC CPU temperature of 85 C or more, or an EC GPU
+# temperature of 70 C or more (EC GPU 0 is a powered-off dGPU), and managers
+# before this release then also disable the service. The release checks heat
+# the CPU, so the handover waits for 5 C under each limit over consecutive
+# one-second samples.
+cool_package_below=80000
+cool_ec_cpu_below=80
+cool_ec_gpu_below=65
+cool_samples=10
+cool_limits="CPU package $((cool_package_below / 1000)) C, EC CPU $cool_ec_cpu_below C and EC GPU $cool_ec_gpu_below C"
+cool_timeout=${MSI_FAN_UPGRADE_COOL_TIMEOUT-600}
 
 [[ $EUID -eq 0 ]] || { echo 'Run with sudo.' >&2; exit 1; }
 [[ -x $manager ]] || { echo "Existing manager is missing: $manager" >&2; exit 1; }
@@ -17,6 +31,12 @@ factory='58 64 70 76 82 88 0 25 35 44 58 70 75 52 58 64 70 76 82 0 25 35 44 58 7
   echo "Existing manager has unsafe ownership or mode: $manager" >&2
   exit 1
 }
+if [[ ! $cool_timeout =~ ^[1-9][0-9]{0,4}$ ]] ||
+    ((cool_timeout < cool_samples || cool_timeout > 86400)); then
+  printf 'MSI_FAN_UPGRADE_COOL_TIMEOUT must be a whole number of seconds from %d to 86400, not %q.\n' \
+    "$cool_samples" "$cool_timeout" >&2
+  exit 1
+fi
 
 # Validate the exact platform and the source release before touching the installed
 # controller. This also prevents a mismatched digest manifest from being deployed.
@@ -121,6 +141,100 @@ for index in "${!source_files[@]}"; do
     "${source_files[$index]}" "$staged"
   cmp -s "${source_files[$index]}" "$staged"
 done
+
+# Read one sysfs attribute into reading; empty if it is missing or unreadable.
+read_attribute() {
+  reading=''
+  { IFS= read -r reading < "$1"; } 2>/dev/null || true
+}
+
+# Succeed if $1 is a decimal reading from $2 to $3.
+valid_reading() {
+  [[ $1 =~ ^[0-9]{1,6}$ ]] && ((10#$1 >= $2 && 10#$1 <= $3))
+}
+
+# An unreadable, non-numeric or out-of-range value, such as the EC's 255
+# sentinel, or a CPU at 0 C, never counts as cool.
+readings_valid() {
+  valid_reading "$package" 1 110000 && valid_reading "$ec_cpu" 1 110 &&
+    valid_reading "$ec_gpu" 0 110
+}
+
+# Sample the sensors the installed manager checks, from the same sources, into
+# package, ec_cpu and ec_gpu. Succeed only if each is valid and below its cool
+# limit.
+sample_cooling() {
+  local name cores=()
+  for name in "$hwmon"/hwmon*/name; do
+    read_attribute "$name"
+    [[ $reading != coretemp ]] || cores+=("${name%/name}")
+  done
+  package=''
+  # Like the manager, require exactly one coretemp device.
+  if ((${#cores[@]} == 1)); then
+    read_attribute "${cores[0]}/temp1_input"
+    package=$reading
+  fi
+  read_attribute "$base/cpu/realtime_temperature"
+  ec_cpu=$reading
+  read_attribute "$base/gpu/realtime_temperature"
+  ec_gpu=$reading
+  readings_valid &&
+    ((10#$package < cool_package_below && 10#$ec_cpu < cool_ec_cpu_below &&
+      10#$ec_gpu < cool_ec_gpu_below))
+}
+
+# Describe one reading in degrees C: label, value, valid range, units per degree.
+describe_reading() {
+  if valid_reading "$2" "$3" "$4"; then
+    printf '%s %d.%d C' "$1" "$((10#$2 / $5))" "$((10#$2 % $5 * 10 / $5))"
+  elif [[ -z $2 ]]; then
+    printf '%s unreadable' "$1"
+  else
+    printf '%s invalid (%q)' "$1" "$2"
+  fi
+}
+
+cooling_readings() {
+  printf '%s, %s, %s' "$(describe_reading 'CPU package' "$package" 1 110000 1000)" \
+    "$(describe_reading 'EC CPU' "$ec_cpu" 1 110 1)" \
+    "$(describe_reading 'EC GPU' "$ec_gpu" 0 110 1)"
+}
+
+# Hand over to the installed manager only once it can release Cooler Boost, so
+# a refused hot release cannot stop (and, before this release, disable) the
+# controller. Nothing on the running system has changed yet.
+cool=0
+waited=0
+waiting=0
+gate_started=$SECONDS
+while :; do
+  if sample_cooling; then
+    cool=$((cool + 1))
+    ((cool < cool_samples)) || break
+  else
+    cool=0
+    if ((!waiting)); then
+      waiting=1
+      echo "Waiting up to $cool_timeout s for the machine to cool below $cool_limits, 5 C under the installed manager's Cooler Boost release limits: $(cooling_readings)"
+    fi
+  fi
+  if ((waited >= cool_timeout || SECONDS - gate_started >= cool_timeout)); then
+    echo "Upgrade not started: the machine did not cool below $cool_limits within $cool_timeout s; stop heavy workloads and rerun." >&2
+    echo "Last readings: $(cooling_readings). No installed file, service or fan setting was changed." >&2
+    readings_valid ||
+      echo 'An unreadable or invalid reading never counts as cool; check the msi-ec and coretemp sensors before rerunning.' >&2
+    exit 1
+  fi
+  if ((waited > 0 && waited % 30 == 0)); then
+    echo "Still waiting for cool-down after $waited s ($cool of $cool_samples consecutive cool samples): $(cooling_readings)"
+  fi
+  sleep 1
+  waited=$((waited + 1))
+done
+if ((waiting)); then
+  echo "Cooled below $cool_limits after $waited s: $(cooling_readings)"
+fi
 
 # A reload clears stale manager metadata before the old manager takes the
 # controller to its guarded factory-auto state.

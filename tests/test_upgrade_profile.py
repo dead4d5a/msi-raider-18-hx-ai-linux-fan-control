@@ -19,6 +19,9 @@ import unittest
 ROOT = pathlib.Path(__file__).parents[1]
 FACTORY = "58 64 70 76 82 88 0 25 35 44 58 70 75 52 58 64 70 76 82 0 25 35 44 58 70 75"
 DEFAULT = "50 60 70 76 82 88 20 30 40 50 60 80 110 38 40 42 44 55 70 20 30 40 60 70 100 120"
+# Coretemp package (millidegrees), EC CPU and EC GPU readings for one sample.
+COOL = ("52000", "50", "40")
+HOT = ("90000", "88", "72")
 
 # Every privileged command is replaced, every deployment/sysfs path is
 # relocated beneath TemporaryDirectory, and PATH holds only the mocks and an
@@ -162,6 +165,27 @@ elif command == "install":
         destination.chmod(mode)
 ''').lstrip("\\\n")
 
+# The cool-down gate's one-second wait. It records the call and advances the
+# scripted sensor readings to the next sample instead of waiting; bash keeps
+# each of the many samples cheap.
+SLEEP_SHIM = textwrap.dedent(r'''\
+#!/usr/bin/env bash
+set -euo pipefail
+[[ $# -eq 1 && $1 == 1 ]] || exit 2
+root=$UPGRADE_TEST_ROOT
+printf '%s\n' '["sleep", "1"]' >> "$root/calls.jsonl"
+slept=1
+[[ ! -f $root/slept ]] || slept=$(($(<"$root/slept") + 1))
+printf '%s\n' "$slept" > "$root/slept"
+mapfile -t samples <<< "${UPGRADE_TEST_TEMPERATURES-}"
+if ((slept < ${#samples[@]})); then
+    read -r package cpu gpu <<< "${samples[slept]}"
+    printf '%s\n' "$package" > "$root/sys/class/hwmon/hwmon8/temp1_input"
+    printf '%s\n' "$cpu" > "$root/sys/devices/platform/msi-ec/cpu/realtime_temperature"
+    printf '%s\n' "$gpu" > "$root/sys/devices/platform/msi-ec/gpu/realtime_temperature"
+fi
+''').lstrip("\\\n")
+
 
 # Real tools the upgrade and its release-check helper may use. Any other bare
 # command, including a future privileged one, is not found inside the sandbox.
@@ -178,7 +202,15 @@ LATCH_PAYLOAD = "candidate14\n"
 
 class UpgradeSandboxTestCase(unittest.TestCase):
     def run_upgrade(self, failure, *, sudo=("4242", "4343"), unreadable=False,
-                    latch_mode=None, initial=None, marker=False):
+                    latch_mode=None, initial=None, marker=False, temperatures=(COOL,),
+                    hwmon=None, cool_timeout=None):
+        """Run the sandboxed upgrade.
+
+        temperatures holds one (package, EC CPU, EC GPU) sample per cool-down
+        gate sample; the first is written here verbatim (None leaves the file
+        missing), each later one by the sleep shim, and the last one persists.
+        hwmon maps hwmon directory names to their reported name.
+        """
         with tempfile.TemporaryDirectory() as temporary:
             sandbox = pathlib.Path(temporary)
             release = sandbox / "release"
@@ -188,6 +220,19 @@ class UpgradeSandboxTestCase(unittest.TestCase):
             (sandbox / "run").mkdir()
             base = sandbox / "sys/devices/platform/msi-ec"
             base.mkdir(parents=True)
+            # A hot non-coretemp hwmon must not stand in for the CPU package.
+            package, ec_cpu, ec_gpu = temperatures[0]
+            for directory, name in (hwmon or {"hwmon0": "acpitz", "hwmon8": "coretemp"}).items():
+                path = sandbox / "sys/class/hwmon" / directory
+                path.mkdir(parents=True)
+                (path / "name").write_text(name + "\n")
+                reading = package if name == "coretemp" else "99000"
+                if reading is not None:
+                    (path / "temp1_input").write_text(reading + "\n")
+            for relative, reading in (("cpu", ec_cpu), ("gpu", ec_gpu)):
+                (base / relative).mkdir()
+                if reading is not None:
+                    (base / relative / "realtime_temperature").write_text(reading + "\n")
             initial_state = {
                 "active": "active", "substate": "running", "keeper": "inactive",
                 "enabled": "enabled", "curve": DEFAULT, "mode": "advanced", "boost": "off",
@@ -216,7 +261,8 @@ class UpgradeSandboxTestCase(unittest.TestCase):
                 self.assertIn(ROOT_GUARD, script)
                 script = script.replace(ROOT_GUARD, ": # root check mocked")
                 if relocate:
-                    for prefix in ("/usr/local", "/etc", "/run", "/var/lib", "/sys/devices"):
+                    for prefix in ("/usr/local", "/etc", "/run", "/var/lib", "/sys/devices",
+                                   "/sys/class"):
                         script = script.replace(prefix, str(sandbox) + prefix)
                 body = "\n".join(line for line in script.splitlines()
                                  if not line.lstrip().startswith("#"))
@@ -259,6 +305,9 @@ class UpgradeSandboxTestCase(unittest.TestCase):
                 path = mock_bin / name
                 path.write_text(COMMAND_SHIM)
                 path.chmod(0o755)
+            path = mock_bin / "sleep"
+            path.write_text(SLEEP_SHIM)
+            path.chmod(0o755)
             allowed_bin = sandbox / "allowed-bin"
             allowed_bin.mkdir()
             for name in ALLOWED_TOOLS:
@@ -268,31 +317,46 @@ class UpgradeSandboxTestCase(unittest.TestCase):
             # verify-release.sh points PYTHONPYCACHEPREFIX at an empty cache,
             # which would make every Python shim recompile its imports.
             environment = {key: value for key, value in os.environ.items()
-                           if not key.startswith("SUDO_") and key != "PYTHONPYCACHEPREFIX"}
+                           if not key.startswith("SUDO_") and key not in (
+                               "PYTHONPYCACHEPREFIX", "MSI_FAN_UPGRADE_COOL_TIMEOUT")}
             if sudo:
                 environment.update(SUDO_USER="tester", SUDO_UID=sudo[0], SUDO_GID=sudo[1])
             if unreadable:
                 environment["UPGRADE_TEST_UNREADABLE"] = str(release)
+            if cool_timeout is not None:
+                environment["MSI_FAN_UPGRADE_COOL_TIMEOUT"] = cool_timeout
             environment.update(PATH=str(mock_bin) + os.pathsep + str(allowed_bin),
                                UPGRADE_TEST_ROOT=str(sandbox), UPGRADE_TEST_FAIL_AT=failure,
-                               UPGRADE_TEST_FACTORY=FACTORY, UPGRADE_TEST_DEFAULT=DEFAULT)
+                               UPGRADE_TEST_FACTORY=FACTORY, UPGRADE_TEST_DEFAULT=DEFAULT,
+                               # Line N is the sample after the Nth sleep.
+                               UPGRADE_TEST_TEMPERATURES="\n".join(
+                                   ["written above", *map(" ".join, temperatures[1:])]))
+            self.deployed_before = self.deployed_files(sandbox)
             result = subprocess.run(["bash", str(release / "scripts/upgrade-profile.sh")],
                                     env=environment, text=True, capture_output=True, timeout=30)
             state = json.loads(state_path.read_text())
             calls = [json.loads(line) for line in (sandbox / "calls.jsonl").read_text().splitlines()]
+            self.stages_remaining = list((sandbox / "run").glob("msi-fan-profile-upgrade.*"))
+            self.backup_created = (sandbox / "var/lib/msi-fan-profile").exists()
             verify = sandbox / "verify.json"
             self.verify = json.loads(verify.read_text()) if verify.exists() else None
             if self.verify is not None:
                 self.verify["in_place"] = self.verify["tree"] == str(release)
                 self.verify["tree_remaining"] = pathlib.Path(self.verify["tree"]).exists()
             self.latch_remaining = latch.exists()
-            self.deployed = {
-                str(path.relative_to(sandbox)): format(path.stat().st_mode & 0o777, "o")
-                for prefix in ("etc", "usr") for path in (sandbox / prefix).rglob("*")
-                if path.is_file()}
-            record = sandbox / "usr/local/share/doc/msi-fan-profile/INSTALL_RECORD"
+            self.deployed_after = self.deployed_files(sandbox)
+            self.deployed = {path: mode for path, (mode, _) in self.deployed_after.items()}
+            record =sandbox / "usr/local/share/doc/msi-fan-profile/INSTALL_RECORD"
             self.record = record.read_text() if record.exists() else ""
             return result, state, calls
+
+    @staticmethod
+    def deployed_files(sandbox):
+        return {
+            str(path.relative_to(sandbox)): (format(path.stat().st_mode & 0o777, "o"),
+                                             path.read_bytes())
+            for prefix in ("etc", "usr") for path in (sandbox / prefix).rglob("*")
+            if path.is_file()}
 
 
 class UpgradeCoolingPreservationTests(UpgradeSandboxTestCase):
@@ -396,6 +460,127 @@ class UpgradeCoolingPreservationTests(UpgradeSandboxTestCase):
         result, state, calls = self.run_upgrade("disable")
         self.assert_stopped_after_verified_factory(result, state, calls)
         self.assertEqual(calls.count(["systemctl", "disable", "msi-fan-profile.service"]), 2)
+
+
+class UpgradeCoolDownGateTests(UpgradeSandboxTestCase):
+    """The release checks heat the CPU; the installed manager's factory-auto then
+    refuses to release Cooler Boost at a CPU package or EC CPU temperature of
+    85 C or an EC GPU temperature of 70 C, and older managers also disable the
+    service. The upgrade hands over only after 10 consecutive cool samples."""
+
+    LIMITS = "CPU package 80 C, EC CPU 80 C and EC GPU 65 C"
+    LIVE = ("systemctl", "msi-fan-profile", "systemd-analyze", "systemd-tmpfiles")
+
+    def staged_only(self, calls):
+        installs = [call for call in calls if call[0] == "install"]
+        return bool(installs) and all("/run/msi-fan-profile-upgrade." in call[-1]
+                                      for call in installs)
+
+    def assert_gate_precedes_live_changes(self, calls, sleeps):
+        self.assertEqual(calls.count(["sleep", "1"]), sleeps)
+        first_sleep = calls.index(["sleep", "1"])
+        live = next(index for index, call in enumerate(calls) if call[0] in self.LIVE)
+        self.assertEqual(calls[live], ["systemctl", "daemon-reload"])
+        self.assertNotIn(["sleep", "1"], calls[live:])
+        # The release checks and artifact staging run before the gate.
+        self.assertIn("verify-release.sh", [call[0] for call in calls[:first_sleep]])
+        self.assertTrue(self.staged_only(calls[:live]))
+        self.assertEqual(calls[first_sleep:live], [["sleep", "1"]] * sleeps)
+
+    def assert_nothing_changed(self, result, state, calls):
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertFalse([call for call in calls if call[0] in self.LIVE])
+        self.assertTrue(self.staged_only(calls))
+        self.assertEqual(self.deployed_after, self.deployed_before)
+        self.assertEqual((state["curve"], state["mode"], state["boost"], state["enabled"],
+                          state["active"], state["keeper"]),
+                         (DEFAULT, "advanced", "off", "enabled", "active", "inactive"))
+        self.assertFalse(self.stages_remaining)
+        self.assertFalse(self.backup_created)
+        # No state changed, so the exit handler reports no stop or recovery.
+        self.assertNotIn("Upgrade stopped", result.stderr)
+        self.assertNotIn("apply-default", result.stderr)
+
+    def test_cool_machine_hands_over_after_the_confirmation_window_only(self):
+        # Just under each margin, and EC GPU 0 for a powered-off dGPU.
+        for sample in (("79999", "79", "64"), ("52000", "50", "0")):
+            with self.subTest(sample=sample):
+                result, state, calls = self.run_upgrade("", temperatures=(sample,))
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                # Ten consecutive samples take nine one-second waits, no more.
+                self.assert_gate_precedes_live_changes(calls, sleeps=9)
+                self.assertNotIn("Waiting", result.stdout)
+                self.assertNotIn("Cooled below", result.stdout)
+                self.assertLess(calls.index(["msi-fan-profile", "factory-auto"]),
+                                calls.index(["msi-fan-profile", "apply-default"]))
+                self.assertEqual((state["curve"], state["mode"], state["boost"]),
+                                 (DEFAULT, "advanced", "off"))
+
+    def test_hot_machine_waits_for_consecutive_cool_samples_then_hands_over(self):
+        # Each sensor holds the gate at its margin in turn, a reading at the
+        # margin restarts the count, and progress is reported every 30 s.
+        samples = ([("80000", "50", "40")] * 10 + [("52000", "80", "40")] * 10 +
+                   [("52000", "50", "68")] * 11 + [COOL] * 4 + [("52000", "50", "65")] +
+                   [COOL] * 10)
+        result, state, calls = self.run_upgrade("", temperatures=samples)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assert_gate_precedes_live_changes(calls, sleeps=len(samples) - 1)
+        self.assertIn(f"Waiting up to 600 s for the machine to cool below {self.LIMITS}, "
+                      "5 C under the installed manager's Cooler Boost release limits: "
+                      "CPU package 80.0 C, EC CPU 50.0 C, EC GPU 40.0 C", result.stdout)
+        self.assertIn("Still waiting for cool-down after 30 s (0 of 10 consecutive cool "
+                      "samples): CPU package 52.0 C, EC CPU 50.0 C, EC GPU 68.0 C",
+                      result.stdout)
+        self.assertEqual(result.stdout.count("Still waiting"), 1)
+        self.assertIn(f"Cooled below {self.LIMITS} after 45 s: CPU package 52.0 C, "
+                      "EC CPU 50.0 C, EC GPU 40.0 C", result.stdout)
+        self.assertEqual((state["curve"], state["mode"], state["boost"], state["enabled"]),
+                         (DEFAULT, "advanced", "off", "enabled"))
+
+    def test_machine_that_stays_hot_times_out_before_any_live_change(self):
+        result, state, calls = self.run_upgrade("", temperatures=(HOT,), cool_timeout="12")
+        self.assert_nothing_changed(result, state, calls)
+        self.assertEqual(calls.count(["sleep", "1"]), 12)
+        self.assertIn(f"did not cool below {self.LIMITS} within 12 s; stop heavy workloads "
+                      "and rerun.", result.stderr)
+        self.assertIn("Last readings: CPU package 90.0 C, EC CPU 88.0 C, EC GPU 72.0 C. "
+                      "No installed file, service or fan setting was changed.", result.stderr)
+        self.assertNotIn("invalid reading", result.stderr)
+
+    def test_implausible_or_missing_readings_never_count_as_cool(self):
+        two_coretemps = {"hwmon0": "acpitz", "hwmon8": "coretemp", "hwmon9": "coretemp"}
+        for reading, options in (
+                ("EC CPU invalid (255)", {"temperatures": (("52000", "255", "40"),)}),
+                ("EC CPU invalid (0)", {"temperatures": (("52000", "0", "40"),)}),
+                ("EC GPU invalid (-1)", {"temperatures": (("52000", "50", "-1"),)}),
+                ("EC GPU unreadable", {"temperatures": (("52000", "50", None),)}),
+                ("CPU package unreadable", {"temperatures": (("", "50", "40"),)}),
+                ("CPU package unreadable", {"hwmon": two_coretemps}),
+        ):
+            with self.subTest(reading=reading, options=options):
+                result, state, calls = self.run_upgrade("", cool_timeout="10", **options)
+                self.assert_nothing_changed(result, state, calls)
+                self.assertEqual(calls.count(["sleep", "1"]), 10)
+                self.assertIn("within 10 s; stop heavy workloads and rerun.", result.stderr)
+                self.assertIn("Last readings: ", result.stderr)
+                self.assertIn(reading, result.stderr.split("Last readings: ")[1])
+                self.assertIn("An unreadable or invalid reading never counts as cool",
+                              result.stderr)
+
+    def test_invalid_cool_down_timeout_is_rejected_before_any_change(self):
+        for value in ("", "0", "9", "86401", "-5", "010", "1.5", "60s", "abc"):
+            with self.subTest(value=value):
+                result, state, calls = self.run_upgrade("", cool_timeout=value)
+                self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                self.assertIn("MSI_FAN_UPGRADE_COOL_TIMEOUT must be a whole number of seconds "
+                              "from 10 to 86400", result.stderr)
+                # Rejected before the release checks; only the read-only manager
+                # ownership check precedes it.
+                self.assertEqual({call[0] for call in calls}, {"stat"})
+                self.assertIsNone(self.verify)
+                self.assertEqual(self.deployed_after, self.deployed_before)
+                self.assertEqual((state["curve"], state["mode"], state["boost"],
+                                  state["enabled"]), (DEFAULT, "advanced", "off", "enabled"))
 
 
 class UnprivilegedReleaseCheckTests(UpgradeSandboxTestCase):

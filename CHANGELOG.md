@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+- Make `upgrade-profile.sh` wait for a cool margin before it changes anything
+  on the running system. Its release checks heat the CPU, and the installed
+  manager's `factory-auto` refuses to release Cooler Boost at a CPU package or
+  EC CPU temperature of 85 °C or an EC GPU temperature of 70 °C; managers before
+  this release then also disable the service, and a retry reran the checks, so
+  the upgrade could loop. After the release checks and staging, the upgrade now
+  reads the manager's own sensors until the CPU package and EC CPU are below
+  80 °C and the EC GPU below 65 °C for 10 consecutive one-second samples, never
+  counting an unreadable or invalid reading such as the EC's 255 as cool. It
+  prints the readings every 30 seconds, and after 600 seconds
+  (`MSI_FAN_UPGRADE_COOL_TIMEOUT`, 10 to 86400) exits `1` with nothing changed.
 - Document what a clean stop does while hot: the daemon exits `1` with
   `factory restored; Boost release unsafe`, and recovery returns the EC to
   Candidate 14/`advanced` with Cooler Boost on. Record the 2026-10-10/11 field

@@ -95,6 +95,23 @@ documentation as one release (adding the readiness check and kernel hook to
 older deployments), and reactivates only through the new guarded manager. Fresh installs and upgrades
 write an `INSTALL_RECORD` with the deployed artifact hashes under
 `/usr/local/share/doc/msi-fan-profile/`.
+
+The release checks heat the CPU, and the installed manager's `factory-auto`
+refuses to release Cooler Boost at a CPU package or EC CPU temperature of 85 °C
+or an EC GPU temperature of 70 °C (managers older than this release then also
+disable the service). After the release checks and staging, and before it
+changes anything on the running system, the upgrade therefore waits until the
+CPU package (coretemp) and EC CPU are below 80 °C and the EC GPU is below 65 °C
+(0, a powered-off dGPU, counts as cool) for 10 consecutive one-second samples.
+An unreadable or invalid reading, such as the EC's 255, never counts as cool.
+It prints the readings about every 30 seconds. After 600 seconds it exits `1`
+with `did not cool below ... within 600 s; stop heavy workloads and rerun`,
+having changed nothing. To wait longer, set a timeout from 10 to 86400 seconds:
+
+```bash
+sudo env MSI_FAN_UPGRADE_COOL_TIMEOUT=1200 ./scripts/upgrade-profile.sh
+```
+
 If the upgrade stops before activation after entering the safe state, it leaves
 the service disabled in factory auto mode. Once activation begins, a failed
 start or health check leaves runtime cooling, the recovery keeper, and boot
@@ -102,8 +119,9 @@ enablement untouched; it reports the error and retained backup location. It
 never replaces runtime recovery with factory mode merely because activation or
 status verification failed. Inspect both units before deciding on another action.
 
-If the existing manager cannot complete `factory-auto`, for example because the
-machine is too hot to release Cooler Boost, the upgrade stops before replacing
+If the existing manager cannot complete `factory-auto`, for example because a
+load heated the machine again after the cool-down wait and it is too hot to
+release Cooler Boost, the upgrade stops before replacing
 any artifact, and the script itself changes no boot enablement. Let the machine
 cool and rerun the upgrade. If a cool retry still fails, or to resume the
 installed profile now, run `sudo msi-fan-profile apply-default` and rerun the

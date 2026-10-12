@@ -2,7 +2,7 @@
 0072eedaed218fa9252de44c7d6bc73adf395b90e437f41b1ded9eee30bbbbce  ./.github/ISSUE_TEMPLATE/compatibility.yml
 497151dc12ad9b0a5527a38ecf8703c9e9ce8c2d6c8af3b33809b294c230a1b6  ./.github/workflows/checks.yml
 47f5d2d77b0f5f1615c97d66c027f581c55d8388810c38d566cf14c3cd304bf4  ./.gitignore
-74189890383e4f1d82f7fd0354c05b3143a614df1935079a04e504f1626cf8ce  ./CHANGELOG.md
+1216d8b31f9556479731c7061983723dc3f9ec8ea25968fdfaf26c9a3e2d9aae  ./CHANGELOG.md
 6633d875a37172286ab88eb20e611e3d222abc2607b5fe4d170604dd64a269d0  ./CONTRIBUTING.md
 e81c85b024709a55bdbe56407c8160fde57303aabd3cf2b389cf44529f32807a  ./LICENSE.md
 8177f97513213526df2cf6184d8ff986c675afb514d4e68a404010521b880643  ./LICENSES/GPL-2.0-or-later.txt
@@ -18,8 +18,8 @@ a6fbc5a09dd178d04b8387321a9f02107620508352071c116b03b2500dfef6b9  ./docs/ARCHITE
 c1a904a20647e4bafe734e5dac3616ed2e739b11c370fa3b68215f4e7f767adc  ./docs/DEVELOPMENT_HISTORY.md
 1de84c5ca055cc848cc43e6fa96da901f72544fb097a0bd1373a40d23f7a07c7  ./docs/DRIVER_INSTALL.md
 1e7a3a303ea03f6a4f892d35aac640ead0cf4cbf764cbaa4e716faa039bfd9fa  ./docs/EXAMPLE_OUTPUT.md
-5176005bbba844a239313926a86fa614b0b072e38083127ba3a282e52c5c2e28  ./docs/INSTALL.md
-481709fed00a7a8caae8e2cd4ac31d94ba69cca288d36655570060f477fbd110  ./docs/OPERATIONS.md
+6f34919e6dda0c781b3781f4f75495867473843ee35d6a63aa2a8c869c07e85e  ./docs/INSTALL.md
+5e52784753e695122a033e9717bcf2e95dd427d9401cfd0f0c919e35c72428cb  ./docs/OPERATIONS.md
 4815c16e5e409c029aa7dd00efd80040960ea689cf4e782e41295f367efbd9aa  ./docs/PROFILE.md
 a8ef9d450e5a384446fe2e0fc5c4b03515a026bff34de3d02f58ac096e1353e2  ./docs/ROLLBACK.md
 1bbdac983ac5b4d6cf8529b7cf0890b12651528fd61b6f6e574da66ac5416f93  ./docs/SAFETY.md
@@ -32,7 +32,7 @@ d3858dfc3ed367dbbefd03f11e483019a47fd25335f44bfb8103de335efa75f8  ./kernel/posti
 9679456d8d3c909ee4c9ccf3d525fa25f651ad260a9230d2af9666acab98227b  ./scripts/preflight.sh
 e96e13bcd881524f13eb7b1eb42e2e34a79a1e2044e1183f20148f924902fe5d  ./scripts/select-ci-kernel.sh
 f624b4666af07d8fc823b70f9e0dd74d3bbabdf1e8b334adbda79ec24d28631b  ./scripts/uninstall-profile.sh
-3577b2bb979e8ecc431205e6330520b95158d3bc59b138c5a19c5aff4fa2ef0b  ./scripts/upgrade-profile.sh
+39287f8d14126c8af4dbbd7b78fd6b499b14ab0d17b6293853c05942fb3dc6e5  ./scripts/upgrade-profile.sh
 9c14b1ffc81e563d325e0ff7018c9979dcbb5d4ee3cbf673f4ffd24d648e87db  ./scripts/verify-driver-build.sh
 588ead13d0dff48351e048b1d5ff06f6ec9de099c466602b0355b6c12f2db171  ./scripts/verify-release-unprivileged.sh
 5b6baff140f28515892722b05cc03057a4bb7464a3e4bce08fe5c40d5bed6916  ./scripts/verify-release.sh
@@ -51,5 +51,5 @@ c6c0d00c5fbaecd14fb1a915ce931f1eafb53e8de71c25f4330421c8acf737f2  ./tests/test_m
 ca616f87a9c75f0405310b4183de1fb16fa9c162000dfbceb9020dedb97be401  ./tests/test_msi_gpu_recover.py
 c0efa440c9874000dd711552b1f01b44813290692cdc14fdeee89fce2bc81772  ./tests/test_systemd_integration.py
 eacd7eb61389a97ae1dc9d74eb8bdf8146731d747c0662e52ebd2b0d9759fdc9  ./tests/test_systemd_units.py
-a0e4564c17e1f3477ed7a101bef578d21a78084907e0e78fa6a24648fa3011b0  ./tests/test_upgrade_profile.py
+e48b332fb569f64a8567d9fa827419ac207abd4abf5860db2bf6261d848e30a3  ./tests/test_upgrade_profile.py
 b14550d3f3fca40d71e480555629b1692f4a7af764a6182a593e0d809ce0638e  ./tmpfiles/msi-fan-profile.conf

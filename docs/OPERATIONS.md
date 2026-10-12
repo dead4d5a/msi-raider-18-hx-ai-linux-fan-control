@@ -293,7 +293,11 @@ keeper keeps cooling:
    inactive, no recovery latch, and `cooler_boost` `off`.
 5. If the installed release leaks, install a fixed one in a cool window with the
    guarded `sudo ./scripts/upgrade-profile.sh` (see `docs/INSTALL.md` in the
-   source checkout). Afterwards,
+   source checkout). After its release checks, which heat the CPU, it waits
+   until the CPU package and EC CPU are below 80 °C and the EC GPU below 65 °C
+   for 10 seconds before it touches the controller; if that takes longer than
+   600 seconds (`MSI_FAN_UPGRADE_COOL_TIMEOUT`), it exits with nothing changed.
+   Stop heavy workloads and rerun it. Afterwards,
    check `controller_memory.memory_peak_bytes` over several days; it should
    stay far below 64 MiB.
 
