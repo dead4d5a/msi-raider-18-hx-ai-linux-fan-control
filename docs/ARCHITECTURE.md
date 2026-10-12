@@ -62,7 +62,12 @@ script. It takes the CPU package and EC CPU/GPU temperatures through the
 caller's own reader, every 0.5 s, and confirms only six consecutive valid, cool
 samples within 10 s; an invalid, unreadable or hot sample restarts the count.
 It writes nothing. Callers pass a heartbeat (the daemon feeds its watchdog with
-every sample) and a hook that reasserts Boost at once on an unsafe sample.
+every sample) and a hook that reasserts Boost at once on an unsafe sample. The
+daemon passes a shorter window when little of `TimeoutStopSec=30s` remains, as
+after a stop signal during startup, so the confirmation ends at least 5 s
+before systemd's `SIGKILL`, or is refused when not even one window fits. The
+uninstall script checks the exact identity again after the window, before its
+next EC write.
 
 Snapshot acquisition and the remaining telemetry share one two-second freshness
 envelope; resume and reapplication invalidate and reacquire EC temperatures.

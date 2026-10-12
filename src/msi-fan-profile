@@ -309,13 +309,18 @@ def restore_factory_locked(release=True):
     if not confirmation.cool:
         print(f'Cooler Boost release not confirmed: {confirmation.reason}', file=sys.stderr)
         unsafe = confirmation.unsafe
-        if unsafe is not None and unsafe.state == 'hot':
+        if unsafe is None:
+            # Every sample was valid and cool, but they came too slowly to fill
+            # the window; that is neither heat nor unusable telemetry.
+            raise FactoryReleaseRefused(
+                'factory restored but cool confirmation did not complete: '
+                f'{confirmation.reason}; Boost retained')
+        if unsafe.state == 'hot':
             raise FactoryReleaseRefused('factory restored but too hot to release Boost')
-        if unsafe is not None and unsafe.state == 'invalid':
+        if unsafe.state == 'invalid':
             raise FactoryReleaseRefused(
                 'factory restored but telemetry is invalid; Boost retained')
-        detail = (unsafe.detail.removeprefix('telemetry unavailable: ') if unsafe
-                  else confirmation.reason)
+        detail = unsafe.detail.removeprefix('telemetry unavailable: ')
         raise FactoryReleaseRefused(
             f'factory restored but telemetry is unavailable: {detail}; Boost retained')
     write(BASE / 'fan_mode', 'auto')

@@ -152,9 +152,15 @@ recovery-Boost marker, replaces and records the artifacts, and activates
 through the new manager. The new daemon consumes the marker once it has
 reapplied Candidate 14 and keeps Boost on as its automatic latch until
 telemetry has been valid and cool for 30 continuous seconds, so `status` shows
-`cooler_boost` `on` and health `cooling` until then. If a later step fails
-before activation, the exit message says that Cooler Boost was left on and the
-recovery-Boost marker was kept, and the service stays disabled.
+`cooler_boost` `on` and health `cooling` until then. After the disable the
+upgrade checks again, before replacing anything, that Boost is still on, the
+keeper is inactive and the recovery-Boost marker is still valid. If that or a
+later step fails before activation, the service stays disabled, and the exit
+message reports what it then reads, for example
+`This script did not change Cooler Boost or the recovery Boost latch: cooler_boost is on and /run/msi-fan-profile.recovery-boost is present.`
+The marker is `present`, `present but not valid` or `missing`, and
+`cooler_boost` shows the EC's value, such as `off` after a Cooler Boost key
+press during the upgrade.
 
 In every other case the upgrade stops before replacing any artifact, with the
 manager's exit status, and the script itself changes no boot enablement. That

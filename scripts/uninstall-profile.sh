@@ -44,22 +44,28 @@ systemctl reset-failed msi-fan-profile.service 2>/dev/null || true
 exec 8</run/msi-fanctl.lock
 flock -x 8
 
-# Exact identity gate. Do not write a model-specific curve on any mismatch.
-[[ $(cat /sys/class/dmi/id/product_name) == 'Raider 18 HX AI A2XWIG' ]]
-[[ $(cat /sys/class/dmi/id/board_name) == 'MS-1824' ]]
-[[ $(cat /sys/class/dmi/id/bios_version) == 'E1824IMS.310' ]]
-[[ $(cat /sys/module/msi_ec/version) == '0.13.1' ]]
-module_source=$(cat /sys/module/msi_ec/srcversion)
-case "$module_source" in
-  AB0BFAE2391B5ADD66E01BD) ;;
-  9086C45007CBB7FA1264430) [[ -r $base/fan_control_snapshot ]] ;;
-  *) echo 'Refusing uninstall recovery on an unsupported driver build.' >&2; exit 1 ;;
-esac
-[[ $(cat "$base/fw_version") == '1824EMS1.108' ]]
-if [[ -e /sys/module/ec_sys ]]; then
-  echo 'Refusing uninstall recovery while ec_sys is loaded.' >&2
-  exit 1
-fi
+# Exact identity gate. Do not write a model-specific value on any mismatch.
+# Callers test the status: set -e does not apply inside a function that is
+# called as a condition, so every check returns explicitly.
+exact_identity() {
+  local module_source
+  [[ $(cat /sys/class/dmi/id/product_name) == 'Raider 18 HX AI A2XWIG' ]] || return 1
+  [[ $(cat /sys/class/dmi/id/board_name) == 'MS-1824' ]] || return 1
+  [[ $(cat /sys/class/dmi/id/bios_version) == 'E1824IMS.310' ]] || return 1
+  [[ $(cat /sys/module/msi_ec/version) == '0.13.1' ]] || return 1
+  module_source=$(cat /sys/module/msi_ec/srcversion) || return 1
+  case "$module_source" in
+    AB0BFAE2391B5ADD66E01BD) ;;
+    9086C45007CBB7FA1264430) [[ -r $base/fan_control_snapshot ]] || return 1 ;;
+    *) echo 'Refusing uninstall recovery on an unsupported driver build.' >&2; return 1 ;;
+  esac
+  [[ $(cat "$base/fw_version") == '1824EMS1.108' ]] || return 1
+  if [[ -e /sys/module/ec_sys ]]; then
+    echo 'Refusing uninstall recovery while ec_sys is loaded.' >&2
+    return 1
+  fi
+}
+exact_identity || exit 1
 
 # Restore complete factory envelope. Keep Boost on until cool verification.
 printf 'on\n' > "$base/cooler_boost"
@@ -73,11 +79,20 @@ printf 'on\n' > "$base/cooler_boost"
 # One reading never releases Boost. The shared, read-only helper requires
 # consecutive valid, cool samples, exactly as the controllers do; an empty,
 # junk or hot reading restarts the count, and it gives up within 10 seconds.
+# The identity gate above ran up to 10 seconds earlier by then, so check it
+# again before the next EC write; a changed driver also supplied the readings.
 if ! /usr/bin/python3 -I -B "$repo/src/msi_fan_control.py" confirm-cool \
     /sys/class/hwmon "$base"; then
-  printf 'on\n' > "$base/cooler_boost" 2>/dev/null || true
+  if exact_identity; then
+    printf 'on\n' > "$base/cooler_boost" 2>/dev/null || true
+  fi
   echo 'Factory restored, but machine is too hot to release Cooler Boost, or its temperature telemetry is invalid.' >&2
   echo 'Files were not removed. Cool down and retry.' >&2
+  exit 1
+fi
+if ! exact_identity; then
+  echo 'The exact platform or driver identity changed during the cool confirmation; nothing was written after it, so Cooler Boost was not released.' >&2
+  echo 'Files were not removed. Check msi_ec and ec_sys, then retry.' >&2
   exit 1
 fi
 printf 'off\n' > "$base/cooler_boost"

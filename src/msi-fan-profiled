@@ -41,6 +41,9 @@ DEFAULT = (
     "38 40 42 44 55 70 20 30 40 60 70 100 120"
 )
 STOP = False
+# When the first stop signal arrived. SIGTERM arms systemd's stop timer, which
+# keeps running while the daemon finishes a startup still in progress.
+STOP_REQUESTED_AT: float | None = None
 BOOST_REQUEST = False
 RELEASE_REQUEST = False
 SUSTAINED_ALARM_SECONDS = 15.0
@@ -54,6 +57,11 @@ POLL_INTERVAL_SECONDS = 1.0
 # udev coldplug registers coretemp and msi_wmi_platform; TimeoutStartSec is 30s.
 HWMON_STARTUP_WAIT_SECONDS = 10.0
 HWMON_STARTUP_POLL_SECONDS = 0.5
+# TimeoutStopSec in msi-fan-profile.service; systemd sends SIGKILL after it. A
+# clean stop leaves the release writes, the notification and the exit at least
+# this margin of it after the cool confirmation.
+STOP_TIMEOUT_SECONDS = 30.0
+STOP_EXIT_MARGIN_SECONDS = 5.0
 
 
 class ProfileError(RuntimeError):
@@ -339,6 +347,23 @@ def reassert_boost(_reading: fan_control.CoolReading | None = None) -> None:
         write(BASE / "cooler_boost", "on")
 
 
+def cool_confirmation_budget(now: float) -> float:
+    """Seconds the clean stop's cool confirmation may take.
+
+    A stop signal arms TimeoutStopSec. A stop that arrives during startup
+    first waits for the hwmon registration (up to 10 s) and the Boost
+    verification (up to 12 s), so the confirmation gets only what remains of
+    the stop timeout after STOP_EXIT_MARGIN_SECONDS, never more than its own
+    10 s. A stop that the factory-auto marker starts before any signal has the
+    full window: the stop timer is not running yet.
+    """
+    window = fan_control.COOL_CONFIRM_TIMEOUT_SECONDS
+    if STOP_REQUESTED_AT is None:
+        return window
+    return min(window, STOP_TIMEOUT_SECONDS - STOP_EXIT_MARGIN_SECONDS -
+               (now - STOP_REQUESTED_AT))
+
+
 def release_factory_if_cool(core: pathlib.Path,
                             heartbeat: Callable[[str], None]) -> bool:
     """Leave the restored factory envelope at auto/off only once confirmed cool.
@@ -346,12 +371,24 @@ def release_factory_if_cool(core: pathlib.Path,
     One reading never decides: the shared confirmation needs consecutive valid,
     cool samples, heartbeats the watchdog with each one, and reasserts Boost at
     once on an unsafe sample. Boost stays on unless coolness is confirmed.
+    When too little of the stop timeout remains for the shortest confirmation,
+    the release is refused without sampling: the daemon then exits 1 into
+    full-cooling recovery instead of being killed by systemd.
     """
+    budget = cool_confirmation_budget(time.monotonic())
+    shortest = ((fan_control.COOL_CONFIRM_SAMPLES - 1) *
+                fan_control.COOL_CONFIRM_INTERVAL_SECONDS)
+    if budget < shortest:
+        print("WARNING Cooler Boost release refused: "
+              f"{max(budget, 0.0):.1f} s of the {STOP_TIMEOUT_SECONDS:.0f} s stop timeout "
+              f"remain for the cool confirmation, which needs {shortest:g} s",
+              file=sys.stderr, flush=True)
+        return False
     try:
         confirmation = fan_control.confirm_cool(
             fan_control.cool_sampler(read, core, BASE),
             heartbeat=lambda progress: heartbeat(f"Factory auto restored; {progress}"),
-            on_unsafe=reassert_boost)
+            on_unsafe=reassert_boost, timeout=budget)
         if not confirmation.cool:
             print(f"WARNING Cooler Boost release refused: {confirmation.reason}",
                   file=sys.stderr, flush=True)
@@ -711,7 +748,9 @@ def consume_recovery_latch() -> bool:
 
 
 def on_stop(_number: int, _frame: object) -> None:
-    global STOP
+    global STOP, STOP_REQUESTED_AT
+    if STOP_REQUESTED_AT is None:
+        STOP_REQUESTED_AT = time.monotonic()
     STOP = True
 
 

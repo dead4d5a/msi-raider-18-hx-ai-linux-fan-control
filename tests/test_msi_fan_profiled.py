@@ -1509,8 +1509,10 @@ class CleanStopReleaseTests(HardwareFreeMainLoopTests):
     COOL = ("59000", "60", "44")
     HOT = ("90000", "60", "44")
 
-    def release(self, readings, *, boost_off_at=None, heartbeat=None):
-        clock = {"now": 0.0}
+    def release(self, readings, *, boost_off_at=None, heartbeat=None, start=0.0,
+                stop_requested_at=None):
+        """Release at clock time start; stop_requested_at is when SIGTERM arrived."""
+        clock = {"now": start}
         state = {"fan_mode": "auto", "fan_curve": DAEMON.FACTORY, "cooler_boost": "on"}
         self.writes = []
         self.samples = []
@@ -1538,6 +1540,7 @@ class CleanStopReleaseTests(HardwareFreeMainLoopTests):
                 state["cooler_boost"] = "off"  # A keyboard toggle during the wait.
 
         with mock.patch.object(DAEMON, "BASE", pathlib.Path("/fake/ec")), \
+                mock.patch.object(DAEMON, "STOP_REQUESTED_AT", stop_requested_at), \
                 mock.patch.object(DAEMON, "read", side_effect=fake_read), \
                 mock.patch.object(DAEMON, "write", side_effect=fake_write), \
                 mock.patch.object(DAEMON.time, "monotonic", side_effect=lambda: clock["now"]), \
@@ -1546,6 +1549,7 @@ class CleanStopReleaseTests(HardwareFreeMainLoopTests):
             result = DAEMON.release_factory_if_cool(
                 pathlib.Path("/fake/core"), heartbeat or self.beats.append)
         self.stderr = stderr.getvalue()
+        self.finished = clock["now"]
         return result, state
 
     def test_spike_at_the_first_sample_still_releases_once_cool(self):
@@ -1587,6 +1591,72 @@ class CleanStopReleaseTests(HardwareFreeMainLoopTests):
         self.assertFalse(released)
         self.assertEqual(self.writes, [(0.0, "cooler_boost", "on")])
         self.assertEqual(state["cooler_boost"], "on")
+
+    def test_stop_timeout_constants_match_the_unit(self):
+        unit = (pathlib.Path(__file__).parents[1] / "systemd/msi-fan-profile.service").read_text()
+        self.assertIn(f"\nTimeoutStopSec={DAEMON.STOP_TIMEOUT_SECONDS:.0f}s\n", unit)
+        self.assertEqual(DAEMON.STOP_EXIT_MARGIN_SECONDS, 5.0)
+
+    def test_stop_signal_records_when_the_stop_timer_started(self):
+        original = DAEMON.STOP, DAEMON.STOP_REQUESTED_AT
+        try:
+            DAEMON.STOP, DAEMON.STOP_REQUESTED_AT = False, None
+            with mock.patch.object(DAEMON.time, "monotonic", side_effect=[4.0, 9.0]):
+                DAEMON.on_stop(DAEMON.signal.SIGTERM, None)
+                # A later signal, such as a second stop request, keeps the first time.
+                DAEMON.on_stop(DAEMON.signal.SIGINT, None)
+            self.assertEqual((DAEMON.STOP, DAEMON.STOP_REQUESTED_AT), (True, 4.0))
+        finally:
+            DAEMON.STOP, DAEMON.STOP_REQUESTED_AT = original
+
+    def test_a_stop_without_a_signal_or_early_in_the_timeout_gets_the_full_window(self):
+        # The factory-auto marker starts the stop before SIGTERM arms the timer.
+        for stop_requested_at in (None, 0.0):
+            with self.subTest(stop_requested_at=stop_requested_at):
+                released, _ = self.release([self.HOT, self.COOL], start=1.5,
+                                           stop_requested_at=stop_requested_at)
+                self.assertTrue(released)
+                self.assertEqual(self.finished, 4.5)
+                released, _ = self.release([self.HOT], start=1.5,
+                                           stop_requested_at=stop_requested_at)
+                self.assertFalse(released)
+                self.assertEqual(self.samples[-1], 1.5 + 7.5)
+
+    def test_a_stop_during_startup_never_confirms_past_the_stop_timeout(self):
+        # SIGTERM at 0 s during startup; the hwmon wait (10 s) and the Boost
+        # verification (12 s) then ran before the loop exit and the restore.
+        # Only 3 s of the 30 s timeout remain before the 5 s exit margin.
+        released, state = self.release([self.HOT], start=22.0, stop_requested_at=0.0)
+        self.assertFalse(released)
+        self.assertEqual(self.samples, [22.0, 22.5])
+        self.assertLessEqual(self.finished, 25.0)
+        self.assertEqual(state["cooler_boost"], "on")
+        # A cool streak that can still finish by 25 s releases; a later one,
+        # which the full window would wait for, can no longer run past the margin.
+        released, _ = self.release([self.HOT, self.COOL], start=22.0, stop_requested_at=0.0)
+        self.assertTrue(released)
+        self.assertEqual(self.finished, 25.0)
+        released, state = self.release([self.HOT, self.HOT, self.COOL], start=22.0,
+                                       stop_requested_at=0.0)
+        self.assertFalse(released)
+        self.assertEqual(self.samples, [22.0, 22.5])
+        self.assertEqual(state["cooler_boost"], "on")
+        # A machine that is cool from the first sample still releases in time.
+        released, state = self.release([self.COOL], start=22.0, stop_requested_at=0.0)
+        self.assertTrue(released)
+        self.assertEqual(self.finished, 24.5)
+        self.assertEqual(state["cooler_boost"], "off")
+
+    def test_too_little_stop_timeout_for_one_window_refuses_without_sampling(self):
+        for start in (22.6, 25.0, 40.0):
+            with self.subTest(start=start):
+                released, state = self.release([self.COOL], start=start, stop_requested_at=0.0)
+                self.assertFalse(released)
+                self.assertEqual((self.samples, self.writes, self.beats), ([], [], []))
+                self.assertEqual(state["cooler_boost"], "on")
+                self.assertIn("WARNING Cooler Boost release refused: ", self.stderr)
+                self.assertIn(" s of the 30 s stop timeout remain for the cool confirmation, "
+                              "which needs 2.5 s", self.stderr)
 
 
 class StartupGuardMainTests(HardwareFreeMainLoopTests):

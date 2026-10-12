@@ -1260,8 +1260,11 @@ class FactoryAutoStateMachineTests(HardwareIsolatedTestCase):
 
 
 class FactoryReleasePlausibilityTests(HardwareIsolatedTestCase):
-    def release(self, readings, readings_error=None):
-        """Run the release with telemetry replayed per sample (the last repeats)."""
+    def release(self, readings, readings_error=None, read_seconds=0.0):
+        """Run the release with telemetry replayed per sample (the last repeats).
+
+        read_seconds is how long each sample's package read takes.
+        """
         core = pathlib.Path('/fake/hwmon3')
         clock = {'now': 0.0}
         samples = []
@@ -1272,6 +1275,7 @@ class FactoryReleasePlausibilityTests(HardwareIsolatedTestCase):
                 return 'coretemp'
             if path == core / 'temp1_input':
                 samples.append(clock['now'])
+                clock['now'] += read_seconds
                 if readings_error is not None:
                     raise readings_error
             current = readings[min(len(samples), len(readings)) - 1]
@@ -1334,6 +1338,21 @@ class FactoryReleasePlausibilityTests(HardwareIsolatedTestCase):
                 r'telemetry is unavailable: \[Errno 5\] I/O error; Boost retained$'):
             self.release([('50000', '50', '40')], readings_error=OSError(5, 'I/O error'))
         self.assertEqual(len(self.samples), 16)
+
+    def test_valid_cool_samples_that_arrive_too_slowly_are_not_called_unavailable(self):
+        # Five 2.1 s reads cannot fill the window, so the release is refused,
+        # but the readable, cool telemetry is not reported as unavailable.
+        with self.assertRaisesRegex(
+                MANAGER.FactoryReleaseRefused,
+                r'^factory restored but cool confirmation did not complete: no 6 consecutive '
+                r'valid cool samples 0\.5 s apart within 10 s \(5 samples in 10\.5 s\); '
+                r'samples too slow; last: CPU package 50\.0 C, EC CPU 50 C, EC GPU 40 C; '
+                r'Boost retained$') as refused:
+            self.release([('50000', '50', '40')], read_seconds=2.1)
+        self.assertNotIn('unavailable', str(refused.exception))
+        self.assertNotIn('too hot', str(refused.exception))
+        self.assertEqual(len(self.samples), 5)
+        self.assertNotIn(mock.call(MANAGER.BASE / 'cooler_boost', 'off'), self.writes)
 
 
 class HostIsolationTests(HardwareIsolatedTestCase):

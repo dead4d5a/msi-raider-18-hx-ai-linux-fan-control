@@ -217,7 +217,11 @@ above 85 °C, or EC GPU at or above 70 °C) or the temperature telemetry stays
 invalid or unavailable, `factory-auto` exits `1` with
 `factory staged with Boost on; ... rerun factory-auto when cool`. The line
 before it, `Cooler Boost release not confirmed: ...`, names the most recent
-unsafe sample. The verified factory curve and auto mode are in place with
+unsafe sample. If every sample was valid and cool but they arrived too slowly
+to fill the window, it says `samples too slow`, and the error reads
+`factory restored but cool confirmation did not complete: ...` instead of
+`too hot` or `telemetry is unavailable`; check the EC's response time rather
+than the sensors. The verified factory curve and auto mode are in place with
 Cooler Boost on. The marker, boot enablement, and any recovery-Boost marker are
 left as they were, so `status` exits `1` until the transition completes. Rerun `factory-auto` once the
 machine is cool, or run `apply-default` to resume Candidate 14; a retained
@@ -247,7 +251,12 @@ machine heats up again after the daemon released Boost, `ExecStopPost` switches
 Boost back on at its first unsafe sample and, without a new confirmed window,
 logs `Boost release refused: ...` and
 `successful service ended factory auto/off while too hot; Boost re-enabled`;
-the unit then fails like a hot stop. This is
+the unit then fails like a hot stop. A stop that arrives while the daemon is
+still starting (waiting for the hwmon devices or verifying Boost) gives the
+confirmation only what remains of the 30 s stop timeout less 5 s. With less
+than 2.5 s left the journal shows
+`WARNING Cooler Boost release refused: N s of the 30 s stop timeout remain for the cool confirmation, which needs 2.5 s`,
+and the stop ends the same way as a hot one instead of in a `SIGKILL`. This is
 intended. While the system keeps running, the unit is failed, the keeper holds
 full cooling, and `status` exits `1`; run `sudo msi-fan-profile apply-default`
 once the machine is cool. At shutdown the keeper cannot start, and systemd logs

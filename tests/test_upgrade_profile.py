@@ -96,6 +96,7 @@ elif command == "msi-fan-profile":
             # factory auto with Boost on. Tests vary what it left behind.
             left = json.loads(refusal)
             state.update({key: left[key] for key in ("enabled", "active", "substate", "keeper")})
+            marker.chmod(int(left["marker_mode"], 8))
             if not left["marker"]:
                 marker.unlink()
             latch = root / "run/msi-fan-profile.recovery-boost"
@@ -152,6 +153,21 @@ elif command == "systemctl":
     if action in ("enable", "disable"):
         state["enabled"] = "enabled" if action == "enable" else "disabled"
         save()
+        change = os.environ.get("UPGRADE_TEST_AT_DISABLE")
+        if action == "disable" and change and not state.get("changed_at_disable"):
+            # Something outside the upgrade changes the full-cooling state after
+            # it was verified and before the post-disable checks, once.
+            state["changed_at_disable"] = True
+            latch = root / "run/msi-fan-profile.recovery-boost"
+            if change == "boost-off":  # The operator presses the Cooler Boost key.
+                cooling(state["curve"], state["mode"], "off")
+            elif change == "latch-unlinked":
+                latch.unlink()
+            elif change == "latch-payload":
+                latch.write_text("candidate13\n")
+            elif change == "keeper-active":
+                state["keeper"] = "active"
+            save()
     elif action == "is-enabled":
         print(state["enabled"])
     elif action == "stop":
@@ -259,14 +275,15 @@ LATCH_PAYLOAD = "candidate14\n"
 # clean stop. Tests override single entries.
 OLD_REFUSAL = {"curve": FACTORY, "mode": "auto", "boost": "on", "enabled": "disabled",
                "active": "inactive", "substate": "dead", "keeper": "inactive",
-               "marker": True, "latch": LATCH_PAYLOAD, "latch_mode": "600", "latch_kind": "file"}
+               "marker": True, "marker_mode": "600", "latch": LATCH_PAYLOAD, "latch_mode": "600",
+               "latch_kind": "file"}
 
 
 class UpgradeSandboxTestCase(unittest.TestCase):
     def run_upgrade(self, failure, *, sudo=("4242", "4343"), unreadable=False,
                     latch_mode=None, initial=None, marker=False, temperatures=(COOL,),
                     hwmon=None, cool_timeout=None, edit_during_wait=None, refusal=None,
-                    not_root=None):
+                    not_root=None, at_disable=None):
         """Run the sandboxed upgrade.
 
         temperatures holds one (package, EC CPU, EC GPU) sample per cool-down
@@ -277,7 +294,9 @@ class UpgradeSandboxTestCase(unittest.TestCase):
         first cool-down wait appends to. refusal makes the installed manager's
         factory-auto fail like an earlier release's refused hot handover,
         leaving OLD_REFUSAL updated with it. not_root names a sandbox path that
-        stat reports as owned by a regular user.
+        stat reports as owned by a regular user. at_disable changes the state
+        once, at the first systemctl disable: boost-off, latch-unlinked,
+        latch-payload or keeper-active.
         """
         self.assertNotIn(None, [reading for sample in temperatures[1:] for reading in sample])
         with tempfile.TemporaryDirectory() as temporary:
@@ -386,7 +405,7 @@ class UpgradeSandboxTestCase(unittest.TestCase):
             # verify-release.sh points PYTHONPYCACHEPREFIX at an empty cache,
             # which would make every Python shim recompile its imports.
             environment = {key: value for key, value in os.environ.items()
-                           if not key.startswith("SUDO_") and key not in (
+                           if not key.startswith(("SUDO_", "UPGRADE_TEST_")) and key not in (
                                "PYTHONPYCACHEPREFIX", "MSI_FAN_UPGRADE_COOL_TIMEOUT")}
             if sudo:
                 environment.update(SUDO_USER="tester", SUDO_UID=sudo[0], SUDO_GID=sudo[1])
@@ -400,6 +419,8 @@ class UpgradeSandboxTestCase(unittest.TestCase):
                 environment["UPGRADE_TEST_REFUSAL"] = json.dumps({**OLD_REFUSAL, **refusal})
             if not_root is not None:
                 environment["UPGRADE_TEST_NOT_ROOT"] = str(sandbox / not_root)
+            if at_disable is not None:
+                environment["UPGRADE_TEST_AT_DISABLE"] = at_disable
             environment.update(PATH=str(mock_bin) + os.pathsep + str(allowed_bin),
                                UPGRADE_TEST_ROOT=str(sandbox), UPGRADE_TEST_FAIL_AT=failure,
                                UPGRADE_TEST_FACTORY=FACTORY, UPGRADE_TEST_DEFAULT=DEFAULT,
@@ -644,7 +665,7 @@ class UpgradeFullCoolingHandoverTests(UpgradeSandboxTestCase):
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
         self.assertRegex(result.stderr, reason)
         self.assertNotIn("continuing the upgrade at full cooling", result.stderr)
-        self.assertNotIn("Cooler Boost was left on", result.stderr)
+        self.assertNotIn("This script did not change Cooler Boost", result.stderr)
         self.assertIn("did not reach verified factory auto/off", result.stderr)
         self.assertIn("let the machine cool and rerun this upgrade", result.stderr)
         self.assertRegex(result.stderr, r"run 'sudo \S*/usr/local/sbin/msi-fan-profile "
@@ -700,7 +721,10 @@ class UpgradeFullCoolingHandoverTests(UpgradeSandboxTestCase):
                 ({"active": "failed", "substate": "failed"},
                  "msi-fan-profile.service is not inactive"),
                 ({"keeper": "active"}, "msi-fan-profile-keeper.service is not inactive"),
+                ({"active": "inactive", "substate": "failed"},
+                 "msi-fan-profile.service is not inactive"),
                 ({"marker": False}, "no root-owned, mode-0600 factory-auto marker"),
+                ({"marker_mode": "644"}, "no root-owned, mode-0600 factory-auto marker"),
         ):
             with self.subTest(left=left):
                 result, state, calls = self.run_upgrade("", refusal=left)
@@ -709,6 +733,15 @@ class UpgradeFullCoolingHandoverTests(UpgradeSandboxTestCase):
                     **left)
                 self.assertTrue(self.latch_remaining)
                 self.assertEqual(self.latch_after, LATCH_PAYLOAD)
+
+    def test_marker_that_is_not_root_owned_stops_as_before(self):
+        result, state, calls = self.run_upgrade(
+            "", refusal={}, not_root="run/msi-fan-profile.factory-auto")
+        self.assert_stopped_as_before(
+            result, state, calls,
+            r"Not continuing at full cooling: no root-owned, mode-0600 factory-auto marker \S*/"
+            r"run/msi-fan-profile\.factory-auto\.")
+        self.assertTrue(self.latch_remaining)
 
     def test_failed_platform_check_after_the_refusal_stops_with_nothing_replaced(self):
         result, state, calls = self.run_upgrade("identity", refusal={})
@@ -733,17 +766,21 @@ class UpgradeFullCoolingHandoverTests(UpgradeSandboxTestCase):
         self.assertEqual((state["curve"], state["mode"], state["boost"], state["enabled"]),
                          (DEFAULT, "advanced", "off", "enabled"))
 
-    def test_failure_after_continuing_says_boost_was_left_on_and_the_latch_kept(self):
-        latch = r" \S*/" + self.LATCH + " was kept"
+    @classmethod
+    def retained(cls, boost, latch):
+        """The exit message's report of the Boost and latch it finds."""
+        return (r"This script did not change Cooler Boost or the recovery Boost latch: "
+                r"cooler_boost is " + boost + r" and \S*/" + cls.LATCH + " is " + latch + r"\.")
+
+    def test_failure_after_continuing_reports_boost_on_and_the_latch_kept(self):
         for failure, code, message, replaced in (
                 ("preactivation", 25,
-                 r"Upgrade stopped; the service remains disabled in factory auto mode\. Cooler "
-                 r"Boost was left on and the recovery Boost latch" + latch + r"\.", True),
+                 r"Upgrade stopped; the service remains disabled in factory auto mode\. " +
+                 self.retained("on", "present"), True),
                 ("disable", 1,
                  r"Upgrade stopped before replacing any artifact: the installed manager left "
                  r"factory auto with Cooler Boost on, but a later service, marker, cooling or "
-                 r"recovery Boost latch check failed\. Cooler Boost was left on and the "
-                 r"recovery Boost latch" + latch + r"\.", False),
+                 r"recovery Boost latch check failed\. " + self.retained("on", "present"), False),
         ):
             with self.subTest(failure=failure):
                 result, state, calls = self.run_upgrade(failure, refusal={})
@@ -762,6 +799,35 @@ class UpgradeFullCoolingHandoverTests(UpgradeSandboxTestCase):
                     self.assertEqual(self.deployed_after, self.deployed_before)
                     self.assertIn("The service was disabled, so the installed profile will "
                                   "not return at boot.", result.stderr)
+
+    def test_a_change_after_continuing_stops_and_reports_what_it_finds(self):
+        # The checks after the disable guard the replacement: Boost on, the
+        # keeper stopped and a latch the new daemon consumes. Each is read again,
+        # and the exit message reports the state found, not the state intended.
+        for change, boost, latch in (("boost-off", "off", "present"),
+                                     ("latch-unlinked", "on", "missing"),
+                                     ("latch-payload", "on", "present but not valid"),
+                                     ("keeper-active", "on", "present")):
+            with self.subTest(change=change):
+                result, state, calls = self.run_upgrade("", refusal={}, at_disable=change)
+                self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                self.assertIn(self.CONTINUING, result.stderr)
+                self.assertRegex(
+                    result.stderr,
+                    r"Upgrade stopped before replacing any artifact: the installed manager "
+                    r"left factory auto with Cooler Boost on, but a later service, marker, "
+                    r"cooling or recovery Boost latch check failed\. " +
+                    self.retained(boost, latch))
+                self.assertNotIn("was left on", result.stderr)
+                self.assertNotIn("was kept", result.stderr)
+                self.assertEqual(calls.count(["systemctl", "disable", "msi-fan-profile.service"]),
+                                 2)
+                self.assertFalse(self.replacements(calls))
+                self.assertEqual(self.deployed_after, self.deployed_before)
+                self.assertEqual(self.record, "")
+                self.assertNotIn(["msi-fan-profile", "apply-default"], calls)
+                self.assertEqual((state["curve"], state["mode"], state["boost"],
+                                  state["enabled"]), (FACTORY, "auto", boost, "disabled"))
 
 
 class UpgradeCoolDownGateTests(UpgradeSandboxTestCase):

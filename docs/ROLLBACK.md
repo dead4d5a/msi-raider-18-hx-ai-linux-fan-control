@@ -199,7 +199,12 @@ with `/usr/bin/python3`) confirms six consecutive valid, cool samples 0.5 s
 apart within 10 seconds, as the controllers do. Otherwise it requests Boost
 again, exits `1` with
 `Factory restored, but machine is too hot to release Cooler Boost, ...` and
-`Files were not removed. Cool down and retry.`, and removes nothing.
+`Files were not removed. Cool down and retry.`, and removes nothing. After the
+confirmation and before its next EC write it checks the exact platform and
+driver identity again. If `msi_ec` was reloaded as another build or `ec_sys`
+was loaded meanwhile, it writes nothing more, exits `1` with
+`The exact platform or driver identity changed during the cool confirmation; ...`,
+and removes nothing; Cooler Boost is not released.
 
 ## Manual profile rollback
 

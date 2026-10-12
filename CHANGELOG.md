@@ -29,12 +29,15 @@
   a failed platform check, another curve, mode or Boost state, a running unit
   or a missing `factory-auto` marker, stops as before with the manager's exit
   status and nothing replaced, after a `Not continuing at full cooling: ...`
-  line that names the first failed check. If a later step fails after
-  continuing, the exit message says that Cooler Boost was left on and the
-  recovery-Boost marker kept. The cool handover is unchanged. The cool-down
-  gate stays, so the continuation remains the exception; its samples already
-  follow the shared confirmation's validity rules, and an invalid one restarts
-  its count.
+  line that names the first failed check. After continuing, the checks after
+  the disable read Boost, the keeper and the recovery-Boost marker again before
+  anything is replaced. If one of them or a later step fails, the exit message
+  reports what it then reads instead of assuming it: `This script did not
+  change Cooler Boost or the recovery Boost latch: cooler_boost is ... and ...
+  is ...`, with the marker `present`, `present but not valid` or `missing`.
+  The cool handover is unchanged. The cool-down gate stays, so the
+  continuation remains the exception; its samples already follow the shared
+  confirmation's validity rules, and an invalid one restarts its count.
 - Confirm coolness over several valid samples before releasing Cooler Boost.
   Every check that switches Boost off, or leaves the factory envelope at
   `auto/off`, used to decide from one instantaneous reading: the daemon's clean
@@ -60,17 +63,34 @@
   invalid. On refusal each program does exactly what it did before (Boost
   on; the daemon exits `1` with `factory restored; Boost release unsafe`, and
   `factory-auto` reports `factory staged with Boost on`), and the log names the
-  most recent unsafe sample. Entering cooling is never delayed: in the daemon,
-  the manager and `ExecStopPost` an unsafe sample reasserts Boost at once. That
+  most recent unsafe sample. When every sample was valid and cool but they
+  arrived too slowly to fill the window, the log says `samples too slow` and
+  `factory-auto` reports `factory restored but cool confirmation did not
+  complete: ...` instead of calling the telemetry unavailable. Entering
+  cooling is never delayed: in the daemon, the manager and `ExecStopPost` an
+  unsafe sample reasserts Boost at once. That
   undoes a keyboard off during the wait and, in `ExecStopPost`, where the
   daemon had already released Boost, switches it back on before the verdict.
   `uninstall-profile.sh` keeps the Boost it has just set and requests it again
-  when it refuses. The daemon sends a watchdog heartbeat with every sample,
+  when it refuses. Because its confirmation can take 10 s, it now repeats its
+  exact platform and driver identity check after the confirmation and before
+  its next EC write, as every other EC writer does inside each write. If
+  `msi_ec` was reloaded as another build or `ec_sys` appeared meanwhile, it
+  writes nothing more, exits `1` with `The exact platform or driver identity
+  changed during the cool confirmation; ...` and removes nothing. The daemon
+  sends a watchdog heartbeat with every sample,
   because a stop started by the `factory-auto` marker still runs under
   `WatchdogSec=5s`. A cool clean stop now takes about 2.5 s longer, and a cool
   `factory-auto`, which confirms three times (daemon, `ExecStopPost`, manager),
-  about 7.5 s longer; each wait ends within about 10 s, inside
-  `TimeoutStopSec=30s`. The runtime 30-second cooldown is unchanged; it already
+  about 7.5 s longer; each wait ends within about 10 s. A stop that arrives
+  while the daemon is still starting is handled after up to 10 s of hwmon
+  wait and 12 s of Boost verification, so the daemon records when the first
+  stop signal arrived and gives the confirmation only what remains of
+  `TimeoutStopSec=30s` less a 5 s exit margin. With less than 2.5 s left it
+  refuses the release without sampling (`WARNING Cooler Boost release refused:
+  N s of the 30 s stop timeout remain ...`) and exits `1` into full-cooling
+  recovery, as after a hot stop, instead of being killed by systemd. The
+  runtime 30-second cooldown is unchanged; it already
   requires continuously valid, cool samples. An upgrade from an earlier release
   still runs that release's single-reading checks in its `factory-auto`, so the
   upgrade's cool-down gate stays.

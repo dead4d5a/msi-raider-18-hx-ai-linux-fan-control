@@ -119,14 +119,14 @@ cleanup() {
   elif ((rc != 0 && enabled_for_startup)); then
     systemctl disable "$service" >/dev/null 2>&1 || true
     if ((boost_retained)); then
-      echo "Upgrade stopped before activation; the service was disabled and factory auto mode remains in effect. Cooler Boost was left on and the recovery Boost latch $recovery_latch was kept." >&2
+      echo "Upgrade stopped before activation; the service was disabled and factory auto mode remains in effect. $(retained_cooling)" >&2
     else
       echo 'Upgrade stopped before activation; the service was disabled and factory auto mode remains in effect.' >&2
     fi
   elif ((rc != 0 && safe_state)); then
     systemctl disable "$service" >/dev/null 2>&1 || true
     if ((boost_retained)); then
-      echo "Upgrade stopped; the service remains disabled in factory auto mode. Cooler Boost was left on and the recovery Boost latch $recovery_latch was kept." >&2
+      echo "Upgrade stopped; the service remains disabled in factory auto mode. $(retained_cooling)" >&2
     else
       echo 'Upgrade stopped; the service remains disabled in factory auto mode.' >&2
     fi
@@ -137,7 +137,7 @@ cleanup() {
     # keep the service disabled, as this window intended.
     systemctl disable "$service" >/dev/null 2>&1 || true
     if ((boost_retained)); then
-      echo "Upgrade stopped before replacing any artifact: the installed manager left factory auto with Cooler Boost on, but a later service, marker, cooling or recovery Boost latch check failed. Cooler Boost was left on and the recovery Boost latch $recovery_latch was kept." >&2
+      echo "Upgrade stopped before replacing any artifact: the installed manager left factory auto with Cooler Boost on, but a later service, marker, cooling or recovery Boost latch check failed. $(retained_cooling)" >&2
     else
       echo 'Upgrade stopped before replacing any artifact: the existing manager reported factory auto/off, but a later service, marker, cooling or recovery Boost latch check failed.' >&2
     fi
@@ -292,6 +292,23 @@ recovery_latch_valid() {
 refuse_full_cooling() {
   echo "Not continuing at full cooling: $1." >&2
   return 1
+}
+
+# After continuing at full cooling, an exit message reports what is there now,
+# not what was intended: the failed check may be exactly that Cooler Boost or
+# the recovery Boost latch changed. Only reads; the script writes neither.
+retained_cooling() {
+  local boost latch
+  boost=$(cat "$base/cooler_boost" 2>/dev/null || printf 'unreadable')
+  if recovery_latch_valid 2>/dev/null; then
+    latch=present
+  elif [[ -e $recovery_latch || -L $recovery_latch ]]; then
+    latch='present but not valid'
+  else
+    latch=missing
+  fi
+  printf 'This script did not change Cooler Boost or the recovery Boost latch: cooler_boost is %s and %s is %s.' \
+    "${boost:-empty}" "$recovery_latch" "$latch"
 }
 
 # Earlier releases decide a Boost release from one reading, which a spike can

@@ -324,9 +324,12 @@ class CoolConfirmationTests(unittest.TestCase):
                 '\u0665\u0660')
         # The EC's 255 sentinel is junk in degrees and 0 is junk for either CPU
         # channel; EC GPU 0 is a powered-off dGPU (see the dedicated test).
-        for label, position, extra in (('package', 0, ('0', '110001')),
-                                       ('EC CPU', 1, ('255', '0', '111')),
-                                       ('EC GPU', 2, ('255', '111'))):
+        # More than six digits is junk even when the value is in range.
+        for label, position, extra in (('package', 0, ('0', '110001', '0000059000',
+                                                       '0059000')),
+                                       ('EC CPU', 1, ('255', '0', '111', '0000060',
+                                                      '0000001')),
+                                       ('EC GPU', 2, ('255', '111', '0000044', '0000000'))):
             for value in junk + extra:
                 reading = list(COOL)
                 reading[position] = value
@@ -367,6 +370,8 @@ class CoolConfirmationTests(unittest.TestCase):
     def test_powered_off_gpu_and_thresholds_are_exactly_the_existing_limits(self):
         for reading, state in (
                 (('59000', '60', '0'), 'cool'), (('1', '1', '0'), 'cool'),
+                # Up to six digits, leading zeros included, is a valid reading.
+                (('059000', '000060', '000044'), 'cool'),
                 (('84999', '84', '69'), 'cool'), (('85000', '60', '44'), 'hot'),
                 (('59000', '85', '44'), 'hot'), (('59000', '60', '70'), 'hot'),
                 (('110000', '110', '110'), 'hot')):
@@ -437,14 +442,18 @@ class CoolConfirmationTests(unittest.TestCase):
         failing.assert_called_once()
 
     def test_unsafe_callback_runs_immediately_for_every_unsafe_sample(self):
+        # An unreadable sample is as unsafe as a hot or junk one: callers
+        # reassert Boost from this callback, so it must run for each of them.
         clock = FakeClock()
         calls = []
-        sample, _ = scripted(clock, [HOT, JUNK, COOL])
+        sample, _ = scripted(clock, [HOT, JUNK, OSError(5, 'I/O error'),
+                                     UnicodeDecodeError('ascii', b'\xff', 0, 1, 'junk'), COOL])
         result = CONTROL.confirm_cool(
             sample, monotonic=clock.monotonic, sleep=clock.sleep,
             on_unsafe=lambda reading: calls.append((clock.now, reading.state)))
         self.assertTrue(result.cool)
-        self.assertEqual(calls, [(0.0, 'hot'), (0.5, 'invalid')])
+        self.assertEqual(calls, [(0.0, 'hot'), (0.5, 'invalid'), (1.0, 'unavailable'),
+                                 (1.5, 'unavailable')])
 
     def test_window_that_cannot_hold_its_samples_is_rejected(self):
         for options in ({'samples': 0}, {'interval': 0}, {'timeout': 2.0}):

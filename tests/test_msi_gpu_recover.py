@@ -950,10 +950,12 @@ class ReleaseBoostIfCoolTests(HardwareIsolatedTestCase):
             if path.name == "temp1_input":
                 self.samples.append(clock["now"])
             current = readings[max(0, min(len(self.samples), len(readings)) - 1)]
-            if path.name == "temp1_input":
-                return current[0]
-            if path.name == "realtime_temperature":
-                return current[1 if path.parent.name == "cpu" else 2]
+            if path.name in ("temp1_input", "realtime_temperature"):
+                reading = current[0 if path.name == "temp1_input" else
+                                  1 if path.parent.name == "cpu" else 2]
+                if isinstance(reading, BaseException):
+                    raise reading
+                return reading
             if readback and path.name in readback and ("cooler_boost", "off") in self.writes:
                 return readback[path.name]
             return state[path.name]
@@ -1009,7 +1011,7 @@ class ReleaseBoostIfCoolTests(HardwareIsolatedTestCase):
                 self.assertIn("Boost release refused: no 6 consecutive valid cool samples",
                               self.stderr.getvalue())
 
-    def test_unreadable_telemetry_reasserts_boost(self):
+    def test_junk_telemetry_or_missing_coretemp_reasserts_boost(self):
         for kwargs, requests in (({"ec_cpu": "-1"}, 16), ({"package": "hot"}, 16),
                                  ({"core": RuntimeError("expected one coretemp hwmon; "
                                                         "found 0")}, 1)):
@@ -1017,6 +1019,19 @@ class ReleaseBoostIfCoolTests(HardwareIsolatedTestCase):
                 self.assertFalse(self.release(**kwargs))
                 self.assertEqual(self.writes, [])
                 self.assertEqual(self.request.call_count, requests)
+
+    def test_unreadable_telemetry_switches_boost_on_at_once_and_refuses(self):
+        # The daemon left auto/off; an unreadable sample is unsafe like a hot
+        # one, so Boost goes back on at the first sample, not at the verdict.
+        for kwargs in ({"package": OSError(5, "I/O error")},
+                       {"ec_gpu": UnicodeDecodeError("ascii", b"\xff", 0, 1, "junk")}):
+            with self.subTest(kwargs=kwargs):
+                self.assertFalse(self.release(**kwargs, boost="off", real_request=True))
+                self.assertEqual(list(zip(self.write_times, self.writes)),
+                                 [(0.0, ("cooler_boost", "on"))])
+                self.assertEqual(self.state["cooler_boost"], "on")
+                self.assertEqual(len(self.samples), 16)
+                self.assertIn("telemetry unavailable", self.stderr.getvalue())
 
     def test_failed_final_readback_turns_boost_back_on(self):
         for readback in ({"cooler_boost": "on"}, {"fan_mode": "advanced"},

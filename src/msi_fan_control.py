@@ -35,14 +35,18 @@ SOURCE_PATH = MODULE_PATH / "srcversion"
 # package and EC CPU below 85 C, the EC GPU below 70 C (0 is a powered-off
 # dGPU). The ranges reject junk: a CPU at 0 C is never plausible.
 #
-# Every caller fits the 10 s bound. The daemon's clean stop has
-# TimeoutStopSec=30s for the loop exit, the factory restore and this wait, and
-# it sends a watchdog heartbeat with every sample, so WatchdogSec=5s, which is
-# still enforced when the factory-auto marker starts the stop before SIGTERM,
-# never expires. ExecStopPost runs under the same TimeoutStopSec=30s. The
-# manager has no watchdog; factory-auto's 50 s systemctl stop covers both
-# waits above. Entering cooling never waits for this: callers reassert Boost
-# at once on an unsafe sample.
+# The daemon's clean stop has TimeoutStopSec=30s, armed by SIGTERM, for the
+# loop exit, the factory restore and this wait. A stop during startup can
+# first spend up to 10 s waiting for hwmon registration and 12 s verifying
+# Boost, so the daemon passes only what remains of the stop timeout, less a
+# 5 s exit margin, as the timeout, and refuses the release without sampling
+# when that cannot hold one window; it then exits into full-cooling recovery
+# instead of being killed. It sends a watchdog heartbeat with every sample, so
+# WatchdogSec=5s, which is still enforced when the factory-auto marker starts
+# the stop before SIGTERM, never expires. ExecStopPost runs under its own
+# TimeoutStopSec=30s. The manager has no watchdog; factory-auto's 50 s
+# systemctl stop covers both waits above. Entering cooling never waits for
+# this: callers reassert Boost at once on an unsafe sample.
 COOL_PACKAGE_LIMIT_MILLIDEGREES = 85000
 COOL_EC_CPU_LIMIT_CELSIUS = 85
 COOL_EC_GPU_LIMIT_CELSIUS = 70

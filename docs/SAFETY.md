@@ -263,7 +263,10 @@ right after the stop delays it by about 0.5 s. When the window ends without
 agreement, each caller does exactly what one hot reading made it do before:
 Boost stays on, the daemon exits `1`, `factory-auto` reports
 `factory staged with Boost on`, and the uninstall removes nothing. The log
-names the most recent unsafe sample.
+names the most recent unsafe sample. When every sample was valid and cool but
+they came too slowly to fill the window, for example from a slow EC, the log
+says `samples too slow` instead, and `factory-auto` reports
+`cool confirmation did not complete` rather than heat or unusable telemetry.
 
 Entering cooling never waits for this confirmation. In the daemon, the manager
 and `ExecStopPost`, an unsafe sample reasserts Cooler Boost at once if anything
@@ -273,16 +276,42 @@ sample switches Boost back on before the verdict, and a later confirmed window
 releases it again. The uninstall script keeps the Boost it set just before the
 check and requests it again when it refuses.
 
-The 10 s bound fits every caller. The daemon's clean stop runs under
-`TimeoutStopSec=30s`: one monitoring pass, the factory restore, at most 10 s
-of confirmation and the release. It sends a watchdog heartbeat with every
-sample. That matters when the `factory-auto` marker starts the stop before the
-stop request arrives, because systemd still enforces `WatchdogSec=5s` then.
-`ExecStopPost` runs under the same `TimeoutStopSec=30s`; on its success path it
-spends at most 10 s confirming. The manager has no watchdog, and its 50 s
-`systemctl stop` covers the daemon's and the helper's waits. A cool clean stop
-takes about 2.5 s longer than before, and a cool `factory-auto`, which confirms
-three times, about 7.5 s longer.
+The uninstall script validates the exact platform and driver before its first
+EC write, and the confirmation can take 10 s, during which a driver reload or
+`ec_sys` could appear. The confirmation's readings would then also have come
+from an unverified driver. So, like every other EC writer, which checks identity
+inside each write, the script repeats the full identity check after the
+confirmation and before the next EC write: before it switches Boost off, and
+before it requests Boost again on a refusal. If identity no longer matches, it
+writes nothing more, not even Boost on, because no model-specific write goes to
+an unverified driver. Boost stays as it was set and verified before the
+confirmation unless something else switched it off meanwhile, the script exits
+`1` with
+`The exact platform or driver identity changed during the cool confirmation; ...`,
+and nothing is removed.
+
+The daemon's clean stop runs under `TimeoutStopSec=30s`, which systemd arms
+when it sends `SIGTERM` and follows with `SIGKILL`. A stop during normal
+monitoring needs at most one monitoring pass, the factory restore, 10 s of
+confirmation and the release. A stop that arrives while the daemon is still
+starting is handled only after startup, which can spend up to 10 s waiting for
+the hwmon devices and up to 12 s verifying Boost, so those waits and a 10 s
+confirmation could reach the 30 s limit. The daemon therefore records when the
+first stop signal arrived. It gives the confirmation only what remains of the
+30 s, less a 5 s margin for the release writes and the exit, and never more
+than 10 s. If that remainder cannot hold six samples (2.5 s), it refuses the
+release without sampling and logs
+`WARNING Cooler Boost release refused: N s of the 30 s stop timeout remain ...`.
+The daemon then exits `1` into full-cooling recovery, as after a hot stop,
+instead of being killed. A stop that the `factory-auto` marker starts before
+any signal gets the full 10 s, because the stop timer is not running yet. The
+daemon sends a watchdog heartbeat with every sample. That matters when the
+`factory-auto` marker starts the stop before the stop request arrives, because
+systemd still enforces `WatchdogSec=5s` then. `ExecStopPost` runs under its own
+`TimeoutStopSec=30s`; on its success path it spends at most 10 s confirming.
+The manager has no watchdog, and its 50 s `systemctl stop` covers the daemon's
+and the helper's waits. A cool clean stop takes about 2.5 s longer than before,
+and a cool `factory-auto`, which confirms three times, about 7.5 s longer.
 
 The runtime release of an automatic latch or a queued manual release is not
 changed: it already requires 30 continuously valid, cool seconds, and an
@@ -298,8 +327,9 @@ A clean stop is a `systemctl stop`, a shutdown or reboot, or the stop inside
 `auto` mode with Cooler Boost on. It then releases Boost only once six
 consecutive valid samples, 0.5 s apart within 10 s, show the CPU package and
 EC CPU below 85 °C and the EC GPU below 70 °C (see the previous section). When
-it stays hotter, or the telemetry stays invalid, the stop deliberately ends in
-full cooling instead:
+it stays hotter, the telemetry stays invalid, or a stop that arrived during
+startup leaves too little of the stop timeout to confirm, the stop
+deliberately ends in full cooling instead:
 
 1. The daemon exits `1` with `factory restored; Boost release unsafe`, so
    systemd records a failed stop.
@@ -347,7 +377,13 @@ latch and is released only after 30 continuously valid, cool seconds. Without a
 valid marker, the daemon would keep the inherited Boost as manual Boost, so a
 missing or invalid marker stops the upgrade, as does any other failed check:
 nothing is replaced and the manager's exit status is kept. The upgrade script
-never writes the EC and never releases Boost itself.
+never writes the EC and never releases Boost itself. The service and the
+markers are checked again after the disable, before any file is replaced: Boost
+must still be on, the keeper inactive and the recovery-Boost marker valid. If a
+check fails after the upgrade has continued, its exit message reads Cooler
+Boost and the marker again and reports what it finds, such as
+`cooler_boost is off` or a marker that is `missing`, since the failed check may
+be exactly that.
 
 ## Suspend/resume
 
