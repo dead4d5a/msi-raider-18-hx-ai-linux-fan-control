@@ -91,6 +91,54 @@ observations, not attended or injected-fault tests.
   value. The unreleased cool confirmation and full-cooling upgrade handover in
   `CHANGELOG.md` respond to this.
 
+## Field evidence on monitoring stalls, 2026-10-24 to 2026-11-13
+
+These are events of v0.2.0 (`e4d4e19`), unattended, on the signed legacy
+driver `AB0BFAE2391B5ADD66E01BD`, taken from the journal of both units
+(America/Denver). They are field observations, not attended or injected-fault
+tests. The monitoring-gap warning of 0.2.0 gives no duration. The raw journal
+exports stay on the validation host, in a directory outside the repository;
+the SHA-256 of each export's units log is given below.
+
+- 2026-10-24, 16:20:28 and 16:20:30: two monitoring gaps. Each latched Cooler
+  Boost and reset the cooldown, and the second pass logged
+  `sensor telemetry recovered; Cooler Boost remains latched until monitored cooldown completes`.
+  The journal holds no later line from that boot, so it does not show the
+  release; the next boot applied Candidate 14 at 16:21:44.
+- 2026-10-30, 22:52:03: one monitoring gap, handled the same way. The automatic
+  latch released Cooler Boost at 22:52:33, after its 30-second cooldown, and a
+  clean stop 11 s later left thermally verified factory auto/off.
+- 2026-11-10, 04:52:24, during a host-wide out-of-memory stall: a sensor
+  acquisition took 5.943 s, and the next pass found a monitoring gap; both
+  latched Cooler Boost. At 04:52:32, 8.5 s later, systemd logged
+  `Watchdog timeout (limit 5s)!` and killed the daemon, which had run healthy
+  since 2026-10-30 (memory peak 14.0 MB). `ExecStopPost`
+  (`service_result=watchdog`) verified Candidate 14/`advanced` with Cooler
+  Boost on 2 s after the timeout. The keeper started, verified fan response at
+  6,153/6,315 RPM and held that state for 2 h 47 min, until the operator
+  rebooted. The next boot applied Candidate 14 normally.
+  Source for these three entries: the export of 2026-11-11, units log SHA-256
+  `1d44c90b56a5b2c3dc7a5e35a16a3dbe6c6c3f8ee43c968fa36cdcd1264afc50`.
+- 2026-11-13, during another host-wide out-of-memory stall: the 5 s watchdog
+  killed the daemon, which had run since the boot of 2026-11-10 (memory peak
+  15.1 MB). `ExecStopPost` verified Candidate 14 in `advanced` mode with Cooler
+  Boost on within 2 s. The keeper started and held Boost, and then its own 5 s
+  watchdog killed it three times within four minutes; the kernel needed 5 to
+  14 s to finish off each killed keeper. At the third restart systemd refused
+  the start (`Start request repeated too quickly`; the limit is three starts in
+  15 minutes). From then on no process supervised the fans, for 9 h 35 min: the
+  EC stayed at Candidate 14 in `advanced` mode with Cooler Boost on, last
+  verified by the keeper at 6,153/6,400 RPM, until the operator ran
+  `sudo msi-fan-profile apply-default`. That started the daemon with the
+  recovery latch; the daemon released Cooler Boost after its 30-second
+  cooldown, and `msi-fan-profile status` exited `0`. Source: a later journal
+  export, units log SHA-256
+  `90034453805bdd0da74a221d607c4c2a998fbb6dafea7b46dd119b84f355b3b6`.
+
+Neither kill was a fault of the daemon. Full cooling held both times; on
+2026-11-13 supervision did not. 0.2.1 raises the watchdog of both units to
+30 s.
+
 ## Automated validation on 2026-09-30
 
 - Mocked recovery-marker handoff and manual-latch separation, including heat or

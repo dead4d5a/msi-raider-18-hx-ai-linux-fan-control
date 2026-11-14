@@ -432,6 +432,65 @@ Boost and the marker again and reports what it finds, such as
 `cooler_boost is off` or a marker that is `missing`, since the failed check may
 be exactly that.
 
+## Host memory stalls
+
+When the host runs out of memory, the kernel can hold any process for seconds
+while it reclaims memory, in an allocation or in a page fault. Such host-wide
+out-of-memory stalls recur on the validation host. The daemon and the keeper
+are held like every other process and run no code until the kernel lets them
+continue.
+
+A late daemon latches Cooler Boost in its first pass after the stall. When an
+acquisition starts more than 2 s after the previous one, or takes longer than
+2 s, that pass reasserts Boost as an automatic latch and resets the cooldown
+and the fan-response evidence (section 6); time without continuous monitoring
+never counts toward the 30-second cool timer. Each stall is logged once, as a
+`WARNING` with its length, where the time went, and the memory pressure of the
+unit and of the host, read after the Boost write. The keeper reasserts full
+cooling in every pass and logs `WARNING recovery keeper stall ...` when a
+pass, with any overrun of the sleep before it, takes more than 2 s.
+
+The watchdog is for a process that does not resume. Both units use
+`WatchdogSec=30s` with `SIGKILL` (section 7). When the daemon has sent no
+notification for 30 s, systemd kills it and records the result `watchdog`.
+`ExecStopPost` then stages and verifies Candidate 14 in `advanced` mode with
+Cooler Boost on and records the recovery-Boost marker, and the keeper holds
+that state; a killed keeper is restarted 30 s later, within its start limit.
+This release does not hand back by itself: full cooling stays until
+`apply-default`, which needs no reboot (`OPERATIONS.md`, "After a watchdog
+kill").
+
+The cost of 30 s is that a daemon stall of 7 to 30 s passes without Boost
+until the daemon resumes. In that time no alarm can raise Cooler Boost. In the
+field, with Boost off and the CPU at 88 °C or above, the median fan speeds were
+about 3,100 RPM (fan 1) and 3,700 RPM (fan 2), roughly half and 60 % of full
+speed. A shorter watchdog gains little in a host-wide stall, because the
+recovery helper and the keeper need memory too and wait in the same way.
+
+What cannot be guaranteed:
+
+- A stall inside a kernel allocation cannot be bounded from user space. No
+  timer of the daemon, the recovery helper or the keeper runs while the kernel
+  holds it, and even the watchdog's `SIGKILL` takes effect only when the kernel
+  lets the process go: on 2026-11-13 the kernel needed 5 to 14 s to finish off
+  each killed keeper.
+- `MemoryMin=32M` is not effective when the parent cgroup reserves nothing, as
+  `system.slice` does on a stock Ubuntu host (section 7). While a unit is
+  active, `msi-fan-profile status` reports this as
+  `controller_memory.memory_min_effective`, which reads `false` on the
+  validation host.
+- The keeper's start limit still ends the guard. When the keeper fails again
+  after three starts within 15 minutes, systemd refuses to restart it
+  (`Start request repeated too quickly`), and `keeper_result` reads
+  `start-limit-hit`. The EC keeps what the keeper last asserted, Candidate 14
+  in `advanced` mode with Cooler Boost on, but no process reasserts it or
+  watches the temperatures and fans; nothing switches Boost back on if a key
+  press turns it off. This was observed on 2026-11-13: the keeper's former 5 s
+  watchdog killed it three times within four minutes of one stall, and the
+  fans stayed at full cooling without a supervising process for 9 h 35 min,
+  until `apply-default` restored normal control. The 30 s watchdog makes this
+  less likely; it does not rule it out.
+
 ## Suspend/resume
 
 The daemon compares `CLOCK_BOOTTIME` and monotonic time. A suspend gap triggers a

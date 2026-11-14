@@ -363,6 +363,101 @@ keeper keeps cooling:
    check `controller_memory.memory_peak_bytes` over several days; it should
    stay far below 64 MiB.
 
+### After a watchdog kill
+
+`msi-fan-profile status` shows `service_result` `watchdog`, and the
+controller's journal has systemd's `Watchdog timeout (limit 30s)!` and
+`Failed with result 'watchdog'`: the daemon sent no watchdog notification for
+30 s. The usual cause is a host-wide out-of-memory stall, which leaves the
+kernel's `Out of memory` lines in the same minute:
+
+```bash
+sudo journalctl -k --no-pager | grep -F 'Out of memory'
+```
+
+If the daemon resumed during the stall before it was killed, its journal also
+has a stall warning, `WARNING monitoring gap; ...` or
+`WARNING slow sensor acquisition ...`, with the stall's length and the memory
+pressure of the unit and the host. `SAFETY.md` describes this under "Host
+memory stalls".
+
+Neither an upgrade nor a reboot is needed. Once the machine is responsive
+again and cool, run `sudo msi-fan-profile apply-default` and continue with
+steps 3 and 4 above.
+
+- If both units are `failed` and `keeper_result` reads `start-limit-hit`, the
+  keeper failed too, and systemd stopped restarting it after three starts in
+  15 minutes. The EC still holds Candidate 14 in `advanced` mode with Cooler
+  Boost on, but no process supervises it. Run the same `apply-default`; it
+  also resets the keeper's start count.
+- If `apply-default` reports `service disabled, factory auto with Boost on`,
+  it failed before it started the daemon, for example because a `systemctl`
+  call timed out, and its fail-safe disabled the service. Run it again. Check
+  `systemctl is-enabled msi-fan-profile.service` before any reboot.
+- If it fails with `activation failed after start was attempted` and no keeper
+  is active, see [Torn recovery latch](#torn-recovery-latch).
+
+## Torn recovery latch
+
+The recovery helper and the keeper record the recovery-Boost marker in two
+steps: they create `/run/msi-fan-profile.recovery-boost`, then write its
+12-byte payload. If one of them is killed between the two, an empty file
+remains, which no command of this release removes. Then:
+
+- the daemon refuses to start, before any EC write, with
+  `ERROR ProfileError: invalid recovery Boost latch payload`;
+- the keeper stages full cooling and then exits at every start with
+  `FATAL: recovery keeper could not establish full cooling: invalid recovery Boost latch payload`,
+  until systemd stops restarting it. The EC keeps Candidate 14 in `advanced`
+  mode with Cooler Boost on, with no process supervising it;
+- `apply-default` fails with
+  `apply-default activation failed after start was attempted: ...`.
+
+Do not run `factory-auto` in this state, and do not start an upgrade, which
+hands over through `factory-auto`. On a cool machine `factory-auto` restores
+the factory curve, then fails to clear the empty marker and ends in its
+fail-safe: the service disabled, and the factory curve in `auto` mode with
+Cooler Boost on.
+
+Confirm the state first. `msi-fan-profile status` exits `1` and shows
+`recovery_boost_latched` `true`, `cooler_boost` `on`, and neither
+`service_active_state` nor `keeper_active_state` `active`, and
+
+```bash
+sudo stat -c %s /run/msi-fan-profile.recovery-boost
+```
+
+prints `0`. A complete marker has 12 bytes. If it prints `12`, or the file does
+not exist, the latch is not torn; the journal of both units names the reason.
+
+Then take one of two ways out, the first where possible:
+
+1. Reboot once the machine is cool, with the service still enabled. `/run` is
+   emptied at boot, and the boot applies Candidate 14 as usual. Cooler Boost
+   does not survive the reboot, and nothing monitors the machine until the
+   daemon has applied Candidate 14 (see [Boot window](#boot-window)), so do
+   not reboot while hot. Check first:
+
+   ```bash
+   systemctl is-enabled msi-fan-profile.service
+   ```
+
+   If it prints `disabled`, take the second way out instead, because
+   `apply-default` enables the service again and a reboot does not.
+2. Remove the empty file as root, then hand over to the daemon:
+
+   ```bash
+   sudo rm /run/msi-fan-profile.recovery-boost
+   sudo msi-fan-profile apply-default
+   ```
+
+   Without a marker, the daemon keeps the Cooler Boost it finds as manual
+   Boost, and `status` shows `health.manual_boost` `true`. Release it with
+   `sudo msi-fan-profile boost-release`, which completes after 30 continuously
+   valid, cool seconds.
+
+After either way out, `msi-fan-profile status` exits `0`.
+
 ## Controller failed: driver not loaded
 
 After a kernel update, `msi-fan-profile.service` can appear in

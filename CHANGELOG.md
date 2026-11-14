@@ -51,6 +51,15 @@ its section starts with a short summary, upgrade notes and known issues.
   `locked_bytes` and `memory_min_effective`, which is `false` when an ancestor
   cgroup reserves less than the unit's `MemoryMin`, as on the validation host;
   none of the new keys enters the exit status or the stable comparison (ST-4).
+- `docs/SAFETY.md` has a new section, "Host memory stalls": what the daemon
+  does when a stall makes it late, what the 30 s watchdog is for and costs,
+  what a kill leads to, what cannot be guaranteed, and the unsupervised full
+  cooling left when the keeper reaches its start limit, as observed on
+  2026-11-13. `docs/OPERATIONS.md` gains runbooks for a watchdog kill and for
+  a torn recovery latch, an empty `/run/msi-fan-profile.recovery-boost` after
+  which `apply-default` fails and `factory-auto` must not be run, and
+  `docs/VALIDATION.md` records the stalls of 2026-10-24 to 2026-11-13 as field
+  evidence (ST-5).
 - At startup the daemon logs `pre-apply EC state: curve=... mode=... boost=...`
   between the three EC reads it already makes and its first write, with the
   curve in the words of `msi-fan-profile status` (`factory`, `candidate14` or
