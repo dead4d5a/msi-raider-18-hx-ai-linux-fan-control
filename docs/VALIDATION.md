@@ -62,8 +62,9 @@ observations, not attended or injected-fault tests.
   an automatic latch at 12:04:12, after its 30-second cooldown.
 - A cool guarded upgrade deployed 6ed5498 at 12:06. The stop logged
   `successful candidate14 service left thermally verified factory auto/off`, and
-  Candidate 14 was applied again at 12:06:17. A multi-day run of the fix is
-  still pending.
+  Candidate 14 was applied again at 12:06:17. v0.2.0, which contains the fix,
+  replaced this build later that day; its multi-day runs are recorded under
+  "Field evidence from 2026-10-18 to 2026-11-11" below.
 - Reboot from 7.0.0-34 to 7.0.0-38: at the 12:43:36 shutdown the machine was too
   hot to release Boost. The daemon restored factory auto with Boost on and
   exited `1` with `factory restored; Boost release unsafe`; `ExecStopPost` then
@@ -77,29 +78,67 @@ observations, not attended or injected-fault tests.
 - A cool reboot on 7.0.0-38 at 14:40 left verified factory auto/off. On the next
   boot `systemd-tmpfiles-setup` finished at 8.8 s and Candidate 14 was applied
   at 13.4 s.
-- Upgrade attempt on 2026-10-11 at 19:02 under bursty load (six database insert
-  processes at about 80% CPU each): the upgrade's cool-down gate passed with 10
-  consecutive one-second samples, the last at CPU package 59 °C, EC CPU 60 °C
-  and EC GPU 44 °C. 0.26 s later the installed 6ed5498 daemon's single-reading
-  release check found it not cool, so the daemon exited with
-  `factory restored; Boost release unsafe`, `ExecStopPost` staged Candidate
-  14/`advanced` with Boost and the recovery marker, and that release's manager
-  refused `factory-auto` and disabled the service. The upgrade replaced
-  nothing. The operator reports that these sensors are flaky: the coretemp
-  package reading jumps 20 °C or more within milliseconds under bursty load,
-  and the EC sometimes returns junk such as 255 °C, 65535 RPM or an empty
-  value. The unreleased cool confirmation and full-cooling upgrade handover in
-  `CHANGELOG.md` respond to this.
+- Upgrade attempt on 2026-10-11 at 19:02 under bursty load: the upgrade's
+  cool-down gate passed with 10 consecutive one-second samples, the last at CPU
+  package 59 °C, EC CPU 60 °C and EC GPU 44 °C. 0.26 s later the installed
+  6ed5498 daemon's single-reading release check found it not cool, so the
+  daemon exited with `factory restored; Boost release unsafe`, `ExecStopPost`
+  staged Candidate 14/`advanced` with Boost and the recovery marker, and that
+  release's manager refused `factory-auto` and disabled the service. The
+  upgrade replaced nothing. The operator reports that these sensors are flaky:
+  the coretemp package reading jumps 20 °C or more within milliseconds under
+  bursty load, and the EC sometimes returns junk such as 255 °C, 65535 RPM or
+  an empty value. The cool confirmation and the full-cooling upgrade handover
+  of 0.2.0 (`CHANGELOG.md`) respond to this.
 
-## Field evidence on monitoring stalls, 2026-10-24 to 2026-11-13
+## Field evidence from 2026-10-18 to 2026-11-11
 
-These are events of v0.2.0 (`e4d4e19`), unattended, on the signed legacy
-driver `AB0BFAE2391B5ADD66E01BD`, taken from the journal of both units
-(America/Denver). They are field observations, not attended or injected-fault
-tests. The monitoring-gap warning of 0.2.0 gives no duration. The raw journal
-exports stay on the validation host, in a directory outside the repository;
-the SHA-256 of each export's units log is given below.
+This is field evidence for v0.2.0, unattended: events of `e4d4e19` on the
+signed legacy driver `AB0BFAE2391B5ADD66E01BD`, taken from the journal of both
+units (America/Denver). They are field observations, not attended or
+injected-fault tests, and they count only for the build they happened on; code
+that changes afterwards needs its own evidence. When the journal was exported
+on 2026-11-11, nothing before 2026-10-18 21:36 was retained, so the first week
+of v0.2.0 is not covered. The monitoring-gap warning of 0.2.0 gives no
+duration. The raw export stays on the validation host, in a directory outside
+the repository; its units log has SHA-256
+`1d44c90b56a5b2c3dc7a5e35a16a3dbe6c6c3f8ee43c968fa36cdcd1264afc50`. Every figure
+below can be recomputed from that export and this repository.
 
+- Deployment: the install record in the export names `e4d4e19` as
+  `source_commit` and the SHA-256 of that commit's `SHA256SUMS` as
+  `source_manifest_sha256`, and its 12 file digests are those of the files of
+  v0.2.0, so its `source_tree_dirty=yes` reached no installed file. v0.2.0 was
+  deployed on 2026-10-11, before the retained journal begins.
+- Daemon runs: the run that the clean stop of 2026-10-19 ended had started
+  before the retained journal, at the earliest with the boot of 2026-10-16, at
+  most 2.8 days earlier, and peaked at 15.6M. The run of 5.3 days from
+  2026-10-19 to the end of its boot on 2026-10-24 (below) logged no stop line,
+  so no peak was recorded. The run of 6.3 days from 2026-10-24 to 2026-10-30
+  peaked at 13.7M and used 26 min 40 s of CPU time, and the run of 10.3 days
+  from 2026-10-30 that the watchdog kill of 2026-11-10 ended peaked at 14.0M and
+  used 45 min 22 s: about 0.3 % of one core in both runs. All three peaks came
+  with `0B memory swap peak`. The leaking 2026-09-30 build had reached its 64M
+  limit on 2026-10-10 (above).
+- 2026-10-18 21:36 to 2026-10-19 09:18, sustained heat: in the 702 minute status
+  lines of this period the logged CPU temperature was at or above 95 °C in 55 %
+  and Cooler Boost was on in 76 %, and the daemon logged
+  `Cooler Boost established for alarm` 273 times, without a failure. The clean
+  stop at 09:18 logged
+  `Cooler Boost release confirmed: 6 consecutive valid cool samples 0.5 s apart after 2.5 s`
+  and `successful candidate14 service left thermally verified factory auto/off`.
+- 2026-10-20, 04:59:37 to 05:03:32: EC telemetry sentinel. The daemon logged
+  `EC CPU temperature sentinel 255C` at 04:59:37 and then once a minute, and
+  stayed in the same process with Candidate 14 active and Cooler Boost latched.
+  At 05:03:32 it logged
+  `sensor telemetry recovered; Cooler Boost remains latched until monitored cooldown completes`,
+  and at 05:04:02 it released Cooler Boost after its 30-second cooldown. Single
+  `implausible fan2=480000RPM` readings on 2026-10-23 and 2026-10-26 took the
+  same path: telemetry recovered 2 s later, and Boost was released 30 s after
+  that. These events close the attended sentinel test that was pending, for
+  v0.2.0 only. Injecting the sentinel would need a raw EC write, which this
+  project does not support (`SECURITY.md`), so a later release that changes
+  this path rests on its unit tests until such an event occurs on it.
 - 2026-10-24, 16:20:28 and 16:20:30: two monitoring gaps. Each latched Cooler
   Boost and reset the cooldown, and the second pass logged
   `sensor telemetry recovered; Cooler Boost remains latched until monitored cooldown completes`.
@@ -107,21 +146,31 @@ the SHA-256 of each export's units log is given below.
   release; the next boot applied Candidate 14 at 16:21:44.
 - 2026-10-30, 22:52:03: one monitoring gap, handled the same way. The automatic
   latch released Cooler Boost at 22:52:33, after its 30-second cooldown, and a
-  clean stop 11 s later left thermally verified factory auto/off.
+  clean stop 11 s later logged the same release confirmation, after 5.0 s, and
+  left thermally verified factory auto/off.
+- 2026-11-01, kernel installation: the readiness hook logged 12 `PASS` lines
+  and `KERNEL READINESS PASSED: 7.0.0-42-generic`. The first boot of that kernel
+  followed the kill of 2026-11-10 (next entry). The retained journal holds no
+  installation of a kernel that fails the check.
 - 2026-11-10, 04:52:24, during a host-wide out-of-memory stall: a sensor
   acquisition took 5.943 s, and the next pass found a monitoring gap; both
   latched Cooler Boost. At 04:52:32, 8.5 s later, systemd logged
   `Watchdog timeout (limit 5s)!` and killed the daemon, which had run healthy
-  since 2026-10-30 (memory peak 14.0 MB). `ExecStopPost`
-  (`service_result=watchdog`) verified Candidate 14/`advanced` with Cooler
-  Boost on 2 s after the timeout. The keeper started, verified fan response at
-  6,153/6,315 RPM and held that state for 2 h 47 min, until the operator
-  rebooted. The next boot applied Candidate 14 normally.
-  Source for these three entries: the export of 2026-11-11, units log SHA-256
-  `1d44c90b56a5b2c3dc7a5e35a16a3dbe6c6c3f8ee43c968fa36cdcd1264afc50`.
+  since 2026-10-30. `ExecStopPost` (`service_result=watchdog`) verified
+  Candidate 14/`advanced` with Cooler Boost on 2 s after the timeout. The
+  keeper started, verified fan response at 6,153/6,315 RPM and held that state
+  for 2 h 47 min, until the operator rebooted. The next boot applied
+  Candidate 14 normally.
+
+## Field evidence on 2026-11-13
+
+This is field evidence for v0.2.0, unattended, on the same driver, from a
+later journal export, which also stays on the validation host; its units log
+has SHA-256 `90034453805bdd0da74a221d607c4c2a998fbb6dafea7b46dd119b84f355b3b6`.
+
 - 2026-11-13, during another host-wide out-of-memory stall: the 5 s watchdog
-  killed the daemon, which had run since the boot of 2026-11-10 (memory peak
-  15.1 MB). `ExecStopPost` verified Candidate 14 in `advanced` mode with Cooler
+  killed the daemon, which had run since the boot of 2026-11-10 (15.1M memory
+  peak). `ExecStopPost` verified Candidate 14 in `advanced` mode with Cooler
   Boost on within 2 s. The keeper started and held Boost, and then its own 5 s
   watchdog killed it three times within four minutes; the kernel needed 5 to
   14 s to finish off each killed keeper. At the third restart systemd refused
@@ -131,13 +180,11 @@ the SHA-256 of each export's units log is given below.
   verified by the keeper at 6,153/6,400 RPM, until the operator ran
   `sudo msi-fan-profile apply-default`. That started the daemon with the
   recovery latch; the daemon released Cooler Boost after its 30-second
-  cooldown, and `msi-fan-profile status` exited `0`. Source: a later journal
-  export, units log SHA-256
-  `90034453805bdd0da74a221d607c4c2a998fbb6dafea7b46dd119b84f355b3b6`.
+  cooldown, and `msi-fan-profile status` exited `0`.
 
-Neither kill was a fault of the daemon. Full cooling held both times; on
-2026-11-13 supervision did not. 0.2.1 raises the watchdog of both units to
-30 s.
+Neither the kill of 2026-11-10 nor that of 2026-11-13 was a fault of the
+daemon. Full cooling held both times; on 2026-11-13 supervision did not. 0.2.1
+raises the watchdog of both units to 30 s.
 
 ## Automated validation on 2026-09-30
 
@@ -180,44 +227,73 @@ Reproduce default checks with `./scripts/verify-release.sh`. The optional
 systemd and driver checks are documented in `CONTRIBUTING.md`. CI additionally
 builds the snapshot and deployed legacy patches against the runner's 24.04 GA
 and HWE kernel headers, also weekly; that CI job is not evidence of attended
-thermal compatibility on another kernel.
+thermal compatibility on another kernel. The snapshot build
+`9086C45007CBB7FA1264430` was never signed, loaded or run on the validation
+host, and it leaves the accepted set when the new driver build arrives (DR-10).
 
 ## Pending
 
-- Final attended suspend/resume test confirming the daemon logs a resume event,
-  forcibly reprograms Candidate 14, and preserves watchdog service health. The
-  validation host has `sleep`, `suspend`, `hibernate` and `hybrid-sleep` targets
-  masked since 2026-09-29, and Secure Boot lockdown disables hibernation there,
-  so the current code's resume path has not run in the field.
-- Attended EC telemetry-sentinel test confirming degraded mode remains active,
-  Boost stays latched, and valid telemetry resumes the physical-verification
-  path without a primary-service failure.
-- Attended primary-service fault test confirming the failure keeper reasserts
-  Candidate 14/`advanced`/Boost and yields cleanly to `apply-default`. The
-  unattended memory-limit kill above exercised this path in the field; it does
-  not replace an attended, injected fault.
-- Extended attended validation of the deployed 2026-10-11 user-space release
-  (6ed5498), including a multi-day run with `controller_memory` checks and the
-  fault, resume, and sustained-load cases above. Successful guarded deployment
-  and Boost/cooldown checks do not replace those hardware tests.
-- Guarded deployment and attended validation of the unreleased changes in
-  `CHANGELOG.md`, including a visible driver-loss failure after a kernel update
-  and the kernel readiness hook on a real kernel installation.
-- Signing/staging/deployment and attended validation of the new snapshot driver
-  `9086C45007CBB7FA1264430`. The currently loaded legacy module remains unchanged.
-- Matched post-deployment performance timings with diagnostics temporarily on,
-  then confirmation that they are disabled after validation. No throughput or
-  battery-life improvement is claimed from the offline tests alone.
-- Simulated failures at each kernel EC write/readback/rollback position and
-  concurrent kernel-store tests. The build verifier checks compilation and
-  module identity, not transaction behavior under injected I/O faults.
-- Repeated matched, longer attended thermal/performance/acoustic comparisons;
-  Candidate 14 remains measured and promising, not proven optimal.
+Each entry names the test that closes it.
 
-The implementation already uses a suspend-time discontinuity between
-`CLOCK_BOOTTIME` and monotonic time and forces a full safe reapply. Until the
-attended result is recorded, suspend/resume should be treated as implemented but
-not finally validated. Keep suspend masked on such a host until it is.
+- Injected faults on the release candidate (VA-12): a kill, after which the
+  keeper holds full cooling until `apply-default` hands back and the daemon
+  releases Cooler Boost after 30 continuously valid, cool seconds; a 20 s
+  freeze that the daemon survives; a freeze longer than the watchdog, which
+  hands over to the keeper; and a second failure in the same boot. The kill
+  and the hand-back are rehearsed once on 0.2.1 when it is deployed (ST-6). The
+  watchdog kills of 2026-11-10 and 2026-11-13 exercised v0.2.0 up to the
+  keeper, and on 2026-11-13 `apply-default` started the daemon with the
+  recovery latch after the keeper had stopped at its start limit. No hand-back
+  from an active keeper is recorded for v0.2.0, and field events do not
+  replace an attended, injected fault.
+- Guarded deployment of the release candidate with its complete record
+  (VA-10), then its 14-day soak against the roadmap's soak criteria C1 to C10
+  (VA-16). The sustained-load case is the soak's exposure criterion C10, and
+  resume is not claimed (below). For v0.2.0 the field evidence above holds
+  daemon runs of up to 10.3 days and the sustained heat of 2026-10-18 and
+  2026-10-19.
+- One attended boot with `module_blacklist=msi_ec` on the kernel command line,
+  which confirms the visible driver-loss failure: the primary unit fails before
+  any EC write, the keeper is skipped, and `msi-fan-profile status` prints
+  `ERROR: msi_ec driver not loaded for kernel <release>` and exits `1`; then a
+  normal boot (VA-14). The deployment of v0.2.0 and the readiness hook on a
+  real kernel installation are recorded in the field evidence above.
+- One attended window with timing diagnostics on and its figures recorded,
+  then confirmation that diagnostics are off again (VA-11).
+- Mock-EC fault injection at every EC access of the driver's `fan_curve` store
+  transaction, for the deployed legacy build (VA-8) and for the new driver
+  build (DR-10). `scripts/verify-driver-build.sh` checks compilation and module
+  identity, not transaction behavior under injected I/O faults.
+
+## Known limitation of 0.2.x: the fan-2 curve
+
+On 0.2.x, fan 2, the GPU-side fan, runs one step below the Candidate 14 table
+while the machine warms up. Next to each curve the EC keeps six falling
+thresholds, which decide when a step is left again. The legacy driver reads,
+writes and verifies the six rising thresholds and seven speeds of each fan, 26
+bytes in all, and does not touch the 12 falling-threshold bytes. Their factory
+values, captured during calibration, lie above Candidate 14's rising
+thresholds for fan 2 (research item DR-15). Fan 1 is essentially unaffected.
+By evidence level:
+
+- Observed: the EC's fan-2 target alternates once a second between the table's
+  step and the one below at a GPU temperature of 43 and 44 °C, and on warm-up
+  fan 2 runs one step below the table up to 54 °C, about 3,750 instead of
+  4,330 RPM at 44 to 54 °C (DR-15: a 90 s read-only sample, and the minute
+  status lines of the field evidence above).
+- Inferred from the factory falling thresholds: the same up to 78 °C, with the
+  step at 79 °C and above held.
+- From two rows of the calibration table only (`docs/CALIBRATION.md`): about
+  4,300 RPM at 55 to 69 °C, where the table implies about 6,150.
+- Unknown: any long-term effect of the alternation, and whether this unit
+  honors falling thresholds that are written to it.
+
+The alarms and Cooler Boost do not depend on the curve, and every measurement
+behind Candidate 14 was taken with this behavior present. The fix is planned
+before 1.0 under decision D-2: a new driver build that also writes the falling
+thresholds, and a curve re-tuned with them (DR-10, DR-12, DR-18, DR-20). DR-16
+adds a description of falling thresholds and of the curve the EC executes to
+`docs/PROFILE.md`.
 
 ## Not claimed
 
@@ -226,9 +302,29 @@ not finally validated. Keep suspend masked on such a host until it is.
 - RTX 5090 A2XWJG behavior
 - Other MS-1824 marketing variants
 - Other Ubuntu/kernel releases, including an upgrade to Ubuntu 26.04; field
-  operation on 7.0.0-34 and 7.0.0-38 is not attended validation
+  operation on 7.0.0-34, 7.0.0-38 and 7.0.0-42 is not attended validation
 - Hibernation behavior
+- Suspend and resume (decision D-3). The daemon detects a suspend from the
+  discontinuity between `CLOCK_BOOTTIME` and monotonic time and forces a full
+  safe reapply, but that path is covered by mocked tests only and has not run
+  on the hardware with the current code. The validation host's `sleep`,
+  `suspend`, `hibernate` and `hybrid-sleep` targets have been masked since
+  2026-09-29 and stay masked, and Secure Boot lockdown disables hibernation
+  there. Keep suspend masked on such a host.
 - Hard CPU temperature enforcement below 90°C
+- That Candidate 14 is optimal or holds a hard thermal ceiling, and noise,
+  throughput or battery-life comparisons beyond the short runs in
+  `docs/CALIBRATION.md` (decision D-4): Candidate 14 is measured and
+  promising, not proven optimal. Nor is a throughput or battery-life
+  improvement claimed for the controller's own efficiency changes, which rest
+  on offline tests.
+- Battery operation: no test on battery power is recorded.
+- Uninstall and fresh installation on real hardware: the uninstall script is
+  tested in a sandbox only, and the validation host is updated with the
+  guarded upgrade.
+- Concurrent kernel-store tests, with simultaneous writes to the driver's
+  `fan_curve` store, and the real EC's behavior when an EC access fails; fault
+  injection uses a mock EC (see Pending).
 - Generic fan-curve editing
 
 Contributions for another exact configuration should include DMI/BIOS/EC
