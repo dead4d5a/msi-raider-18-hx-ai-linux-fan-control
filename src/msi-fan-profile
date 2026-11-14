@@ -36,14 +36,26 @@ RECOVERY_LATCH = pathlib.Path('/run/msi-fan-profile.recovery-boost')
 RECOVERY_LATCH_PAYLOAD = b'candidate14\n'
 MANAGER_LOCK = pathlib.Path('/run/msi-fan-profile-manager.lock')
 FAN_LOCK = pathlib.Path('/run/msi-fanctl.lock')
+# World-readable; read only for the memory diagnostics of the status report.
+PROC = pathlib.Path('/proc')
+CGROUP_ROOT = pathlib.Path('/sys/fs/cgroup')
 FACTORY = '58 64 70 76 82 88 0 25 35 44 58 70 75 52 58 64 70 76 82 0 25 35 44 58 70 75'
 DEFAULT = '50 60 70 76 82 88 20 30 40 50 60 80 110 38 40 42 44 55 70 20 30 40 60 70 100 120'
 COMMANDS = ('status', 'apply-default', 'factory-auto', 'boost-on', 'boost-release')
 UNIT_PROPERTIES = ('Id', 'ActiveState', 'SubState', 'MainPID', 'Job', 'UnitFileState')
 # Read in the same batched query; optional so an older systemd can still report.
-MEMORY_PROPERTIES = ('MemoryCurrent', 'MemoryPeak', 'MemorySwapCurrent')
-# Dynamic samples are reported but never part of the stable configuration check.
-DYNAMIC_STATUS_KEYS = ('controller_memory',)
+MEMORY_PROPERTIES = ('MemoryCurrent', 'MemoryPeak', 'MemorySwapCurrent', 'ControlGroup')
+RESULT_PROPERTIES = ('Result', 'NRestarts', 'ExecMainCode', 'ExecMainStatus')
+# ExecMainCode is the waitid() si_code of the ended main process, named as
+# systemctl status names it.
+MAIN_EXIT_CODES = {os.CLD_EXITED: 'exited', os.CLD_KILLED: 'killed', os.CLD_DUMPED: 'dumped'}
+# Dynamic samples and unit diagnostics are reported but never part of the
+# stable configuration check.
+DYNAMIC_STATUS_KEYS = (
+    'controller_memory',
+    'service_result', 'service_restarts', 'service_main_code', 'service_main_status',
+    'keeper_result', 'keeper_restarts', 'keeper_main_code', 'keeper_main_status',
+)
 
 
 class ManagerError(RuntimeError):
@@ -64,6 +76,11 @@ class UnitState(TypedDict):
     MemoryCurrent: NotRequired[str]
     MemoryPeak: NotRequired[str]
     MemorySwapCurrent: NotRequired[str]
+    ControlGroup: NotRequired[str]
+    Result: NotRequired[str]
+    NRestarts: NotRequired[str]
+    ExecMainCode: NotRequired[str]
+    ExecMainStatus: NotRequired[str]
 
 
 def read(path):
@@ -212,8 +229,8 @@ def clear_recovery_latch():
 
 def unit_states(*services) -> dict[str, UnitState]:
     """Query related service properties in one systemctl invocation."""
-    result = ctl('show', *services,
-                 '--property=' + ','.join(UNIT_PROPERTIES + MEMORY_PROPERTIES), timeout=8)
+    result = ctl('show', *services, '--property=' + ','.join(
+        UNIT_PROPERTIES + MEMORY_PROPERTIES + RESULT_PROPERTIES), timeout=8)
     states = {}
     for block in result.stdout.strip().split('\n\n'):
         values = dict(line.split('=', 1) for line in block.splitlines() if '=' in line)
@@ -356,23 +373,100 @@ def disable_and_safe_factory():
             'unsafe override marker prevented verified boot block: ' + str(marker_error))
 
 
-def systemd_bytes(value):
-    """Parse a systemd byte count; '[not set]' or an absent property is unknown."""
+def systemd_unsigned(value):
+    """Parse a systemd byte count or number; '[not set]' or an absent property is unknown."""
     return int(value) if value.isascii() and value.isdecimal() else None
 
 
-def controller_memory(units):
-    """Report the active controller cgroup's memory; diagnostic only, never policy."""
+def unit_result(state, prefix):
+    """Report why a unit last stopped and how its main process ended; diagnostic only.
+
+    systemd keeps these on a failed unit. ExecMainCode is 0 while the main
+    process runs and before one has ended; code and status are then None.
+    """
+    code = MAIN_EXIT_CODES.get(systemd_unsigned(state.get('ExecMainCode', '')))
+    return {
+        prefix + '_result': state.get('Result') or None,
+        prefix + '_restarts': systemd_unsigned(state.get('NRestarts', '')),
+        prefix + '_main_code': code,
+        prefix + '_main_status': (
+            None if code is None else systemd_unsigned(state.get('ExecMainStatus', ''))),
+    }
+
+
+def locked_bytes(pid):
+    """Return a main process's locked memory (VmLck) in bytes, or None if unknown."""
+    number = systemd_unsigned(pid)
+    if not number:
+        return None
+    try:
+        with (PROC / str(number) / 'status').open('rb') as stream:
+            lines = stream.read().splitlines()
+    except OSError:
+        return None
+    for line in lines:
+        name, _, value = line.partition(b':')
+        if name == b'VmLck':
+            fields = value.split()
+            if len(fields) == 2 and fields[0].isdigit() and fields[1] == b'kB':
+                return int(fields[0]) * 1024
+            return None
+    return None
+
+
+def memory_min(cgroup):
+    """Read a cgroup's memory.min in bytes; 'max' protects everything."""
+    with (cgroup / 'memory.min').open('r', encoding='ascii') as stream:
+        text = stream.read().strip()
+    if text == 'max':
+        return math.inf
+    if not text.isdecimal():
+        raise ValueError(f'malformed memory.min in {cgroup}')
+    return int(text)
+
+
+def memory_min_effective(control_group):
+    """Say whether a unit's memory.min can protect it, or None if unknown.
+
+    The kernel limits a cgroup's protection to what each ancestor below the
+    root reserves: False when an ancestor's memory.min is below the unit's,
+    True when every ancestor's is at least the unit's, None when systemd names
+    no cgroup or a memory.min file cannot be read.
+    """
+    names = control_group.split('/')[1:]
+    if (not control_group.startswith('/') or not names or
+            any(name in ('', '.', '..') for name in names)):
+        return None
+    try:
+        unit, *ancestors = [memory_min(CGROUP_ROOT.joinpath(*names[:depth]))
+                            for depth in range(len(names), 0, -1)]
+    except (OSError, ValueError):
+        return None
+    return all(ancestor >= unit for ancestor in ancestors)
+
+
+def controller_memory(units, memory_files=False):
+    """Report the active controller cgroup's memory; diagnostic only, never policy.
+
+    memory_files adds the main process's locked memory and whether the unit's
+    MemoryMin can take effect, which read /proc and cgroup files besides the
+    systemctl reply.
+    """
     for service in (SERVICE, KEEPER):
         state = units[service]
         if state['ActiveState'] == 'active':
-            return {
+            memory = {
                 'unit': service,
-                'memory_current_bytes': systemd_bytes(state.get('MemoryCurrent', '')),
-                'memory_peak_bytes': systemd_bytes(state.get('MemoryPeak', '')),
-                'memory_swap_current_bytes': systemd_bytes(
+                'memory_current_bytes': systemd_unsigned(state.get('MemoryCurrent', '')),
+                'memory_peak_bytes': systemd_unsigned(state.get('MemoryPeak', '')),
+                'memory_swap_current_bytes': systemd_unsigned(
                     state.get('MemorySwapCurrent', '')),
             }
+            if memory_files:
+                memory['locked_bytes'] = locked_bytes(state.get('MainPID', ''))
+                memory['memory_min_effective'] = memory_min_effective(
+                    state.get('ControlGroup', ''))
+            return memory
     return None
 
 
@@ -381,8 +475,13 @@ def stable_configuration(snapshot):
             if key not in DYNAMIC_STATUS_KEYS}
 
 
-def full_status():
-    """Configuration snapshot; live telemetry and memory never affect activation."""
+def full_status(*, memory_files=False):
+    """Configuration snapshot; live telemetry and memory never affect activation.
+
+    Only status passes memory_files, for the snapshot it prints. The other
+    commands use their snapshot for checks alone, so none of them reads those
+    files ahead of a Boost request or a fail-safe.
+    """
     validated_identity = identity(monitoring=True)
     units = unit_states(SERVICE, KEEPER)
     primary, keeper = units[SERVICE], units[KEEPER]
@@ -418,7 +517,9 @@ def full_status():
         'ec_firmware': firmware,
         'driver_version': validated_identity[pathlib.Path('/sys/module/msi_ec/version')],
         'driver_srcversion': validated_identity[pathlib.Path('/sys/module/msi_ec/srcversion')],
-        'controller_memory': controller_memory(units),
+        'controller_memory': controller_memory(units, memory_files=memory_files),
+        **unit_result(primary, 'service'),
+        **unit_result(keeper, 'keeper'),
     }
 
 
@@ -519,7 +620,9 @@ def status():
     """Exit 0 for valid normal/cooling or factory override; 1 for degraded/stale."""
     first = full_status()
     time.sleep(.05)
-    second = full_status()
+    # Only the printed snapshot reads the memory files; DYNAMIC_STATUS_KEYS
+    # keeps them and the unit results out of the comparison.
+    second = full_status(memory_files=True)
     stable = stable_configuration(first) == stable_configuration(second)
     report = dict(second)
     report['snapshot_stable'] = stable

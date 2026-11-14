@@ -5,14 +5,16 @@
 ```console
 $ msi-fan-profile status
 {
-  "cooler_boost": "off",
   "configuration_valid": true,
   "controller_memory": {
+    "locked_bytes": 0,
     "memory_current_bytes": 12234752,
+    "memory_min_effective": false,
     "memory_peak_bytes": 13262848,
     "memory_swap_current_bytes": 0,
     "unit": "msi-fan-profile.service"
   },
+  "cooler_boost": "off",
   "curve": "candidate14",
   "driver_srcversion": "AB0BFAE2391B5ADD66E01BD",
   "driver_version": "0.13.1",
@@ -24,10 +26,23 @@ $ msi-fan-profile status
     "state": "normal",
     "status": "fresh"
   },
+  "keeper_active_state": "inactive",
+  "keeper_job": "",
+  "keeper_main_code": null,
+  "keeper_main_pid": 0,
+  "keeper_main_status": null,
+  "keeper_restarts": 0,
+  "keeper_result": "success",
+  "keeper_sub_state": "dead",
+  "recovery_boost_latched": false,
   "service_active_state": "active",
   "service_enabled": true,
   "service_job": "",
+  "service_main_code": null,
   "service_main_pid": 1234,
+  "service_main_status": null,
+  "service_restarts": 0,
+  "service_result": "success",
   "service_sub_state": "running",
   "shift_mode": "comfort",
   "snapshot_stable": true
@@ -36,6 +51,12 @@ $ msi-fan-profile status
 
 The PID naturally changes each boot. This excerpt omits the detailed health
 telemetry, per-channel errors, timestamps, latch ownership, and cooldown fields.
+`memory_min_effective` is `false` because `system.slice` reserves no memory for
+the unit's `MemoryMin`, and `locked_bytes` is `0` because neither the controller
+nor the keeper locks memory. The keeper's `keeper_main_code` and
+`keeper_main_status` stay `null` until the keeper has run in the current boot;
+once it has, they keep how its last process ended, also after `apply-default`.
+The Status section of `OPERATIONS.md` describes each key.
 
 ## Driver not loaded after a kernel update
 
@@ -111,6 +132,28 @@ If WMI RPM telemetry is invalid, the recovery log says that it could not certify
 physical RPM; it still does not intentionally restore the factory curve for the
 runtime fault. An identity mismatch is different: recovery makes no
 model-specific write because it cannot safely establish the exact hardware.
+
+`msi-fan-profile status` exits `1` in this state and says why the controller
+stopped. After a watchdog kill it includes:
+
+```json
+{
+  "keeper_active_state": "active",
+  "keeper_restarts": 0,
+  "keeper_result": "success",
+  "recovery_boost_latched": true,
+  "service_active_state": "failed",
+  "service_main_code": "killed",
+  "service_main_status": 9,
+  "service_result": "watchdog"
+}
+```
+
+After a memory-limit kill `service_result` is `oom-kill`. A fault the daemon
+detects itself ends with `exit-code`, `service_main_code` `exited` and
+`service_main_status` `1`. If the keeper also fails and reaches its start limit,
+`keeper_result` is `start-limit-hit` and `keeper_restarts` counts its automatic
+restarts.
 
 Inspect logs before releasing Boost:
 

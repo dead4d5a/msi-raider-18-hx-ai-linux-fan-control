@@ -19,11 +19,34 @@ publishes `/run/msi-fan-profile.health.json` as `root:root:0644`; the manager ch
 ownership, mode, inode, schema, PID, and a five-second freshness limit. Dynamic
 telemetry is not included in the stable configuration comparison.
 
+`service_result` and `keeper_result` are systemd's `Result` for the controller
+and for its keeper: `success`, or why the unit last failed, such as `watchdog`,
+`oom-kill`, `exit-code` (it exited non-zero, as the daemon does on a fault it
+detects itself), `signal` or `start-limit-hit` (systemd refused another start).
+`service_restarts` and `keeper_restarts` count systemd's automatic restarts
+(`NRestarts`); only the keeper restarts by itself, and its start limit is three
+starts in 15 minutes. `service_main_code` and `service_main_status`, and the
+same two `keeper_` keys, tell how the unit's last main process ended: `exited`
+with its exit status, or `killed` or `dumped` with the signal number. `9` is
+`SIGKILL`, which both a watchdog kill and an out-of-memory kill send. Both are
+`null` while that process runs and before one has ended. `apply-default`
+resets the failed state of both units, after which the results read `success`
+and the restart counts `0`; the keeper's `keeper_main_code` and
+`keeper_main_status` keep how its last process ended until it starts again. A
+key is `null` when systemd does not report its property. None of these keys
+enters the stable comparison or the exit status.
+
 `controller_memory` names the active unit (the controller or its keeper) and
 reports its cgroup's current, peak, and swap memory in bytes from the same
-batched `systemctl show` query. It is `null` when neither unit is active, and a
-value is `null` when systemd cannot report it. It is diagnostic only and never
-enters the stable comparison or the exit status. Both units have a hard
+batched `systemctl show` query. `locked_bytes` is the main process's locked
+memory (`VmLck` in `/proc/<pid>/status`); neither the controller nor the keeper
+locks memory, so it reads `0`. `memory_min_effective` says whether the unit's
+`MemoryMin=32M` can protect it: `true` when every ancestor cgroup below the
+root reserves at least as much in its `memory.min`, `false` when one reserves
+less, as `system.slice` does on a stock Ubuntu host. `controller_memory` is
+`null` when neither unit is active, and a value is `null` when systemd cannot
+report it or its file cannot be read. It is diagnostic only and never enters
+the stable comparison or the exit status. Both units have a hard
 `MemoryMax=64M` without swap, so a peak approaching 64 MiB foreshadows a
 memory-limit kill and keeper takeover.
 

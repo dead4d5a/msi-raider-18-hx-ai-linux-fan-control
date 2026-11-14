@@ -43,6 +43,14 @@ its section starts with a short summary, upgrade notes and known issues.
   reported slow acquisition logs nothing more. The keeper logs one such
   WARNING when a pass, with any overrun of the sleep before it, takes more than
   2 s; no decision and no health field uses these figures (ST-3).
+- `msi-fan-profile status` says why each unit last stopped: `service_result`
+  and `keeper_result` give systemd's `Result`, such as `watchdog`, `oom-kill`
+  or `exit-code`, `service_restarts` and `keeper_restarts` its restart count,
+  and `service_main_code` and `service_main_status`, with the same two
+  `keeper_` keys, how the last main process ended. `controller_memory` gains
+  `locked_bytes` and `memory_min_effective`, which is `false` when an ancestor
+  cgroup reserves less than the unit's `MemoryMin`, as on the validation host;
+  none of the new keys enters the exit status or the stable comparison (ST-4).
 
 ## 0.2.0 - 2026-10-11
 

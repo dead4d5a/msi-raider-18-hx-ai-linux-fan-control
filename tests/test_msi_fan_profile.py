@@ -33,7 +33,7 @@ def load_manager():
 MANAGER = load_manager()
 HOST_PATH_PREFIXES = ("/run/", "/sys/", "/proc/", "/dev/", "/etc/", "/var/")
 RELOCATED_PATHS = ("BASE", "OVERRIDE", "ACK", "HEALTH", "RECOVERY_LATCH",
-                   "MANAGER_LOCK", "FAN_LOCK")
+                   "MANAGER_LOCK", "FAN_LOCK", "PROC", "CGROUP_ROOT")
 
 
 class HardwareIsolatedTestCase(unittest.TestCase):
@@ -57,7 +57,7 @@ class HardwareIsolatedTestCase(unittest.TestCase):
         leaked = sorted(
             name for name, value in vars(MANAGER).items()
             if isinstance(value, pathlib.PurePath) and
-            str(value).startswith(HOST_PATH_PREFIXES) and not value.is_relative_to(runtime))
+            f"{value}/".startswith(HOST_PATH_PREFIXES) and not value.is_relative_to(runtime))
         self.assertEqual(leaked, [], "relocate new host path constants in setUp")
         self.unmocked_commands = []
 
@@ -442,7 +442,8 @@ class BatchedUnitStateTests(HardwareIsolatedTestCase):
             states = MANAGER.unit_states(MANAGER.SERVICE)
         ctl.assert_called_once()
         self.assertIn('--property=Id,ActiveState,SubState,MainPID,Job,UnitFileState,'
-                      'MemoryCurrent,MemoryPeak,MemorySwapCurrent', ctl.call_args.args)
+                      'MemoryCurrent,MemoryPeak,MemorySwapCurrent,ControlGroup,'
+                      'Result,NRestarts,ExecMainCode,ExecMainStatus', ctl.call_args.args)
         self.assertEqual(states[MANAGER.SERVICE]['MainPID'], '17')
         self.assertNotIn('MemoryCurrent', states[MANAGER.SERVICE])
 
@@ -493,6 +494,369 @@ class ControllerMemoryTests(HardwareIsolatedTestCase):
         report = json.loads(output.getvalue())
         self.assertTrue(report['snapshot_stable'])
         self.assertEqual(report['controller_memory']['memory_current_bytes'], 2)
+
+
+def unit_reply(name, active, *, pid='0', **properties):
+    """Return one unit's block of a fake systemctl show reply."""
+    sub_state = {'active': 'running', 'inactive': 'dead', 'failed': 'failed'}[active]
+    unit_file = 'enabled' if name == MANAGER.SERVICE else 'static'
+    lines = [f'Id={name}', f'ActiveState={active}', f'SubState={sub_state}',
+             f'MainPID={pid}', 'Job=', f'UnitFileState={unit_file}']
+    lines += [f'{key}={value}' for key, value in properties.items()]
+    return '\n'.join(lines) + '\n'
+
+
+def write_memory_min(control_group, value):
+    """Give a cgroup under the relocated root a memory.min; return that file."""
+    directory = MANAGER.CGROUP_ROOT.joinpath(*control_group.strip('/').split('/'))
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / 'memory.min').write_text(value + '\n')
+    return directory / 'memory.min'
+
+
+def write_proc_status(pid, content):
+    """Give a process under the relocated /proc a status file."""
+    directory = MANAGER.PROC / pid
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / 'status').write_bytes(content)
+    return directory / 'status'
+
+
+SERVICE_CGROUP ='/system.slice/msi-fan-profile.service'
+KEEPER_CGROUP = '/system.slice/msi-fan-profile-keeper.service'
+# After a watchdog kill: the failed primary's ExecStopPost staged full cooling
+# and its OnFailure keeper holds it.
+WATCHDOG_TAKEOVER = '\n'.join((
+    unit_reply(MANAGER.SERVICE, 'failed', Result='watchdog', NRestarts='0',
+               ExecMainCode='2', ExecMainStatus='9', ControlGroup=''),
+    unit_reply(MANAGER.KEEPER, 'active', pid='18', Result='success', NRestarts='0',
+               ExecMainCode='0', ExecMainStatus='0', ControlGroup=KEEPER_CGROUP)))
+# What 0.2.0 compares between the two status snapshots.
+CONFIGURATION_KEYS = {
+    'service_enabled', 'service_active_state', 'service_sub_state', 'service_main_pid',
+    'service_job', 'keeper_active_state', 'keeper_sub_state', 'keeper_main_pid',
+    'keeper_job', 'factory_override', 'recovery_boost_latched', 'curve', 'fan_mode',
+    'cooler_boost', 'shift_mode', 'ec_firmware', 'driver_version', 'driver_srcversion',
+}
+# Why each unit last stopped; reported, but never compared.
+UNIT_DIAGNOSTIC_KEYS = (
+    'service_result', 'service_restarts', 'service_main_code', 'service_main_status',
+    'keeper_result', 'keeper_restarts', 'keeper_main_code', 'keeper_main_status')
+
+
+class UnitDiagnosticsTestCase(HardwareIsolatedTestCase):
+    """Run the real snapshot and status code against a fake systemctl reply."""
+
+    def run_manager(self, reply, command, *, boost='on', latched=False):
+        identity = {
+            MANAGER.BASE / 'fw_version': '1824EMS1.108',
+            pathlib.Path('/sys/module/msi_ec/version'): '0.13.1',
+            pathlib.Path('/sys/module/msi_ec/srcversion'): 'AB0BFAE2391B5ADD66E01BD'}
+        with mock.patch.object(MANAGER, 'identity', return_value=identity), \
+                mock.patch.object(MANAGER, 'ctl', return_value=mock.Mock(stdout=reply)) as ctl, \
+                mock.patch.object(MANAGER, 'hw', return_value={
+                    'curve': 'candidate14', 'mode': 'advanced', 'boost': boost}), \
+                mock.patch.object(MANAGER, 'read', return_value='comfort'), \
+                mock.patch.object(MANAGER, 'marker', return_value=False), \
+                mock.patch.object(MANAGER, 'recovery_latch_metadata', return_value=latched), \
+                mock.patch.object(MANAGER, 'health_snapshot', return_value={
+                    'status': 'fresh', 'state': 'normal'}), \
+                mock.patch.object(MANAGER.time, 'sleep'), \
+                contextlib.redirect_stdout(io.StringIO()) as output:
+            try:
+                return command()
+            finally:
+                self.ctl_calls = [call.args for call in ctl.call_args_list]
+                self.output = output.getvalue()
+
+    def run_status(self, reply, **kwargs):
+        code = self.run_manager(reply, MANAGER.status, **kwargs)
+        return code, json.loads(self.output)
+
+
+class UnitResultTests(UnitDiagnosticsTestCase):
+    def test_failed_primary_reports_the_watchdog_result_and_the_kill(self):
+        code, report = self.run_status(WATCHDOG_TAKEOVER, latched=True)
+        self.assertEqual(code, 1)
+        self.assertEqual(
+            (report['service_result'], report['service_restarts'],
+             report['service_main_code'], report['service_main_status']),
+            ('watchdog', 0, 'killed', 9))
+        # The keeper's main process is still running, so it has not ended.
+        self.assertEqual(
+            (report['keeper_result'], report['keeper_restarts'],
+             report['keeper_main_code'], report['keeper_main_status']),
+            ('success', 0, None, None))
+        self.assertTrue(report['snapshot_stable'])
+        self.assertFalse(report['configuration_valid'])
+        self.assertEqual(len(self.ctl_calls), 2, 'the results need no extra systemctl call')
+
+    def test_restart_count_and_the_end_of_the_last_process_come_from_systemd(self):
+        # Both units failed: the keeper's own watchdog killed it, systemd
+        # restarted it, and then refused another start.
+        reply = '\n'.join((
+            unit_reply(MANAGER.SERVICE, 'failed', Result='watchdog', NRestarts='0',
+                       ExecMainCode='2', ExecMainStatus='9'),
+            unit_reply(MANAGER.KEEPER, 'failed', Result='start-limit-hit', NRestarts='2',
+                       ExecMainCode='2', ExecMainStatus='9')))
+        snapshot = self.run_manager(reply, MANAGER.full_status, latched=True)
+        self.assertEqual(
+            (snapshot['keeper_result'], snapshot['keeper_restarts'],
+             snapshot['keeper_main_code'], snapshot['keeper_main_status']),
+            ('start-limit-hit', 2, 'killed', 9))
+        for result, code, status, expected in (
+                ('exit-code', '1', '1', ('exited', 1)), ('success', '1', '0', ('exited', 0)),
+                ('oom-kill', '2', '9', ('killed', 9)), ('signal', '2', '15', ('killed', 15)),
+                ('core-dump', '3', '6', ('dumped', 6))):
+            with self.subTest(result=result):
+                reply = '\n'.join((
+                    unit_reply(MANAGER.SERVICE, 'failed', Result=result, NRestarts='0',
+                               ExecMainCode=code, ExecMainStatus=status),
+                    unit_reply(MANAGER.KEEPER, 'inactive')))
+                snapshot = self.run_manager(reply, MANAGER.full_status)
+                self.assertEqual(snapshot['service_result'], result)
+                self.assertEqual(
+                    (snapshot['service_main_code'], snapshot['service_main_status']), expected)
+
+    def test_missing_or_unparsable_properties_are_null_not_an_error(self):
+        complete, _ = self.run_status(WATCHDOG_TAKEOVER, latched=True)
+        absent = '\n'.join((unit_reply(MANAGER.SERVICE, 'failed'),
+                            unit_reply(MANAGER.KEEPER, 'active', pid='18')))
+        code, report = self.run_status(absent, latched=True)
+        self.assertEqual(code, complete)
+        for key in UNIT_DIAGNOSTIC_KEYS:
+            with self.subTest(key=key):
+                self.assertIsNone(report[key])
+        self.assertIsNone(report['controller_memory']['memory_min_effective'])
+        self.assertIsNone(report['controller_memory']['locked_bytes'])
+
+        unparsable = '\n'.join((
+            unit_reply(MANAGER.SERVICE, 'failed', Result='', NRestarts='[not set]',
+                       ExecMainCode='7', ExecMainStatus='9'),
+            unit_reply(MANAGER.KEEPER, 'active', pid='18', NRestarts='-1',
+                       ExecMainCode='2', ExecMainStatus='x')))
+        code, report = self.run_status(unparsable, latched=True)
+        self.assertEqual(code, complete)
+        self.assertEqual(
+            [report[key] for key in UNIT_DIAGNOSTIC_KEYS],
+            [None, None, None, None, None, None, 'killed', None])
+
+
+class UnitDiagnosticsExitStatusTests(UnitDiagnosticsTestCase):
+    def test_the_comparison_keeps_the_configuration_keys_and_no_new_one(self):
+        snapshot = self.run_manager(WATCHDOG_TAKEOVER, MANAGER.full_status, latched=True)
+        self.assertEqual(set(MANAGER.stable_configuration(snapshot)), CONFIGURATION_KEYS)
+        self.assertEqual(set(snapshot) - CONFIGURATION_KEYS, set(MANAGER.DYNAMIC_STATUS_KEYS))
+        self.assertEqual(set(MANAGER.DYNAMIC_STATUS_KEYS),
+                         {'controller_memory', *UNIT_DIAGNOSTIC_KEYS})
+        diagnostics = (set(MANAGER.unit_result({}, 'service')) |
+                       set(MANAGER.unit_result({}, 'keeper')))
+        self.assertEqual(diagnostics, set(UNIT_DIAGNOSTIC_KEYS))
+
+    def test_unit_results_never_change_the_exit_status_or_the_stability(self):
+        override = managed_snapshot()
+        override.update(service_active_state='inactive', service_sub_state='dead',
+                        service_main_pid=0, factory_override=True, curve='factory',
+                        fan_mode='auto', cooler_boost='off')
+        takeover = managed_snapshot()
+        takeover.update(service_active_state='failed', service_sub_state='failed',
+                        service_main_pid=0, keeper_active_state='active',
+                        keeper_sub_state='running', keeper_main_pid=18,
+                        recovery_boost_latched=True)
+        quiet = {'service_result': 'success', 'service_restarts': 0,
+                 'service_main_code': None, 'service_main_status': None,
+                 'keeper_result': 'success', 'keeper_restarts': 0,
+                 'keeper_main_code': None, 'keeper_main_status': None}
+        loud = {'service_result': 'watchdog', 'service_restarts': 1,
+                'service_main_code': 'killed', 'service_main_status': 9,
+                'keeper_result': 'start-limit-hit', 'keeper_restarts': 2,
+                'keeper_main_code': 'killed', 'keeper_main_status': 9}
+        for label, snapshot, expected in (('managed', managed_snapshot(), 0),
+                                           ('factory override', override, 0),
+                                           ('keeper takeover', takeover, 1)):
+            for first, second in (({}, {}), (quiet, loud), (loud, quiet), (loud, loud)):
+                with self.subTest(label, first=first, second=second), \
+                        mock.patch.object(MANAGER, 'full_status', side_effect=[
+                            {**snapshot, **first}, {**snapshot, **second}]), \
+                        mock.patch.object(MANAGER, 'health_snapshot', return_value={
+                            'status': 'fresh', 'state': 'normal'}), \
+                        mock.patch.object(MANAGER.time, 'sleep'), \
+                        contextlib.redirect_stdout(io.StringIO()) as output:
+                    self.assertEqual(MANAGER.status(), expected)
+                    report = json.loads(output.getvalue())
+                    self.assertTrue(report['snapshot_stable'])
+                    self.assertEqual(report['configuration_valid'], expected == 0)
+
+    def test_a_configuration_change_between_snapshots_is_still_unstable(self):
+        for key in managed_snapshot():
+            first, second = managed_snapshot(), managed_snapshot()
+            value = second[key]
+            second[key] = (not value if isinstance(value, bool) else
+                           value + 1 if isinstance(value, int) else value + '-changed')
+            with self.subTest(key=key), \
+                    mock.patch.object(MANAGER, 'full_status', side_effect=[first, second]), \
+                    mock.patch.object(MANAGER, 'health_snapshot', return_value={
+                        'status': 'fresh', 'state': 'normal'}), \
+                    mock.patch.object(MANAGER.time, 'sleep'), \
+                    contextlib.redirect_stdout(io.StringIO()) as output:
+                self.assertEqual(MANAGER.status(), 1)
+                self.assertFalse(json.loads(output.getvalue())['snapshot_stable'])
+
+
+class MemoryProtectionTests(HardwareIsolatedTestCase):
+    def test_a_unit_protection_under_a_parent_without_one_is_not_effective(self):
+        # The validation host: system.slice reserves nothing for MemoryMin=32M.
+        write_memory_min('/system.slice', '0')
+        write_memory_min(SERVICE_CGROUP, '33554432')
+        self.assertIs(MANAGER.memory_min_effective(SERVICE_CGROUP), False)
+
+    def test_effective_only_when_every_ancestor_below_the_root_reserves_enough(self):
+        unit = '/a.slice/a-b.slice/msi-fan-profile.service'
+        for outer, inner, own, expected in (
+                ('max', '33554432', '33554432', True), ('67108864', 'max', '33554432', True),
+                ('max', '16777216', '33554432', False), ('0', 'max', '33554432', False),
+                ('max', 'max', 'max', True), ('67108864', 'max', 'max', False)):
+            with self.subTest(outer=outer, inner=inner, own=own):
+                write_memory_min('/a.slice', outer)
+                write_memory_min('/a.slice/a-b.slice', inner)
+                write_memory_min(unit, own)
+                self.assertIs(MANAGER.memory_min_effective(unit), expected)
+        # cgroup v2 has no memory.min in the root; one there is not an ancestor's.
+        (MANAGER.CGROUP_ROOT / 'memory.min').write_text('0\n')
+        write_memory_min('/a.slice', 'max')
+        self.assertIs(MANAGER.memory_min_effective(unit), True)
+
+    def test_unreadable_or_malformed_cgroup_files_are_unknown(self):
+        parent = write_memory_min('/system.slice', '0')
+        own = write_memory_min(SERVICE_CGROUP, '33554432')
+        parent.unlink()
+        self.assertIsNone(MANAGER.memory_min_effective(SERVICE_CGROUP))
+        parent.mkdir()  # Even root cannot read a directory as the file.
+        self.assertIsNone(MANAGER.memory_min_effective(SERVICE_CGROUP))
+        parent.rmdir()
+        for content in (b'', b'-1\n', b'32M\n', b'1 2\n', b'\xff\n'):
+            with self.subTest(content=content):
+                parent.write_bytes(content)
+                self.assertIsNone(MANAGER.memory_min_effective(SERVICE_CGROUP))
+        parent.write_text('max\n')
+        own.write_bytes(b'\xff\n')
+        self.assertIsNone(MANAGER.memory_min_effective(SERVICE_CGROUP))
+        own.write_text('33554432\n')
+        self.assertIs(MANAGER.memory_min_effective(SERVICE_CGROUP), True)
+        with mock.patch.object(MANAGER.pathlib.Path, 'open',
+                               side_effect=PermissionError(13, 'Permission denied')):
+            self.assertIsNone(MANAGER.memory_min_effective(SERVICE_CGROUP))
+
+    def test_an_absent_or_unusable_control_group_is_unknown_without_a_read(self):
+        with mock.patch.object(MANAGER, 'memory_min') as read_min:
+            for value in ('', '/', 'system.slice/msi-fan-profile.service', '/system.slice/',
+                          '/system.slice//msi-fan-profile.service', '/system.slice/../etc',
+                          '/./system.slice'):
+                with self.subTest(control_group=value):
+                    self.assertIsNone(MANAGER.memory_min_effective(value))
+        read_min.assert_not_called()
+
+
+class LockedMemoryTests(HardwareIsolatedTestCase):
+    def test_locked_memory_is_vmlck_in_bytes(self):
+        write_proc_status('17', b'Name:\tmsi-fan-profile\nVmPeak:\t   41000 kB\n'
+                                b'VmLck:\t       0 kB\nVmPin:\t       0 kB\n')
+        self.assertEqual(MANAGER.locked_bytes('17'), 0)
+        # A process name is not necessarily ASCII.
+        write_proc_status('17', b'Name:\t\xff\xfe\nVmLck:\t   26624 kB\n')
+        self.assertEqual(MANAGER.locked_bytes('17'), 26624 * 1024)
+
+    def test_a_missing_or_malformed_status_file_is_unknown(self):
+        self.assertIsNone(MANAGER.locked_bytes('17'))
+        for content in (b'Name:\tkthreadd\n', b'VmLck:\t x kB\n', b'VmLck:\t 5 MB\n',
+                        b'VmLck:\n', b'VmLck:\t -1 kB\n', b'VmLck:\t 1 kB extra\n'):
+            with self.subTest(content=content):
+                status_file = write_proc_status('17', content)
+                self.assertIsNone(MANAGER.locked_bytes('17'))
+        status_file.unlink()
+        status_file.mkdir()  # Even root cannot read a directory as the file.
+        self.assertIsNone(MANAGER.locked_bytes('17'))
+
+    def test_no_main_process_is_unknown_without_a_read(self):
+        with mock.patch.object(MANAGER.pathlib.Path, 'open') as open_file:
+            for pid in ('0', '', '-1', '17x', '../17', '[not set]'):
+                with self.subTest(pid=pid):
+                    self.assertIsNone(MANAGER.locked_bytes(pid))
+        open_file.assert_not_called()
+
+
+class MemoryDiagnosticsStatusTests(UnitDiagnosticsTestCase):
+    def test_status_reports_locked_memory_and_an_ineffective_memory_min(self):
+        # The report expected on the validation host after the upgrade.
+        write_memory_min('/system.slice', '0')
+        write_memory_min(SERVICE_CGROUP, '33554432')
+        write_proc_status('17', b'VmLck:\t       0 kB\n')
+        reply = '\n'.join((
+            unit_reply(MANAGER.SERVICE, 'active', pid='17', MemoryCurrent='12234752',
+                       MemoryPeak='13262848', MemorySwapCurrent='0',
+                       ControlGroup=SERVICE_CGROUP, Result='success', NRestarts='0',
+                       ExecMainCode='0', ExecMainStatus='0'),
+            unit_reply(MANAGER.KEEPER, 'inactive', ControlGroup='', Result='success',
+                       NRestarts='0', ExecMainCode='2', ExecMainStatus='9')))
+        code, report = self.run_status(reply, boost='off')
+        self.assertEqual(code, 0)
+        self.assertEqual(report['controller_memory'], {
+            'unit': MANAGER.SERVICE, 'memory_current_bytes': 12234752,
+            'memory_peak_bytes': 13262848, 'memory_swap_current_bytes': 0,
+            'locked_bytes': 0, 'memory_min_effective': False})
+        self.assertEqual((report['service_result'], report['service_main_code']),
+                         ('success', None))
+        # apply-default reset the keeper's failure; how its last process ended stays.
+        self.assertEqual(
+            (report['keeper_result'], report['keeper_restarts'],
+             report['keeper_main_code'], report['keeper_main_status']),
+            ('success', 0, 'killed', 9))
+
+    def test_an_active_keeper_reports_its_own_process_and_cgroup(self):
+        write_memory_min('/system.slice', 'max')
+        write_memory_min(KEEPER_CGROUP, '33554432')
+        write_proc_status('18', b'VmLck:\t       4 kB\n')
+        code, report = self.run_status(WATCHDOG_TAKEOVER, latched=True)
+        self.assertEqual(code, 1)
+        memory = report['controller_memory']
+        self.assertEqual((memory['unit'], memory['locked_bytes'], memory['memory_min_effective']),
+                         (MANAGER.KEEPER, 4096, True))
+
+    def test_only_the_printed_status_snapshot_reads_the_memory_files(self):
+        reply = '\n'.join((
+            unit_reply(MANAGER.SERVICE, 'active', pid='17', ControlGroup=SERVICE_CGROUP),
+            unit_reply(MANAGER.KEEPER, 'inactive')))
+        with mock.patch.object(MANAGER, 'locked_bytes', return_value=0) as locked, \
+                mock.patch.object(MANAGER, 'memory_min_effective',
+                                  return_value=False) as protection:
+            # apply-default and factory-auto check this default snapshot.
+            snapshot = self.run_manager(reply, MANAGER.full_status, boost='off')
+            self.assertNotIn('locked_bytes', snapshot['controller_memory'])
+            self.assertNotIn('memory_min_effective', snapshot['controller_memory'])
+            locked.assert_not_called()
+            protection.assert_not_called()
+            code, report = self.run_status(reply, boost='off')
+        self.assertEqual(code, 0)
+        locked.assert_called_once_with('17')
+        protection.assert_called_once_with(SERVICE_CGROUP)
+        self.assertEqual(report['controller_memory']['locked_bytes'], 0)
+        self.assertIs(report['controller_memory']['memory_min_effective'], False)
+
+    def test_boost_on_sends_its_request_without_reading_the_memory_files(self):
+        reply = '\n'.join((
+            unit_reply(MANAGER.SERVICE, 'active', pid='17', ControlGroup=SERVICE_CGROUP),
+            unit_reply(MANAGER.KEEPER, 'inactive')))
+        unexpected = AssertionError('memory file read ahead of the Boost request')
+        with mock.patch.object(MANAGER, 'root'), \
+                mock.patch.object(MANAGER, 'lock', return_value=9), \
+                mock.patch.object(MANAGER.os, 'close'), \
+                mock.patch.object(MANAGER, 'wait_for_request') as wait, \
+                mock.patch.object(MANAGER, 'locked_bytes', side_effect=unexpected), \
+                mock.patch.object(MANAGER, 'memory_min_effective', side_effect=unexpected):
+            self.run_manager(reply, lambda: MANAGER.signal_action(
+                'boost-on', MANAGER.signal.SIGUSR1, 25), boost='off')
+        self.assertEqual(self.ctl_calls[-1][:2], ('kill', '--kill-whom=main'))
+        wait.assert_called_once()
 
 
 class StatusReadBudgetTests(HardwareIsolatedTestCase):
@@ -592,9 +956,12 @@ class StatusReadBudgetTests(HardwareIsolatedTestCase):
         self.assertEqual(reads[MANAGER.BASE / 'fan_curve'], 2)
         self.assertTrue(snapshot['snapshot_stable'])
         self.assertTrue(snapshot['configuration_valid'])
+        # The fake reply has no ControlGroup and the relocated /proc no status
+        # file, so the two file-based values are unknown, not an error.
         self.assertEqual(snapshot['controller_memory'], {
             'unit': MANAGER.SERVICE, 'memory_current_bytes': 12_238_848,
-            'memory_peak_bytes': 13_262_848, 'memory_swap_current_bytes': 0})
+            'memory_peak_bytes': 13_262_848, 'memory_swap_current_bytes': 0,
+            'locked_bytes': None, 'memory_min_effective': None})
 
     def test_new_abi_status_uses_one_snapshot_and_no_legacy_control_reads(self):
         reads, calls, snapshot = self.exercise_status(twice=False, snapshot_driver=True)
