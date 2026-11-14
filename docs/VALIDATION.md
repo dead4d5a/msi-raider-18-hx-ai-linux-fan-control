@@ -202,10 +202,9 @@ the full log is in the export.
   the start (`Start request repeated too quickly`; the limit is three starts in
   15 minutes). From then on no process supervised the fans, for 9 h 35 min: the
   EC stayed at Candidate 14 in `advanced` mode with Cooler Boost on, last
-  verified by the keeper at 6,153/6,400 RPM, until the operator ran
-  `sudo msi-fan-profile apply-default`. That started the daemon with the
-  recovery latch; the daemon released Cooler Boost after its 30-second
-  cooldown, and `msi-fan-profile status` exited `0`.
+  verified by the keeper at 6,153/6,400 RPM, until the daemon was started
+  again at 18:44:44, with the recovery latch; the daemon released Cooler Boost
+  after its 30-second cooldown, and `msi-fan-profile status` exited `0`.
 
 Neither the kill of 2026-11-10 nor that of 2026-11-13 was a fault of the
 daemon. Full cooling held both times; on 2026-11-13 supervision did not. 0.2.1
@@ -267,7 +266,7 @@ Each entry names the test that closes it.
   hands over to the keeper; and a second failure in the same boot. The kill
   and the hand-back are rehearsed once on 0.2.1 when it is deployed (ST-6). The
   watchdog kills of 2026-11-10 and 2026-11-13 exercised v0.2.0 up to the
-  keeper, and on 2026-11-13 `apply-default` started the daemon with the
+  keeper, and on 2026-11-13 the daemon was started again with the
   recovery latch after the keeper had stopped at its start limit. No hand-back
   from an active keeper is recorded for v0.2.0, and field events do not
   replace an attended, injected fault.

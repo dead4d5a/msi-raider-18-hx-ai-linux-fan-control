@@ -23,7 +23,7 @@ ded2668f6553c3879f8f3eb8ab3610b3dbde452f787187d5f10efefc2590f280  ./docs/INSTALL
 4815c16e5e409c029aa7dd00efd80040960ea689cf4e782e41295f367efbd9aa  ./docs/PROFILE.md
 2fc99db9b85782d84984c07b3c8fec2a0fa5305f87057328c55bac00d11883eb  ./docs/ROLLBACK.md
 08b564e97b10cab12cb2d56baf12881f174a2af2abcb7ac6597df561214f361e  ./docs/SAFETY.md
-c4663186a96bc04626297c8e87d84edf56a930a5fd735dda953f26f171f288b2  ./docs/VALIDATION.md
+b8ca4623baa29e9e8faa1ba02ae921c86b5d1fb5dc8d2ee70e0c02b4524281fd  ./docs/VALIDATION.md
 d3858dfc3ed367dbbefd03f11e483019a47fd25335f44bfb8103de335efa75f8  ./kernel/postinst.d/zz-msi-fan-profile-readiness
 0b27ad8fb03613fe3bdbdc39598dc59c438c30f78c311eb125076f7562069f37  ./patches/msi-ec-0.13.1-exact-fan-curve.patch
 16b421b04dd40a3b26f14438a8f95f83c2602692ac8700d40ccc5c6e5bb14a2d  ./patches/msi-ec-0.13.1-legacy-fan-curve.patch
