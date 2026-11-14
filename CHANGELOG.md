@@ -13,6 +13,14 @@ ends with its roadmap item ID in parentheses, and with its issue number too
 once that issue exists: `(ST-1)`, later `(ST-1, #N)`. When a version is cut,
 its section starts with a short summary, upgrade notes and known issues.
 
+### Added
+
+- `docs/AUDIT.md` records what became of each of the 46 findings and 10
+  review gaps of the October 2026 audit: its severity after the audit's
+  verification pass, one disposition and an anchor that can be checked, such
+  as a commit, a file and line or a CI run. A row whose work is not finished
+  reads open and names the roadmap item that carries it (LD-1).
+
 ## 0.2.1
 
 Hotfix for the watchdog kills of 2026-11-10 and 2026-11-13, in which a
