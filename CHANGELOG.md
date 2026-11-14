@@ -17,12 +17,12 @@ its section starts with a short summary, upgrade notes and known issues.
 
 - `docs/VALIDATION.md` no longer names `6ed5498` as the deployed release. It
   records the unattended field evidence of v0.2.0 from 2026-10-18 to
-  2026-11-11 with the digest of its journal export, and the fan-2 limitation
-  of 0.2.x with the evidence level of each statement; each Pending entry names
-  the test that closes it, and suspend and resume, curve optimality and a
-  thermal ceiling, battery operation, uninstall and fresh installation on real
-  hardware, and concurrent kernel-store tests are listed under Not claimed
-  (VA-3).
+  2026-11-13 with the digests of its two journal exports, and the fan-2
+  limitation of 0.2.x with the evidence level of each statement; each Pending
+  entry names the test that closes it, and suspend and resume, curve
+  optimality and a thermal ceiling, battery operation, uninstall and fresh
+  installation on real hardware, and concurrent kernel-store tests are listed
+  under Not claimed (VA-3).
 
 ## 0.2.1
 

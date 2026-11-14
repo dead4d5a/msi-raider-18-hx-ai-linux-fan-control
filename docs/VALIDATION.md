@@ -147,15 +147,18 @@ log is in the export.
   v0.2.0 only. Injecting the sentinel would need a raw EC write, which this
   project does not support (`SECURITY.md`), so a later release that changes
   this path rests on its unit tests until such an event occurs on it.
-- 2026-10-24, 16:20:28 and 16:20:30: two monitoring gaps. Each latched Cooler
-  Boost and reset the cooldown, and the second pass logged
+- 2026-10-24, 16:20:28 and 16:20:30: two monitoring gaps, each in the same
+  second as a host-wide out-of-memory kill in the kernel's lines, which give
+  whole seconds only. Each latched Cooler Boost and reset the cooldown, and
+  the second pass logged
   `sensor telemetry recovered; Cooler Boost remains latched until monitored cooldown completes`.
   The journal holds no later line from that boot, so it does not show the
   release; the next boot applied Candidate 14 at 16:21:44.
-- 2026-10-30, 22:52:03: one monitoring gap, handled the same way. The automatic
-  latch released Cooler Boost at 22:52:33, after its 30-second cooldown, and a
-  clean stop 11 s later logged the same release confirmation, after 5.0 s, and
-  left thermally verified factory auto/off.
+- 2026-10-30, 22:52:03: one monitoring gap, again in the same second as a
+  host-wide out-of-memory kill, and handled the same way. The automatic latch
+  released Cooler Boost at 22:52:33, after its 30-second cooldown, and a clean
+  stop 11 s later logged the same release confirmation, after 5.0 s, and left
+  thermally verified factory auto/off.
 - 2026-11-01, kernel installation: the readiness hook logged 12 `PASS` lines
   and `KERNEL READINESS PASSED: 7.0.0-42-generic`. The first boot of that kernel
   (`wtmp` boot list) followed the kill of 2026-11-10 (next entry). The retained
@@ -175,8 +178,9 @@ log is in the export.
 This is field evidence for v0.2.0, unattended, on the same driver, from a
 later journal export of 2026-11-13 (America/Denver), which also stays on the
 validation host. From the journal, the entries use the lines of both units and
-of the kernel's out-of-memory killer; from outside it, the recorded exit code
-of `msi-fan-profile status`. The export's units log has SHA-256
+of the kernel's out-of-memory killer; from outside it, the operator's account
+of the command run at 18:44 on 2026-11-13 and the recorded exit code of
+`msi-fan-profile status`. The export's units log has SHA-256
 `90034453805bdd0da74a221d607c4c2a998fbb6dafea7b46dd119b84f355b3b6`, and its
 manifest `SHA256SUMS`, with the SHA-256 of every other file, has SHA-256
 `390b3db64b162401bcfdea14de715386e891081182f1bec86636b5d1c8a697e0`.
@@ -202,9 +206,10 @@ the full log is in the export.
   the start (`Start request repeated too quickly`; the limit is three starts in
   15 minutes). From then on no process supervised the fans, for 9 h 35 min: the
   EC stayed at Candidate 14 in `advanced` mode with Cooler Boost on, last
-  verified by the keeper at 6,153/6,400 RPM, until the daemon was started
-  again at 18:44:44, with the recovery latch; the daemon released Cooler Boost
-  after its 30-second cooldown, and `msi-fan-profile status` exited `0`.
+  verified by the keeper at 6,153/6,400 RPM, until the operator ran
+  `sudo msi-fan-profile apply-default`, which started the daemon at 18:44:44
+  with the recovery latch; the daemon released Cooler Boost after its
+  30-second cooldown, and `msi-fan-profile status` exited `0`.
 
 Neither the kill of 2026-11-10 nor that of 2026-11-13 was a fault of the
 daemon. Full cooling held both times; on 2026-11-13 supervision did not. 0.2.1
@@ -266,7 +271,7 @@ Each entry names the test that closes it.
   hands over to the keeper; and a second failure in the same boot. The kill
   and the hand-back are rehearsed once on 0.2.1 when it is deployed (ST-6). The
   watchdog kills of 2026-11-10 and 2026-11-13 exercised v0.2.0 up to the
-  keeper, and on 2026-11-13 the daemon was started again with the
+  keeper, and on 2026-11-13 `apply-default` started the daemon with the
   recovery latch after the keeper had stopped at its start limit. No hand-back
   from an active keeper is recorded for v0.2.0, and field events do not
   replace an attended, injected fault.
