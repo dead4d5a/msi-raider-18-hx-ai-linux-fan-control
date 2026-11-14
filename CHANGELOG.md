@@ -58,10 +58,10 @@ the accepted driver builds are those of 0.2.0.
   a watchdog kill").
 - If the recovery helper or the keeper is killed between creating
   `/run/msi-fan-profile.recovery-boost` and writing its payload, it leaves an
-  empty file that no command of this release removes: the daemon then refuses
-  to start, the keeper exits at every start, and `apply-default` fails.
-  `factory-auto`, and an upgrade, which hands over through it, must not be run
-  in that state (`docs/OPERATIONS.md`, "Torn recovery latch").
+  empty file that no `msi-fan-profile` command removes: the daemon then
+  refuses to start, the keeper exits at every start, and `apply-default`
+  fails. `factory-auto`, and an upgrade, which hands over through it, must not
+  be run in that state (`docs/OPERATIONS.md`, "Torn recovery latch").
 - Fan 2, the GPU-side fan, still runs one step below the Candidate 14 table
   while the machine warms up: about 3,750 instead of 4,330 RPM at a GPU
   temperature of 44 to 54 °C (observed). The driver writes the six rising

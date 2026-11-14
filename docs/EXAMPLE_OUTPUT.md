@@ -152,8 +152,9 @@ stopped. After a watchdog kill it includes:
 After a memory-limit kill `service_result` is `oom-kill`. A fault the daemon
 detects itself ends with `exit-code`, `service_main_code` `exited` and
 `service_main_status` `1`. If the keeper also fails and reaches its start limit,
-`keeper_result` is `start-limit-hit` and `keeper_restarts` counts its automatic
-restarts.
+`keeper_active_state` is `failed`, `keeper_restarts` counts the refused restart
+too, `3` after three starts, and `keeper_result` keeps the result of the
+keeper's last run, such as `watchdog`.
 
 Inspect logs before releasing Boost:
 

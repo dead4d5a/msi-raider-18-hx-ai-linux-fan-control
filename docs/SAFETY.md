@@ -457,12 +457,12 @@ it, takes more than 2 s, it reasserts Cooler Boost once more and logs
 `WARNING recovery keeper stall ...` and a line with the same figures.
 
 The watchdog is for a process that does not resume. Both units use
-`WatchdogSec=30s` with `SIGKILL` (section 7). When the daemon has sent no
-notification for 30 s, systemd kills it and records the result `watchdog`.
-`ExecStopPost` then stages and verifies Candidate 14 in `advanced` mode with
-Cooler Boost on and records the recovery-Boost marker, and the keeper holds
-that state; a killed keeper is restarted 30 s later, within its start limit.
-This release does not hand back by itself: full cooling stays until
+`WatchdogSec=30s` with `SIGKILL` (section 7). When no notification from the
+daemon has reached systemd for 30 s, systemd kills it and records the result
+`watchdog`. `ExecStopPost` then stages and verifies Candidate 14 in `advanced`
+mode with Cooler Boost on and records the recovery-Boost marker, and the keeper
+holds that state; a killed keeper is restarted 30 s later, within its start
+limit. This release does not hand back by itself: full cooling stays until
 `apply-default`, which needs no reboot (`OPERATIONS.md`, "After a watchdog
 kill").
 
@@ -470,8 +470,7 @@ The cost of 30 s is that a daemon stall of 7 to 30 s passes without Boost
 until the daemon resumes. In that time no alarm can raise Cooler Boost. In the
 field, with Boost off and the CPU at 88 °C or above, the median fan speeds were
 about 3,100 RPM (fan 1) and 3,700 RPM (fan 2), roughly half and 60 % of full
-speed. A shorter watchdog gains little in a host-wide stall, because the
-recovery helper and the keeper need memory too and wait in the same way.
+speed.
 
 What cannot be guaranteed:
 
@@ -487,15 +486,17 @@ What cannot be guaranteed:
   validation host.
 - The keeper's start limit still ends the guard. When the keeper fails again
   after three starts within 15 minutes, systemd refuses to restart it
-  (`Start request repeated too quickly`), and `keeper_result` reads
-  `start-limit-hit`. The EC keeps what the keeper last asserted, Candidate 14
-  in `advanced` mode with Cooler Boost on, but no process reasserts it or
-  watches the temperatures and fans; nothing switches Boost back on if a key
-  press turns it off. This was observed on 2026-11-13: the keeper's former 5 s
-  watchdog killed it three times within four minutes of one stall, and the
-  fans stayed at full cooling without a supervising process for 9 h 35 min,
-  until `apply-default` restored normal control. The 30 s watchdog makes this
-  less likely; it does not rule it out.
+  (`Start request repeated too quickly`), and status shows
+  `keeper_active_state` `failed`; `keeper_result` keeps the result of the
+  keeper's last run, such as `watchdog` after watchdog kills. The EC keeps
+  what the keeper last asserted, Candidate 14 in `advanced` mode with Cooler
+  Boost on, but no process reasserts it or watches the temperatures and fans;
+  nothing switches Boost back on if a key press turns it off. This was
+  observed on 2026-11-13: the keeper's former 5 s watchdog killed it three
+  times within four minutes of one stall, and the fans stayed at full cooling
+  without a supervising process for 9 h 35 min, until `apply-default`
+  restored normal control. The 30 s watchdog makes this less likely; it does
+  not rule it out.
 
 ## Suspend/resume
 

@@ -522,7 +522,7 @@ def write_proc_status(pid, content):
     return directory / 'status'
 
 
-SERVICE_CGROUP ='/system.slice/msi-fan-profile.service'
+SERVICE_CGROUP = '/system.slice/msi-fan-profile.service'
 KEEPER_CGROUP = '/system.slice/msi-fan-profile-keeper.service'
 # After a watchdog kill: the failed primary's ExecStopPost staged full cooling
 # and its OnFailure keeper holds it.
@@ -592,18 +592,20 @@ class UnitResultTests(UnitDiagnosticsTestCase):
         self.assertEqual(len(self.ctl_calls), 2, 'the results need no extra systemctl call')
 
     def test_restart_count_and_the_end_of_the_last_process_come_from_systemd(self):
-        # Both units failed: the keeper's own watchdog killed it, systemd
-        # restarted it, and then refused another start.
+        # Both units failed, as on 2026-11-13: the keeper's own watchdog killed
+        # it three times, and systemd refused the third restart at the start
+        # limit. systemd counts that refused restart and keeps the result of
+        # the last run, so Result is watchdog, not start-limit-hit.
         reply = '\n'.join((
             unit_reply(MANAGER.SERVICE, 'failed', Result='watchdog', NRestarts='0',
                        ExecMainCode='2', ExecMainStatus='9'),
-            unit_reply(MANAGER.KEEPER, 'failed', Result='start-limit-hit', NRestarts='2',
+            unit_reply(MANAGER.KEEPER, 'failed', Result='watchdog', NRestarts='3',
                        ExecMainCode='2', ExecMainStatus='9')))
         snapshot = self.run_manager(reply, MANAGER.full_status, latched=True)
         self.assertEqual(
             (snapshot['keeper_result'], snapshot['keeper_restarts'],
              snapshot['keeper_main_code'], snapshot['keeper_main_status']),
-            ('start-limit-hit', 2, 'killed', 9))
+            ('watchdog', 3, 'killed', 9))
         for result, code, status, expected in (
                 ('exit-code', '1', '1', ('exited', 1)), ('success', '1', '0', ('exited', 0)),
                 ('oom-kill', '2', '9', ('killed', 9)), ('signal', '2', '15', ('killed', 15)),
@@ -669,7 +671,7 @@ class UnitDiagnosticsExitStatusTests(UnitDiagnosticsTestCase):
                  'keeper_main_code': None, 'keeper_main_status': None}
         loud = {'service_result': 'watchdog', 'service_restarts': 1,
                 'service_main_code': 'killed', 'service_main_status': 9,
-                'keeper_result': 'start-limit-hit', 'keeper_restarts': 2,
+                'keeper_result': 'watchdog', 'keeper_restarts': 3,
                 'keeper_main_code': 'killed', 'keeper_main_status': 9}
         for label, snapshot, expected in (('managed', managed_snapshot(), 0),
                                            ('factory override', override, 0),

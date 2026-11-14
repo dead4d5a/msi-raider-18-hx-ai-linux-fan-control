@@ -22,19 +22,23 @@ telemetry is not included in the stable configuration comparison.
 `service_result` and `keeper_result` are systemd's `Result` for the controller
 and for its keeper: `success`, or why the unit last failed, such as `watchdog`,
 `oom-kill`, `exit-code` (it exited non-zero, as the daemon does on a fault it
-detects itself), `signal` or `start-limit-hit` (systemd refused another start).
-`service_restarts` and `keeper_restarts` count systemd's automatic restarts
-(`NRestarts`); only the keeper restarts by itself, and its start limit is three
-starts in 15 minutes. `service_main_code` and `service_main_status`, and the
-same two `keeper_` keys, tell how the unit's last main process ended: `exited`
-with its exit status, or `killed` or `dumped` with the signal number. `9` is
-`SIGKILL`, which both a watchdog kill and an out-of-memory kill send. Both are
-`null` while that process runs and before one has ended. `apply-default`
-resets the failed state of both units, after which the results read `success`
-and the restart counts `0`; the keeper's `keeper_main_code` and
-`keeper_main_status` keep how its last process ended until it starts again. A
-key is `null` when systemd does not report its property. None of these keys
-enters the stable comparison or the exit status.
+detects itself) or `signal`. `service_restarts` and `keeper_restarts` count
+systemd's automatic restarts (`NRestarts`); only the keeper restarts by itself,
+and its start limit is three starts in 15 minutes. When the keeper fails again
+at that limit, systemd refuses to restart it: `keeper_active_state` reads
+`failed`, `keeper_restarts` counts the refused restart too, `3` after three
+starts, and `keeper_result` keeps the result of the keeper's last run, such as
+`watchdog` after watchdog kills or `exit-code` with a torn recovery latch.
+`service_main_code` and `service_main_status`, and the same two `keeper_` keys,
+tell how the unit's last main process ended: `exited` with its exit status, or
+`killed` or `dumped` with the signal number. `9` is `SIGKILL`, which both a
+watchdog kill and an out-of-memory kill send. Both are `null` while that
+process runs and before one has ended. `apply-default` resets the failed state
+of both units, after which the results read `success` and the restart counts
+`0`; the keeper's `keeper_main_code` and `keeper_main_status` keep how its last
+process ended until it starts again. A key is `null` when systemd does not
+report its property. None of these keys enters the stable comparison or the
+exit status.
 
 `controller_memory` names the active unit (the controller or its keeper) and
 reports its cgroup's current, peak, and swap memory in bytes from the same
@@ -367,9 +371,9 @@ keeper keeps cooling:
 
 `msi-fan-profile status` shows `service_result` `watchdog`, and the
 controller's journal has systemd's `Watchdog timeout (limit 30s)!` and
-`Failed with result 'watchdog'`: the daemon sent no watchdog notification for
-30 s. The usual cause is a host-wide out-of-memory stall, which leaves the
-kernel's `Out of memory` lines in the same minute:
+`Failed with result 'watchdog'`: no watchdog notification from the daemon
+reached systemd for 30 s. The usual cause is a host-wide out-of-memory stall,
+which leaves the kernel's `Out of memory` lines in the same minute:
 
 ```bash
 sudo journalctl -k --no-pager | grep -F 'Out of memory'
@@ -391,11 +395,15 @@ Neither an upgrade nor a reboot is needed. Once the machine is responsive
 again and cool, run `sudo msi-fan-profile apply-default` and continue with
 steps 3 and 4 above.
 
-- If both units are `failed` and `keeper_result` reads `start-limit-hit`, the
-  keeper failed too, and systemd stopped restarting it after three starts in
-  15 minutes. The EC still holds Candidate 14 in `advanced` mode with Cooler
-  Boost on, but no process supervises it. Run the same `apply-default`; it
-  also resets the keeper's start count.
+- If both units are `failed`, the keeper failed too, and systemd does not
+  restart it again: it restarts a failed keeper only within its start limit
+  of three starts in 15 minutes. `keeper_restarts` then reads `3`,
+  `keeper_result` keeps the result of the keeper's last run, such as
+  `watchdog`, and the keeper's journal has `Start request repeated too quickly`.
+  If the keeper resumed during a stall before it was killed, its journal also
+  has `WARNING recovery keeper stall ...`. The EC still holds Candidate 14 in
+  `advanced` mode with Cooler Boost on, but no process supervises it. Run the
+  same `apply-default`; it also resets the keeper's start count.
 - If `apply-default` reports `service disabled, factory auto with Boost on`,
   it failed before it started the daemon, for example because a `systemctl`
   call timed out, and its fail-safe disabled the service. Run it again. Check
@@ -408,7 +416,7 @@ steps 3 and 4 above.
 The recovery helper and the keeper record the recovery-Boost marker in two
 steps: they create `/run/msi-fan-profile.recovery-boost`, then write its
 12-byte payload. If one of them is killed between the two, an empty file
-remains, which no command of this release removes. Then:
+remains, which no `msi-fan-profile` command removes. Then:
 
 - the daemon refuses to start, before any EC write, with
   `ERROR ProfileError: invalid recovery Boost latch payload`;
@@ -460,7 +468,10 @@ Then take one of two ways out, the first where possible:
    Without a marker, the daemon keeps the Cooler Boost it finds as manual
    Boost, and `status` shows `health.manual_boost` `true`. Release it with
    `sudo msi-fan-profile boost-release`, which completes after 30 continuously
-   valid, cool seconds.
+   valid, cool seconds. If the keeper restarted between the two commands, it
+   recorded a complete marker: `status` then shows `health.automatic_boost`
+   `true` instead, and the daemon releases Boost by itself after 30
+   continuously valid, cool seconds.
 
 After either way out, `msi-fan-profile status` exits `0`.
 
