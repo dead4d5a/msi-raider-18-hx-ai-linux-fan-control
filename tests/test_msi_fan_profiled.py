@@ -2442,9 +2442,11 @@ class PreApplyStateLogTests(HardwareFreeMainLoopTests):
 
     entrypoint() runs the real main(), force_apply_default(), read() and
     write() for a few passes against a private file-backed EC tree, and every
-    EC read, EC write and journal line is recorded in one ordered list. Only
-    the clock, notification, hwmon discovery, host identity, the lock and the
-    clean stop's factory restore and release are virtual.
+    EC read, EC write, notification and journal line is recorded in one
+    ordered list. Only the clock, notification, hwmon discovery, host
+    identity, the lock and the clean stop's factory restore and release are
+    virtual, so a failed heartbeat of the real startup Boost verification is
+    tested here too.
     """
 
     # Candidate 14 with fan 1's top speed changed: a curve status calls unknown.
@@ -2452,7 +2454,8 @@ class PreApplyStateLogTests(HardwareFreeMainLoopTests):
     THREE_READS = [("read", "fan_curve"), ("read", "fan_mode"), ("read", "cooler_boost")]
 
     def run_entrypoint(self, curve, mode, boost, *, passes=3, resume_at=None,
-                       revert_at=None):
+                       revert_at=None, notify_failure=None):
+        """notify_failure(message) returns the error notify() raises, or None."""
         ec, wmi, core = DAEMON.BASE, self.runtime / "wmi", self.runtime / "core"
         for path, value in {
             ec / "fw_version": DAEMON.fan_control.FIRMWARE,
@@ -2499,6 +2502,12 @@ class PreApplyStateLogTests(HardwareFreeMainLoopTests):
             events.append(("write", str(path.relative_to(ec)), value))
             real_write(path, value)
 
+        def recording_notify(message):
+            events.append(("notify", message))
+            error = notify_failure(message) if notify_failure else None
+            if error is not None:
+                raise error
+
         def sleep(seconds):
             clock["now"] += seconds
             clock["passes"] += 1
@@ -2519,7 +2528,7 @@ class PreApplyStateLogTests(HardwareFreeMainLoopTests):
                 DAEMON.os.environ.pop("MSI_FAN_TIMING_METRICS", None)
                 for name, value in (
                         ("read", recording_read), ("write", recording_write),
-                        ("LOCK", Lock()), ("notify", lambda _message: None),
+                        ("LOCK", Lock()), ("notify", recording_notify),
                         ("one_hwmon", lambda name: wmi if name == "msi_wmi_platform" else core)):
                     stack.enter_context(mock.patch.object(DAEMON, name, value))
                 for name in ("restore_factory_envelope", "release_factory_if_cool"):
@@ -2607,6 +2616,26 @@ class PreApplyStateLogTests(HardwareFreeMainLoopTests):
                          [("write", "fan_curve", DAEMON.DEFAULT)] * 3)
         self.assertEqual([line for line in logs if line.startswith("pre-apply EC state")],
                          ["pre-apply EC state: curve=factory mode=auto boost=off"])
+
+    def test_failed_startup_verification_heartbeat_still_fails_startup(self):
+        # The real verify_boost() of the startup apply heartbeats before READY=1,
+        # and those heartbeats stay strict: here its first one times out.
+        beat = "WATCHDOG=1\nSTATUS=Verifying Cooler Boost: fans 4400/4400 RPM"
+        status, events = self.run_entrypoint(
+            DAEMON.FACTORY, "auto", "off", notify_failure=lambda message: (
+                TimeoutError("timed out") if message == beat else None))
+        self.assertEqual(status, 1)
+        # Only the ERROR line followed: no READY=1, no pass and no write.
+        failed = events.index(("notify", beat))
+        self.assertEqual(events[failed + 1:], [("log", "ERROR TimeoutError: timed out")])
+        self.assertEqual([event for event in events if event[0] == "notify"],
+                         [("notify", beat)])
+        self.health_publisher.assert_not_called()
+        # The EC is left at Candidate 14 in auto mode with the verification's
+        # Cooler Boost on: nothing wrote advanced mode or Boost off.
+        self.assertEqual([event for event in events if event[0] == "write"], [
+            ("write", "cooler_boost", "on"), ("write", "fan_mode", "auto"),
+            ("write", "fan_curve", DAEMON.DEFAULT), ("write", "cooler_boost", "on")])
 
 
 class HealthPublicationTests(unittest.TestCase):
