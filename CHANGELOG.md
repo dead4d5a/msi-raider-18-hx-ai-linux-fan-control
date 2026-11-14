@@ -87,12 +87,12 @@ Candidate 14, the alarm limits and the accepted driver builds are those of
 
 - Raise `WatchdogSec` of the controller and the keeper from 5 s to 30 s, so
   that a host-wide out-of-memory stall shorter than the watchdog no longer
-  makes systemd kill a healthy daemon or keeper, as the 5 s watchdog did on
-  2026-11-10 and 2026-11-13; the daemon still latches Cooler Boost in the
-  first pass that sees a gap of more than 2 s. A daemon stall of 7 to 30 s now
-  passes without Boost until the daemon resumes, and
-  `systemctl show -p WatchdogUSec msi-fan-profile.service` prints
-  `WatchdogUSec=30s` (ST-1).
+  makes systemd kill a healthy daemon or keeper; the 5 s watchdog killed the
+  daemon on 2026-11-10 and the daemon and the keeper on 2026-11-13. The daemon
+  still latches Cooler Boost in the first pass that sees a gap of more than
+  2 s, but a daemon stall of 7 to 30 s now passes without Boost until the
+  daemon resumes, and `systemctl show -p WatchdogUSec msi-fan-profile.service`
+  prints `WatchdogUSec=30s` (ST-1).
 
 ### Operator-visible
 
@@ -128,11 +128,11 @@ Candidate 14, the alarm limits and the accepted driver builds are those of
 - At startup the daemon logs `pre-apply EC state: curve=... mode=... boost=...`
   between the three EC reads it already makes and its first write, with the
   curve in the words of `msi-fan-profile status` (`factory`, `candidate14` or
-  `unknown`), so the journal shows what the EC kept across the previous stop
-  or boot, also for a state it then refuses with the existing
-  `unrecognized pre-apply state` error. No EC access is added,
-  `Candidate14 applied` is unchanged, and in-loop reapplies log nothing new
-  (VA-7).
+  `unknown`), so the journal shows the EC state each start found (after a cool
+  clean stop, the factory state the daemon itself restored), also for a state
+  it then refuses with the existing `unrecognized pre-apply state` error. No
+  EC access is added, `Candidate14 applied` is unchanged, and in-loop
+  reapplies log nothing new (VA-7).
 
 ## 0.2.0 - 2026-10-11
 
@@ -140,8 +140,8 @@ Hardening release for the same laptop and firmware. A genuine daemon fault
 now ends in full cooling, Candidate 14 in `advanced` mode with Cooler Boost
 on, held by a separate keeper. A memory leak that let the 64 MiB limit kill
 the controller after about 6.8 days is fixed. A read-only kernel readiness
-check finds a driver build that would fail at the next boot; it runs before a
-reboot and from a kernel hook after each kernel installation. A clean
+check finds a driver build that would fail at the next boot; it is run by hand
+before a reboot and by a kernel hook after each kernel installation. A clean
 stop, `factory-auto` or the uninstall script switches Cooler Boost off only
 after six consecutive valid, cool samples. The upgrade waits for a cool margin
 and continues at full cooling when the installed manager cannot confirm a

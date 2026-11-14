@@ -178,11 +178,12 @@ resumes; with 5 s, the kill and the recovery helper had Boost on about 7 s into
 such a stall. For that time the EC runs its curve without alarm escalation: in
 the field, with Boost off and the CPU at 88 °C or above, the median fan speeds
 were about 3,100 RPM (fan 1) and 3,700 RPM (fan 2), roughly half and 60 % of
-full speed. A stall longer than 30 s still ends in a kill and a keeper hold.
-The keeper has the same value because the same stall delays it: on 2026-11-13
-its former 5 s watchdog killed it three times within four minutes of one
-host-wide out-of-memory stall, and its start limit of three starts in 15
-minutes then left the EC at full cooling with no process supervising it.
+full speed. A stall longer than 30 s still ends in a kill and a keeper hold,
+with the recovery helper's Boost about 25 s later than with 5 s. The keeper
+has the same value because the same stall delays it: on 2026-11-13 its
+former 5 s watchdog killed it three times within four minutes of one host-wide
+out-of-memory stall, and its start limit of three starts in 15 minutes then
+left the EC at full cooling with no process supervising it.
 
 A failed runtime watchdog notification is reported and does not stop cooling.
 Each monitoring pass of the daemon and each repair pass of the keeper ends
@@ -356,13 +357,13 @@ release without sampling and logs
 The daemon then exits `1` into full-cooling recovery, as after a hot stop,
 instead of being killed. A stop that the `factory-auto` marker starts before
 any signal gets the full 10 s, because the stop timer is not running yet. The
-daemon sends a watchdog heartbeat with every sample. That matters when the
-`factory-auto` marker starts the stop before the stop request arrives, because
-systemd still enforces `WatchdogSec=30s` then. `ExecStopPost` runs under its own
-`TimeoutStopSec=30s`; on its success path it spends at most 10 s confirming.
-The manager has no watchdog, and its 50 s `systemctl stop` covers the daemon's
-and the helper's waits. A cool clean stop takes about 2.5 s longer than before,
-and a cool `factory-auto`, which confirms three times, about 7.5 s longer.
+daemon sends a watchdog heartbeat with every sample, so the watchdog, which
+systemd still enforces when the `factory-auto` marker starts the stop, stays
+fed throughout. `ExecStopPost` runs under its own `TimeoutStopSec=30s`; on its
+success path it spends at most 10 s confirming. The manager has no watchdog,
+and its 50 s `systemctl stop` covers the daemon's and the helper's waits. A
+cool clean stop takes about 2.5 s longer than before, and a cool
+`factory-auto`, which confirms three times, about 7.5 s longer.
 
 The runtime release of an automatic latch or a queued manual release is not
 changed: it already requires 30 continuously valid, cool seconds, and an
