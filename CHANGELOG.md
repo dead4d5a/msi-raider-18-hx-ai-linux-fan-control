@@ -13,6 +13,66 @@ ends with its roadmap item ID in parentheses, and with its issue number too
 once that issue exists: `(ST-1)`, later `(ST-1, #N)`. When a version is cut,
 its section starts with a short summary, upgrade notes and known issues.
 
+## 0.2.1
+
+Hotfix for the watchdog kills of 2026-11-10 and 2026-11-13, in which a
+host-wide out-of-memory stall delayed the daemon past its 5 s systemd
+watchdog. On 2026-11-13 the keeper that took over was then killed by its own
+5 s watchdog three times, and systemd refused to restart it. Both units now
+use a 30 s watchdog, and a failed runtime watchdog notification no longer
+ends the daemon or the keeper. The length of each stall and where the time
+went, the reason each unit last stopped and the EC state the daemon finds at
+startup now show in the journal or in `msi-fan-profile status`, and the
+installed documents describe host memory stalls, with runbooks for a
+watchdog kill and a torn recovery latch. Candidate 14, the alarm limits and
+the accepted driver builds are those of 0.2.0.
+
+### Upgrade notes
+
+- Upgrade from 0.2.0 with the guarded `sudo ./scripts/upgrade-profile.sh`
+  (`docs/INSTALL.md`). `upgrade-profile.sh`, `preflight.sh` and
+  `verify-release-unprivileged.sh` are byte-identical to 0.2.0, and
+  `verify-release.sh` differs only in the keeper's pinned `WatchdogSec`. No
+  installed file is added or removed, and the driver is not touched.
+- The upgrade hands over through the installed 0.2.0 manager's
+  `factory-auto`, which releases Cooler Boost only after six consecutive
+  valid, cool samples and does not disable the service when it refuses. If it
+  refuses, the upgrade continues at full cooling when the state the refusal
+  left verifies, and otherwise stops with nothing replaced; rerun the upgrade
+  once the machine is cool (`docs/INSTALL.md`).
+- After the upgrade, `systemctl show -p WatchdogUSec msi-fan-profile.service`
+  prints `WatchdogUSec=30s`. systemd reports a unit's watchdog interval as of
+  the unit's last start, so until the keeper next starts, the same query for
+  `msi-fan-profile-keeper.service` can print an older value or `infinity`;
+  check `WatchdogSec=30s` in its installed unit file,
+  `/etc/systemd/system/msi-fan-profile-keeper.service`, instead.
+
+### Known issues
+
+- A host-wide out-of-memory stall longer than 30 s still ends in a watchdog
+  kill, and the keeper then holds Candidate 14/`advanced` with Cooler Boost on
+  until `sudo msi-fan-profile apply-default` is run; no reboot is needed. If
+  the keeper is killed three times within 15 minutes, as on 2026-11-13,
+  systemd refuses to restart it, and the EC keeps full cooling with no
+  process supervising it until `apply-default` (`docs/OPERATIONS.md`, "After
+  a watchdog kill").
+- If the recovery helper or the keeper is killed between creating
+  `/run/msi-fan-profile.recovery-boost` and writing its payload, it leaves an
+  empty file that no command of this release removes: the daemon then refuses
+  to start, the keeper exits at every start, and `apply-default` fails.
+  `factory-auto`, and an upgrade, which hands over through it, must not be run
+  in that state (`docs/OPERATIONS.md`, "Torn recovery latch").
+- Fan 2, the GPU-side fan, still runs one step below the Candidate 14 table
+  while the machine warms up: about 3,750 instead of 4,330 RPM at a GPU
+  temperature of 44 to 54 °C (observed). The driver writes the six rising
+  thresholds and seven speeds of each fan but leaves the EC's 12
+  falling-threshold bytes, which decide when a step is left again, at their
+  factory values; for fan 2 those lie above Candidate 14's rising thresholds.
+  0.2.1 does not change this. The alarms and Cooler Boost do not depend on
+  the curve. Under decision D-2 (option (b), decided on 2026-11-13), the
+  transition to a driver build that also writes those 12 bytes and a re-tune
+  of the curve come before the 1.0 release candidate.
+
 ### Changed
 
 - A failed runtime watchdog notification no longer ends the daemon, after
