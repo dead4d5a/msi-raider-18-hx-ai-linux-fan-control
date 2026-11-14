@@ -51,6 +51,14 @@ its section starts with a short summary, upgrade notes and known issues.
   `locked_bytes` and `memory_min_effective`, which is `false` when an ancestor
   cgroup reserves less than the unit's `MemoryMin`, as on the validation host;
   none of the new keys enters the exit status or the stable comparison (ST-4).
+- At startup the daemon logs `pre-apply EC state: curve=... mode=... boost=...`
+  between the three EC reads it already makes and its first write, with the
+  curve in the words of `msi-fan-profile status` (`factory`, `candidate14` or
+  `unknown`), so the journal shows what the EC kept across the previous stop
+  or boot, also for a state it then refuses with the existing
+  `unrecognized pre-apply state` error. No EC access is added,
+  `Candidate14 applied` is unchanged, and in-loop reapplies log nothing new
+  (VA-7).
 
 ## 0.2.0 - 2026-10-11
 

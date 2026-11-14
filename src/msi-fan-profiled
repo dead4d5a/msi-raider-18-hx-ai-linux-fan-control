@@ -340,12 +340,25 @@ def verify_boost(wmi: pathlib.Path, heartbeat: Callable[[str], None]) -> None:
 
 
 def force_apply_default(wmi: pathlib.Path, preserve_boost: bool,
-                        heartbeat: Callable[[str], None]) -> bool:
-    """Reprogram Candidate14 under auto+Boost, then enter advanced mode."""
+                        heartbeat: Callable[[str], None], *,
+                        startup: bool = False) -> bool:
+    """Reprogram Candidate14 under auto+Boost, then enter advanced mode.
+
+    At startup it first logs the EC state it found, from the reads the state
+    check makes anyway, before that check and before any write, so a state it
+    then refuses is logged too: the journal's record of what the EC kept
+    across the previous stop or boot. In-loop reapplies log nothing here.
+    """
     require_policy_identity()
     curve = read(BASE / "fan_curve")
     mode = read(BASE / "fan_mode")
     boost = read(BASE / "cooler_boost")
+    if startup:
+        # The curve in the words of msi-fan-profile status; mode and Boost as read.
+        found = ("candidate14" if curve == DEFAULT else
+                 "factory" if curve == FACTORY else "unknown")
+        print(f"pre-apply EC state: curve={found} mode={mode} boost={boost}",
+              file=sys.stderr, flush=True)
     recognized = ((curve == FACTORY and mode == "auto") or
                   (curve == DEFAULT and mode == "advanced"))
     if not recognized or boost not in ("on", "off"):
@@ -984,7 +997,7 @@ def main() -> int:
         recovery_latched = recovery_latch_present()
         existing_boost = read(BASE / "cooler_boost") == "on"
         initial_physical_verification = force_apply_default(
-            wmi, existing_boost or recovery_latched, heartbeat)
+            wmi, existing_boost or recovery_latched, heartbeat, startup=True)
         if recovery_latched:
             consume_recovery_latch()
         print(

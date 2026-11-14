@@ -497,7 +497,7 @@ class SustainedAlarmMainLoopTests(HardwareFreeMainLoopTests):
             else:
                 raise AssertionError(f"unexpected write: {path}")
 
-        def fake_apply(_wmi, preserve_boost, _heartbeat):
+        def fake_apply(_wmi, preserve_boost, _heartbeat, **_options):
             state["curve"] = DAEMON.DEFAULT
             state["mode"] = "advanced"
             state["boost"] = "on" if preserve_boost else "off"
@@ -615,7 +615,7 @@ class SensorHoldMainLoopTests(HardwareFreeMainLoopTests):
             writes.append(value)
             state["boost"] = value
 
-        def fake_apply(_wmi, preserve_boost, _heartbeat):
+        def fake_apply(_wmi, preserve_boost, _heartbeat, **_options):
             state["curve"] = DAEMON.DEFAULT
             state["mode"] = "advanced"
             state["boost"] = "on" if preserve_boost else "off"
@@ -742,7 +742,7 @@ class SensorHoldMainLoopTests(HardwareFreeMainLoopTests):
             writes.append(value)
             state["boost"] = value
 
-        def fake_apply(_wmi, preserve_boost, _heartbeat):
+        def fake_apply(_wmi, preserve_boost, _heartbeat, **_options):
             state["curve"] = DAEMON.DEFAULT
             state["mode"] = "advanced"
             state["boost"] = "on" if preserve_boost else "off"
@@ -938,7 +938,7 @@ class RecoveryHandoffMainLoopTests(HardwareFreeMainLoopTests):
             self.io_events.append((clock.now, "write", value))
             state["boost"] = value
 
-        def fake_apply(_wmi, preserve_boost, _heartbeat):
+        def fake_apply(_wmi, preserve_boost, _heartbeat, **_options):
             events.append("apply")
             preserves.append(preserve_boost)
             state["curve"] = DAEMON.DEFAULT
@@ -2124,7 +2124,7 @@ class StartupGuardMainTests(HardwareFreeMainLoopTests):
                 raise FileNotFoundError(2, "No such file or directory", text)
             return host[text]
 
-        def fake_apply(_wmi, _preserve_boost, _heartbeat):
+        def fake_apply(_wmi, _preserve_boost, _heartbeat, **_options):
             # Stop after the startup transaction; the loop is covered elsewhere.
             DAEMON.STOP = True
             return True
@@ -2231,6 +2231,178 @@ class StartupGuardMainTests(HardwareFreeMainLoopTests):
         self.assertIn("found 2", stderr)
         self.apply.assert_not_called()
         self.assertEqual(writes, [])
+
+
+class PreApplyStateLogTests(HardwareFreeMainLoopTests):
+    """The startup apply logs the EC state it found; in-loop reapplies do not.
+
+    entrypoint() runs the real main(), force_apply_default(), read() and
+    write() for a few passes against a private file-backed EC tree, and every
+    EC read, EC write and journal line is recorded in one ordered list. Only
+    the clock, notification, hwmon discovery, host identity, the lock and the
+    clean stop's factory restore and release are virtual.
+    """
+
+    # Candidate 14 with fan 1's top speed changed: a curve status calls unknown.
+    UNKNOWN = DAEMON.DEFAULT.replace(" 80 110 ", " 80 100 ")
+    THREE_READS = [("read", "fan_curve"), ("read", "fan_mode"), ("read", "cooler_boost")]
+
+    def run_entrypoint(self, curve, mode, boost, *, passes=3, resume_at=None,
+                       revert_at=None):
+        ec, wmi, core = DAEMON.BASE, self.runtime / "wmi", self.runtime / "core"
+        for path, value in {
+            ec / "fw_version": DAEMON.fan_control.FIRMWARE,
+            ec / "shift_mode": "comfort",
+            ec / "fan_curve": curve,
+            ec / "fan_mode": mode,
+            ec / "cooler_boost": boost,
+            ec / "cpu/realtime_temperature": "50",
+            ec / "gpu/realtime_temperature": "40",
+            wmi / "fan1_input": "4400",
+            wmi / "fan2_input": "4400",
+            core / "temp1_input": "50000",
+        }.items():
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(value + "\n")
+        events = []
+        clock = {"now": 0.0, "offset": 0.0, "passes": 0}
+        cgroup = pathlib.Path("/proc/self/cgroup")
+        real_read, real_write = DAEMON.read, DAEMON.write
+        legacy = {DAEMON.fan_control.SOURCE_PATH: DAEMON.fan_control.LEGACY_SRCVERSION}
+
+        class Lock:
+            @staticmethod
+            def stat():
+                return types.SimpleNamespace(
+                    st_mode=DAEMON.stat.S_IFREG | 0o600, st_uid=0, st_gid=0)
+
+        class Journal(io.StringIO):
+            # print() writes the message and its newline in separate calls.
+            def write(self, text):
+                events.extend(("log", line) for line in text.splitlines() if line)
+                return super().write(text)
+
+        def recording_read(path):
+            if path == cgroup:
+                return "0::/system.slice/msi-fan-profile.service"
+            if not path.is_relative_to(self.runtime):
+                raise AssertionError(f"host read blocked: {path}")
+            if path.is_relative_to(ec):
+                events.append(("read", str(path.relative_to(ec))))
+            return real_read(path)
+
+        def recording_write(path, value):
+            events.append(("write", str(path.relative_to(ec)), value))
+            real_write(path, value)
+
+        def sleep(seconds):
+            clock["now"] += seconds
+            clock["passes"] += 1
+            if clock["passes"] == resume_at:
+                clock["offset"] += 100.0
+            if clock["passes"] == revert_at:
+                # The EC reverts to its factory curve in auto mode.
+                (ec / "fan_curve").write_text(DAEMON.FACTORY + "\n")
+                (ec / "fan_mode").write_text("auto\n")
+            if clock["passes"] == passes:
+                DAEMON.STOP = True
+
+        original = (DAEMON.STOP, DAEMON.BOOST_REQUEST, DAEMON.RELEASE_REQUEST)
+        DAEMON.STOP = DAEMON.BOOST_REQUEST = DAEMON.RELEASE_REQUEST = False
+        try:
+            with contextlib.ExitStack() as stack:
+                stack.enter_context(mock.patch.dict(DAEMON.os.environ))
+                DAEMON.os.environ.pop("MSI_FAN_TIMING_METRICS", None)
+                for name, value in (
+                        ("read", recording_read), ("write", recording_write),
+                        ("LOCK", Lock()), ("notify", lambda _message: None),
+                        ("one_hwmon", lambda name: wmi if name == "msi_wmi_platform" else core)):
+                    stack.enter_context(mock.patch.object(DAEMON, name, value))
+                for name in ("restore_factory_envelope", "release_factory_if_cool"):
+                    stack.enter_context(mock.patch.object(DAEMON, name, return_value=True))
+                stack.enter_context(mock.patch.object(
+                    DAEMON.fan_control, "host_identity", lambda _read, _base: dict(legacy)))
+                stack.enter_context(mock.patch.object(DAEMON.signal, "signal"))
+                stack.enter_context(mock.patch.object(DAEMON.os, "geteuid", return_value=0))
+                stack.enter_context(mock.patch.object(DAEMON.os, "open", return_value=9))
+                stack.enter_context(mock.patch.object(DAEMON.os, "close"))
+                stack.enter_context(mock.patch.object(DAEMON.fcntl, "flock"))
+                for name, value in (
+                        ("monotonic", lambda: clock["now"]),
+                        ("clock_gettime", lambda _clock: clock["now"] + clock["offset"]),
+                        ("sleep", sleep)):
+                    stack.enter_context(mock.patch.object(DAEMON.time, name, value))
+                with contextlib.redirect_stderr(Journal()):
+                    status = DAEMON.entrypoint()
+        finally:
+            DAEMON.STOP, DAEMON.BOOST_REQUEST, DAEMON.RELEASE_REQUEST = original
+        return status, events
+
+    @staticmethod
+    def logs(events):
+        return [event[1] for event in events if event[0] == "log"]
+
+    @staticmethod
+    def counts(events):
+        return (sum(event[0] == "read" for event in events),
+                sum(event[0] == "write" for event in events))
+
+    def test_startup_logs_the_found_state_after_its_reads_and_before_its_first_write(self):
+        cases = (
+            # A boot after a cool clean stop: the factory curve in auto, Boost off.
+            (DAEMON.FACTORY, "auto", "off", "curve=factory mode=auto boost=off",
+             "preserved_boost=False", (28, 6)),
+            # A restart that finds Candidate 14 still active with Cooler Boost on.
+            (DAEMON.DEFAULT, "advanced", "on", "curve=candidate14 mode=advanced boost=on",
+             "preserved_boost=True", (26, 5)),
+        )
+        for curve, mode, boost, found, preserved, accesses in cases:
+            with self.subTest(found=found):
+                status, events = self.run_entrypoint(curve, mode, boost)
+                self.assertEqual(status, 0)
+                logged = f"pre-apply EC state: {found}"
+                # The existing line, which the documented greps match, follows unchanged.
+                applied = f"Candidate14 applied; {preserved} recovery_latch=False"
+                self.assertEqual(self.logs(events)[:2], [logged, applied])
+                startup = events[:events.index(("log", applied))]
+                line = startup.index(("log", logged))
+                self.assertEqual(startup[line - 3:line], self.THREE_READS)
+                self.assertEqual([event for event in startup[:line] if event[0] == "write"], [])
+                self.assertEqual(startup[line + 1], ("write", "cooler_boost", "on"))
+                # The line adds no EC access: the startup path's EC reads and
+                # writes are those of v0.2.0.
+                self.assertEqual(self.counts(startup), accesses)
+
+    def test_a_refused_startup_state_is_logged_before_the_unchanged_error(self):
+        cases = (
+            (self.UNKNOWN, "advanced", "off", "curve=unknown mode=advanced boost=off"),
+            (DAEMON.FACTORY, "advanced", "on", "curve=factory mode=advanced boost=on"),
+        )
+        for curve, mode, boost, found in cases:
+            with self.subTest(found=found):
+                status, events = self.run_entrypoint(curve, mode, boost)
+                self.assertEqual(status, 1)
+                self.assertEqual(self.logs(events), [
+                    f"pre-apply EC state: {found}",
+                    "ERROR ProfileError: unrecognized pre-apply state: "
+                    f"{mode}/{boost}/{curve!r}"])
+                self.assertEqual(events[-5:-2], self.THREE_READS)
+                # As before, the refusal comes before any EC write.
+                self.assertEqual(self.counts(events), (8, 0))
+
+    def test_in_loop_reapplies_log_no_found_state(self):
+        # The boot clock jumps after pass 2, so pass 3 reapplies for a resume;
+        # the EC reverts to factory/auto after pass 4, which pass 5 reapplies.
+        status, events = self.run_entrypoint(
+            DAEMON.FACTORY, "auto", "off", passes=6, resume_at=2, revert_at=4)
+        self.assertEqual(status, 0)
+        logs = self.logs(events)
+        self.assertIn("resume detected; forcing Candidate14 reapply", logs)
+        # Candidate 14 was written by the startup apply and by both reapplies.
+        self.assertEqual([event for event in events if event[:2] == ("write", "fan_curve")],
+                         [("write", "fan_curve", DAEMON.DEFAULT)] * 3)
+        self.assertEqual([line for line in logs if line.startswith("pre-apply EC state")],
+                         ["pre-apply EC state: curve=factory mode=auto boost=off"])
 
 
 class HealthPublicationTests(unittest.TestCase):

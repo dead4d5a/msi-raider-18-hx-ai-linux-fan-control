@@ -2,7 +2,7 @@
 0072eedaed218fa9252de44c7d6bc73adf395b90e437f41b1ded9eee30bbbbce  ./.github/ISSUE_TEMPLATE/compatibility.yml
 497151dc12ad9b0a5527a38ecf8703c9e9ce8c2d6c8af3b33809b294c230a1b6  ./.github/workflows/checks.yml
 47f5d2d77b0f5f1615c97d66c027f581c55d8388810c38d566cf14c3cd304bf4  ./.gitignore
-8e8acbbee784fbf7d4390c2b1fa4bd4464ef0228e34449be446d79c905971cd2  ./CHANGELOG.md
+fcdf068d9e77155f8f4083f43ab41531e570b84626aae6ed5c81e1ace459ed07  ./CHANGELOG.md
 6633d875a37172286ab88eb20e611e3d222abc2607b5fe4d170604dd64a269d0  ./CONTRIBUTING.md
 e81c85b024709a55bdbe56407c8160fde57303aabd3cf2b389cf44529f32807a  ./LICENSE.md
 8177f97513213526df2cf6184d8ff986c675afb514d4e68a404010521b880643  ./LICENSES/GPL-2.0-or-later.txt
@@ -37,7 +37,7 @@ e96e13bcd881524f13eb7b1eb42e2e34a79a1e2044e1183f20148f924902fe5d  ./scripts/sele
 588ead13d0dff48351e048b1d5ff06f6ec9de099c466602b0355b6c12f2db171  ./scripts/verify-release-unprivileged.sh
 e54ef084d8e7d22e778351aedc94695a879165876436a430b4719a3a3d8ff25e  ./scripts/verify-release.sh
 9bfa1d00e4656039ff0f28ca19509331710eb5677d582b34bfef3855f92b8d41  ./src/msi-fan-profile
-dec19ccd2883c8cd2aacef83a2673edd8fb79ddb1c1bd98680c1db9c4a2828c2  ./src/msi-fan-profiled
+a1123441f0746aa25110c89bf53e79775417409fe4a6d62d30e5902d61d7e143  ./src/msi-fan-profiled
 696ff3ae695162890c32c3cfdb2a6c4548b13a9b2e16c9ca4c82208448360e61  ./src/msi-gpu-recover
 53073c9c20b30a91d1f08e50812c10f6716d16e9f19d8ded630437c77a12cf81  ./src/msi_fan_control.py
 6a42777cebba89850bbbefd12c743ea27d44b94dc65dacc0cb9e62460e1e3a8f  ./systemd/msi-fan-profile-keeper.service
@@ -47,7 +47,7 @@ dec19ccd2883c8cd2aacef83a2673edd8fb79ddb1c1bd98680c1db9c4a2828c2  ./src/msi-fan-
 487d94dada00e422feaf9fbda7ba922758bba0d0a688d63700e2a79144c84af1  ./tests/test_kernel_readiness.py
 b26f61f0838001ab635369e23eba5ce0c38d86b5b3f1f09ad38c7662577078e7  ./tests/test_msi_fan_control.py
 9e917b8d7881f717877c16d3f1e24d296784f8adf7ae54e76e93e3daa4d9d056  ./tests/test_msi_fan_profile.py
-b89688bbe2cba9092cf6ac7d77ee03399da0f7e18f03c8101197d9bae2c968b2  ./tests/test_msi_fan_profiled.py
+5e4d600eb10a5bbedaa45795ebad525fd30089a468abaaac36dbb41d3b95c499  ./tests/test_msi_fan_profiled.py
 8b178375ef34849ca8ef0c3d694d634cd3af3f71ad46c2136eac5d5e6a8900d8  ./tests/test_msi_gpu_recover.py
 c0efa440c9874000dd711552b1f01b44813290692cdc14fdeee89fce2bc81772  ./tests/test_systemd_integration.py
 2aa1cf03e482dd64a1c34a70357c368b0cf2fe8695749407eef8ad4a4e312059  ./tests/test_systemd_units.py
