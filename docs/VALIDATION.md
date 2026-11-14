@@ -94,32 +94,38 @@ observations, not attended or injected-fault tests.
 ## Field evidence from 2026-10-18 to 2026-11-11
 
 This is field evidence for v0.2.0, unattended: events of `e4d4e19` on the
-signed legacy driver `AB0BFAE2391B5ADD66E01BD`, taken from the journal of both
-units (America/Denver). They are field observations, not attended or
-injected-fault tests, and they count only for the build they happened on; code
-that changes afterwards needs its own evidence. When the journal was exported
-on 2026-11-11, nothing before 2026-10-18 21:36 was retained, so the first week
-of v0.2.0 is not covered. The monitoring-gap warning of 0.2.0 gives no
-duration. The raw export stays on the validation host, in a directory outside
-the repository; its units log has SHA-256
-`1d44c90b56a5b2c3dc7a5e35a16a3dbe6c6c3f8ee43c968fa36cdcd1264afc50`. Every figure
-below can be recomputed from that export and this repository.
+signed legacy driver `AB0BFAE2391B5ADD66E01BD`, taken from an export of
+2026-11-11 (America/Denver). From the journal, the entries use its list of
+boots and the lines of both units, of the readiness hook and of the kernel's
+out-of-memory killer; from outside it, the install record and the boot list
+of the login records (`wtmp`), which reaches back further. The events are
+field observations, not attended or injected-fault tests, and they count only
+for the build they happened on; code that changes afterwards needs its own
+evidence. When the journal was exported, nothing before 2026-10-18 21:36 was
+retained, so the first week of v0.2.0 is not covered. The monitoring-gap
+warning of 0.2.0 gives no duration. The raw export stays on the validation
+host, in a directory outside the repository; its units log has SHA-256
+`1d44c90b56a5b2c3dc7a5e35a16a3dbe6c6c3f8ee43c968fa36cdcd1264afc50`. The
+export's manifest `SHA256SUMS`, with the SHA-256 of every other file, has
+SHA-256 `36a6c17dff07553836222e62fea42a0654886434d66d5c92413ba67858baab43`.
+Every figure below can be recomputed from that export and this repository.
 
 - Deployment: the install record in the export names `e4d4e19` as
   `source_commit` and the SHA-256 of that commit's `SHA256SUMS` as
   `source_manifest_sha256`, and its 12 file digests are those of the files of
   v0.2.0, so its `source_tree_dirty=yes` reached no installed file. v0.2.0 was
-  deployed on 2026-10-11, before the retained journal begins.
+  deployed on 2026-10-11 (v0.2.0 tag message), before the retained journal
+  begins.
 - Daemon runs: the run that the clean stop of 2026-10-19 ended had started
-  before the retained journal, at the earliest with the boot of 2026-10-16, at
-  most 2.8 days earlier, and peaked at 15.6M. The run of 5.3 days from
-  2026-10-19 to the end of its boot on 2026-10-24 (below) logged no stop line,
-  so no peak was recorded. The run of 6.3 days from 2026-10-24 to 2026-10-30
-  peaked at 13.7M and used 26 min 40 s of CPU time, and the run of 10.3 days
-  from 2026-10-30 that the watchdog kill of 2026-11-10 ended peaked at 14.0M and
-  used 45 min 22 s: about 0.3 % of one core in both runs. All three peaks came
-  with `0B memory swap peak`. The leaking 2026-09-30 build had reached its 64M
-  limit on 2026-10-10 (above).
+  before the retained journal, at the earliest with the boot of 2026-10-16
+  (`wtmp` boot list), at most 2.8 days earlier, and peaked at 15.6M. The run of
+  5.3 days from 2026-10-19 to the end of its boot on 2026-10-24 (below) logged
+  no stop line, so no peak was recorded. The run of 6.3 days from 2026-10-24 to
+  2026-10-30 peaked at 13.7M and used 26 min 40 s of CPU time, and the run of
+  10.3 days from 2026-10-30 that the watchdog kill of 2026-11-10 ended peaked
+  at 14.0M and used 45 min 22 s: about 0.3 % of one core in both runs. All
+  three peaks came with `0B memory swap peak`. The leaking 2026-09-30 build had
+  reached its 64M limit on 2026-10-10 (above).
 - 2026-10-18 21:36 to 2026-10-19 09:18, sustained heat: in the 702 minute status
   lines of this period the logged CPU temperature was at or above 95 °C in 55 %
   and Cooler Boost was on in 76 %, and the daemon logged
@@ -150,8 +156,8 @@ below can be recomputed from that export and this repository.
   left thermally verified factory auto/off.
 - 2026-11-01, kernel installation: the readiness hook logged 12 `PASS` lines
   and `KERNEL READINESS PASSED: 7.0.0-42-generic`. The first boot of that kernel
-  followed the kill of 2026-11-10 (next entry). The retained journal holds no
-  installation of a kernel that fails the check.
+  (`wtmp` boot list) followed the kill of 2026-11-10 (next entry). The retained
+  journal holds no installation of a kernel that fails the check.
 - 2026-11-10, 04:52:24, during a host-wide out-of-memory stall: a sensor
   acquisition took 5.943 s, and the next pass found a monitoring gap; both
   latched Cooler Boost. At 04:52:32, 8.5 s later, systemd logged
@@ -273,8 +279,11 @@ thresholds, which decide when a step is left again. The legacy driver reads,
 writes and verifies the six rising thresholds and seven speeds of each fan, 26
 bytes in all, and does not touch the 12 falling-threshold bytes. Their factory
 values, captured during calibration, lie above Candidate 14's rising
-thresholds for fan 2 (research item DR-15). Fan 1 is essentially unaffected.
-By evidence level:
+thresholds for fan 2 (research item DR-15). Fan 1 is essentially unaffected by
+them: its thresholds of 70 to 88 °C are the factory ones and keep their 3 °C
+hysteresis, observed at 79 °C and inferred at 67, 73 and 85 °C; at its 50 and
+60 °C thresholds, one degree under the falling values 51 and 61, the absence
+of hysteresis is inferred, not observed (DR-15). For fan 2, by evidence level:
 
 - Observed: the EC's fan-2 target alternates once a second between the table's
   step and the one below at a GPU temperature of 43 and 44 °C, and on warm-up
@@ -288,12 +297,13 @@ By evidence level:
 - Unknown: any long-term effect of the alternation, and whether this unit
   honors falling thresholds that are written to it.
 
-The alarms and Cooler Boost do not depend on the curve, and every measurement
-behind Candidate 14 was taken with this behavior present. The fix is planned
-before 1.0 under decision D-2: a new driver build that also writes the falling
-thresholds, and a curve re-tuned with them (DR-10, DR-12, DR-18, DR-20). DR-16
-adds a description of falling thresholds and of the curve the EC executes to
-`docs/PROFILE.md`.
+The alarms and Cooler Boost do not depend on the curve. That every published
+measurement of Candidate 14 was taken with this behavior present is inferred
+from the factory falling thresholds as well, because the legacy driver cannot
+read them (DR-15). The fix is planned before 1.0 under decision D-2: a new
+driver build that also writes the falling thresholds, and a curve re-tuned with
+them (DR-10, DR-12, DR-18, DR-20). DR-16 adds a description of falling
+thresholds and of the curve the EC executes to `docs/PROFILE.md`.
 
 ## Not claimed
 
