@@ -381,6 +381,11 @@ has a stall warning, `WARNING monitoring gap; ...` or
 pressure of the unit and the host. `SAFETY.md` describes this under "Host
 memory stalls".
 
+If the daemon kept running while its notifications failed, its journal can
+also have `WARNING runtime watchdog notification failed ...` before systemd's
+lines, with no `runtime watchdog notification succeeded again` after it.
+`SAFETY.md` describes this under "systemd watchdog and recovery".
+
 Neither an upgrade nor a reboot is needed. Once the machine is responsive
 again and cool, run `sudo msi-fan-profile apply-default` and continue with
 steps 3 and 4 above.

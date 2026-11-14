@@ -40,6 +40,7 @@ REAL_RECOVERY_WRITE = RECOVER.write
 REAL_MARK_RECOVERY_LATCH = RECOVER.mark_recovery_latch
 REAL_RECOVERY_LATCH_PRESENT = RECOVER.recovery_latch_present
 REAL_ACQUIRE_LOCK = RECOVER.acquire_lock
+REAL_KEEPER_HEARTBEAT = RECOVER.keeper_heartbeat
 HOST_PATH_PREFIXES = ("/run/", "/sys/", "/proc/", "/dev/", "/etc/", "/var/")
 REAL_PATH_OPEN = pathlib.Path.open
 
@@ -445,12 +446,15 @@ class FanResponseTests(HardwareIsolatedTestCase):
 class IncrementalKeeperTests(HardwareIsolatedTestCase):
     def run_keeper_cycles(self, rpm, unavailable=False, *, duration=14,
                           resume_at=None, timing_setting="0", rpm_delay=0.0,
-                          heartbeat_error_at=None, ready_error=None, clock_gap_at=None,
-                          pressure=None):
+                          heartbeat_error_at=None, notify_failure_at=None,
+                          real_heartbeat=False, clock_gap_at=None, pressure=None):
         """Mock sysfs and clock; switch Boost off after every repair cycle.
 
         rpm_delay is seconds per RPM read, or a function of the time. pressure
         maps memory-pressure and cgroup paths to their text or an exception.
+        notify_failure_at(now, message) returns the error that notify() raises
+        for that message, or None. real_heartbeat sends the heartbeats through
+        the real keeper_heartbeat(), and so through notify().
         """
         clock = {"now": 0.0, "offset": 0.0}
         state = {
@@ -462,6 +466,9 @@ class IncrementalKeeperTests(HardwareIsolatedTestCase):
         sleeps = []
         heartbeats = []
         self.failed_heartbeats = []
+        # Messages sent through notify(), and those whose send failed.
+        self.notifications = []
+        self.failed_notifications = []
         # Boost writes and memory-pressure reads in the order they happen.
         self.events = []
         stderr = io.StringIO()
@@ -482,6 +489,15 @@ class IncrementalKeeperTests(HardwareIsolatedTestCase):
                 return
             # An undrained notify socket makes the send time out after 0.5 s.
             self.failed_heartbeats.append(clock["now"])
+            clock["now"] += 0.5
+            raise error
+
+        def fake_notify(message):
+            error = notify_failure_at(clock["now"], message) if notify_failure_at else None
+            if error is None:
+                self.notifications.append((clock["now"], message))
+                return
+            self.failed_notifications.append((clock["now"], message))
             clock["now"] += 0.5
             raise error
 
@@ -524,7 +540,7 @@ class IncrementalKeeperTests(HardwareIsolatedTestCase):
         try:
             with mock.patch.object(RECOVER, "stage_full_cooling"), \
                     mock.patch.object(RECOVER, "mark_recovery_latch"), \
-                    mock.patch.object(RECOVER, "notify", side_effect=ready_error), \
+                    mock.patch.object(RECOVER, "notify", side_effect=fake_notify), \
                     mock.patch.object(RECOVER, "recovery_identity", return_value={
                         RECOVER.fan_control.SOURCE_PATH: RECOVER.fan_control.LEGACY_SRCVERSION}), \
                     mock.patch.object(RECOVER, "read", side_effect=lambda path: state[path.name]), \
@@ -532,7 +548,8 @@ class IncrementalKeeperTests(HardwareIsolatedTestCase):
                     mock.patch.object(RECOVER, "read_pressure", side_effect=fake_read_pressure), \
                     mock.patch.object(RECOVER, "read_uint", side_effect=fake_rpm) as reading_rpm, \
                     mock.patch.object(RECOVER, "one_hwmon", discovery), \
-                    mock.patch.object(RECOVER, "keeper_heartbeat", side_effect=fake_heartbeat), \
+                    mock.patch.object(RECOVER, "keeper_heartbeat", side_effect=(
+                        REAL_KEEPER_HEARTBEAT if real_heartbeat else fake_heartbeat)), \
                     mock.patch.object(RECOVER, "verify_boost", side_effect=AssertionError("blocking verification")), \
                     mock.patch.object(RECOVER.time, "monotonic", side_effect=lambda: clock["now"]), \
                     mock.patch.object(RECOVER.time, "clock_gettime", side_effect=boottime), \
@@ -713,12 +730,34 @@ class IncrementalKeeperTests(HardwareIsolatedTestCase):
     def test_failed_startup_notifications_still_fail_the_keeper(self):
         # The heartbeat before READY=1 and READY=1 itself stay strict: the
         # exception leaves run_keeper() and main(), and the process exits 1.
-        for label, failure in (
-                ("first heartbeat",
-                 {"heartbeat_error_at": lambda _now: TimeoutError("timed out")}),
-                ("READY=1", {"ready_error": TimeoutError("timed out")})):
-            with self.subTest(label), self.assertRaises(TimeoutError):
-                self.run_keeper_cycles(5000, **failure)
+        # Only the named notification fails. The first heartbeat goes through
+        # the real keeper_heartbeat(), so a catch inside it fails this too.
+        for label, failing, options in (
+                ("first heartbeat", "WATCHDOG=1", {"real_heartbeat": True}),
+                ("READY=1", "READY=1", {})):
+            with self.subTest(label):
+                def fail(_now, message):
+                    return (TimeoutError("timed out") if message.split("\n")[0] == failing
+                            else None)
+                with self.assertRaises(TimeoutError):
+                    self.run_keeper_cycles(5000, notify_failure_at=fail, **options)
+                # The failed send was the last one: no READY=1 after a failed
+                # first heartbeat, no repair pass and no STOPPING=1.
+                self.assertEqual([message.split("\n")[0]
+                                  for _, message in self.failed_notifications], [failing])
+                self.assertEqual(self.notifications, [])
+                self.assertEqual(self.events, [])
+
+    def test_missing_notify_socket_at_runtime_still_ends_the_keeper(self):
+        # Without NOTIFY_SOCKET, notify() raises RuntimeError, not an OSError,
+        # and the per-pass catch lets it end the keeper.
+        with self.assertRaisesRegex(RuntimeError, "^NOTIFY_SOCKET is absent$"):
+            self.run_keeper_cycles(5000, heartbeat_error_at=lambda now: (
+                RuntimeError("NOTIFY_SOCKET is absent") if now == 5 else None))
+        self.assertEqual(self.failed_heartbeats, [5.0])
+        # The pass at 5 s repaired Boost before its heartbeat; no pass followed.
+        self.assertEqual([event[:2] for event in self.events],
+                         [(float(now), "write") for now in range(1, 6)])
 
     NO_PRESSURE = ("unit memory pressure unavailable: no cgroup file; "
                    "host memory pressure unavailable: FileNotFoundError")

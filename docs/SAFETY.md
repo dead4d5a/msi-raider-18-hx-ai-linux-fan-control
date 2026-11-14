@@ -192,7 +192,11 @@ notification socket during a host-wide out-of-memory stall, the program logs
 `WARNING runtime watchdog notification failed (consecutive failures: N)` with
 the error, at the first failure and then at most once a minute, and the loop
 goes on. Once a notification succeeds again after such a warning, one line
-says so. The watchdog, not a single failed notification, ends a controller
+says so. The minute counts from the last warning, across runs of failures: a
+run that starts less than a minute after a warning logs one only if it still
+fails once that minute is over, and nothing at all, not even that line, if it
+ends first. So a watchdog kill can follow failures that logged no warning of
+their own. The watchdog, not a single failed notification, ends a controller
 that stays silent: when no notification reaches systemd for 30 s, systemd
 kills the unit and records the result `watchdog`. As after any other
 watchdog timeout, `ExecStopPost` and the keeper then take over from the

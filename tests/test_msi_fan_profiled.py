@@ -938,9 +938,12 @@ class RecoveryHandoffMainLoopTests(HardwareFreeMainLoopTests):
             self.io_events.append((clock.now, "write", value))
             state["boost"] = value
 
-        def fake_apply(_wmi, preserve_boost, _heartbeat, **_options):
+        def fake_apply(_wmi, preserve_boost, heartbeat, *, startup=False):
             events.append("apply")
             preserves.append(preserve_boost)
+            if not startup:
+                # The Boost verification of an in-loop reapply heartbeats.
+                heartbeat("Verifying Cooler Boost: fans 4400/4400 RPM")
             state["curve"] = DAEMON.DEFAULT
             state["mode"] = "advanced"
             state["boost"] = "on" if preserve_boost else "off"
@@ -1918,6 +1921,85 @@ class RecoveryHandoffMainLoopTests(HardwareFreeMainLoopTests):
         self.assertEqual(self.notifications, [])
         self.assertEqual(writes, [])
 
+    def last_health_sample(self):
+        return max(call.args[0]["sampled_monotonic_ns"]
+                   for call in self.health_publisher.call_args_list)
+
+    def test_missing_notify_socket_at_runtime_still_ends_the_daemon(self):
+        # Without NOTIFY_SOCKET, notify() raises ProfileError, not an OSError,
+        # and the per-pass catch lets it end the daemon.
+        def absent(now, message):
+            if now == 10 and message.startswith("WATCHDOG=1\n"):
+                return DAEMON.ProfileError("NOTIFY_SOCKET is absent")
+            return None
+        self.run_startup(True, notify_failure_at=absent, via_entrypoint=True)
+        self.assertEqual(self.exit_status, 1)
+        self.assertTrue(self.stderr.getvalue().endswith(
+            "ERROR ProfileError: NOTIFY_SOCKET is absent\n"))
+        self.assertNotIn("runtime watchdog notification", self.stderr.getvalue())
+        self.assertEqual(self.last_health_sample(), 10_000_000_000)
+
+    def test_failed_reapply_heartbeat_still_ends_the_daemon(self):
+        # A resume and a revert to the factory curve each make the loop reapply
+        # Candidate 14; a failed heartbeat of its Boost verification is fatal.
+        def revert(now, state):
+            if now == 5:
+                state.update(curve=DAEMON.FACTORY, mode="auto")
+
+        def verifying(_now, message):
+            return TimeoutError("timed out") if "Verifying Cooler Boost" in message else None
+        for label, trigger in (
+                ("resume", {"suspend_offset_at": lambda now: 1000 if now >= 5 else 0}),
+                ("factory revert", {"event_at": revert})):
+            with self.subTest(label):
+                self.health_publisher.reset_mock()
+                *_, events = self.run_startup(
+                    True, notify_failure_at=verifying, via_entrypoint=True, **trigger)
+                self.assertEqual(self.exit_status, 1)
+                self.assertTrue(self.stderr.getvalue().endswith(
+                    "ERROR TimeoutError: timed out\n"))
+                self.assertEqual(events, ["apply", "consume", "apply"])
+                self.assertEqual([at for at, _ in self.failed_notifications], [5.0])
+                # No pass followed: the last sample and heartbeat are those at 4 s.
+                self.assertEqual(self.last_health_sample(), 4_000_000_000)
+                self.assertEqual(self.notifications[-1][0], 4.0)
+                self.assertNotIn("runtime watchdog notification", self.stderr.getvalue())
+
+    def test_failed_restoring_heartbeat_ends_the_stop_before_the_factory_restore(self):
+        # Every notification fails from 3 s on. The loop reports the runtime
+        # failures and goes on; the clean stop's first heartbeat is fatal.
+        self.run_startup(False, duration=60.0, override_at=5.0, via_entrypoint=True,
+                         notify_failure_at=lambda now, _message: (
+                             TimeoutError("timed out") if now >= 3 else None))
+        self.assertEqual(self.exit_status, 1)
+        self.assertTrue(self.stderr.getvalue().endswith("ERROR TimeoutError: timed out\n"))
+        warnings, _ = self.notification_reports(self.stderr.getvalue())
+        self.assertEqual(len(warnings), 1)
+        self.assertEqual([at for at, _ in self.failed_notifications], [3.0, 4.0, 5.0])
+        self.assertEqual(self.failed_notifications[-1][1],
+                         "WATCHDOG=1\nSTATUS=Restoring factory auto")
+        self.factory_restore.assert_not_called()
+        self.factory_release.assert_not_called()
+
+    def test_failed_confirmation_heartbeat_keeps_boost_on_and_ends_the_daemon(self):
+        # The readings are cool, but the clean stop's first confirmation
+        # heartbeat times out: the release is refused and Boost stays on.
+        def confirming(_now, message):
+            return TimeoutError("timed out") if "Factory auto restored" in message else None
+        state, writes, *_ = self.run_startup(
+            False, duration=60.0, override_at=5.0, via_entrypoint=True,
+            stop_readings_at=lambda _now: self.COOL_RELEASE, notify_failure_at=confirming)
+        self.assertEqual(self.exit_status, 1)
+        self.assertTrue(self.stderr.getvalue().endswith(
+            "ERROR ProfileError: factory restored; Boost release unsafe\n"))
+        self.factory_restore.assert_called_once_with()
+        self.assertEqual(self.release_samples, [5.0])
+        self.assertEqual([at for at, _ in self.failed_notifications], [5.0])
+        # The refusal reasserted Boost after the 0.5 s timeout; nothing wrote off.
+        self.assertEqual(writes, [(5.5, "on")])
+        self.assertEqual(state["boost"], "on")
+        self.assertFalse(any("STOPPING=1" in message for _, message in self.notifications))
+
 
 class CleanStopReleaseTests(HardwareFreeMainLoopTests):
     """release_factory_if_cool() against a fake EC, clock and heartbeat."""
@@ -2080,7 +2162,9 @@ class StartupGuardMainTests(HardwareFreeMainLoopTests):
 
     KERNEL = "7.0.0-99-generic"
 
-    def run_entrypoint(self, *, driver_loaded=True, hwmon=(), real_identity=True):
+    def run_entrypoint(self, *, driver_loaded=True, hwmon=(), real_identity=True,
+                       notify_failure=None):
+        """notify_failure(message) returns the error notify() raises, or None."""
         class Clock:
             now = 0.0
 
@@ -2129,6 +2213,12 @@ class StartupGuardMainTests(HardwareFreeMainLoopTests):
             DAEMON.STOP = True
             return True
 
+        def fake_notify(message):
+            error = notify_failure(message) if notify_failure else None
+            if error is not None:
+                raise error
+            notifications.append(message)
+
         original_stop = DAEMON.STOP
         DAEMON.STOP = False
         try:
@@ -2161,7 +2251,7 @@ class StartupGuardMainTests(HardwareFreeMainLoopTests):
                 stack.enter_context(mock.patch.object(
                     DAEMON, "release_factory_if_cool", return_value=True))
                 stack.enter_context(mock.patch.object(
-                    DAEMON, "notify", side_effect=notifications.append))
+                    DAEMON, "notify", side_effect=fake_notify))
                 stack.enter_context(mock.patch.object(DAEMON.signal, "signal"))
                 stack.enter_context(mock.patch.object(DAEMON.os, "geteuid", return_value=0))
                 stack.enter_context(mock.patch.object(DAEMON.os, "open", return_value=9))
@@ -2221,6 +2311,22 @@ class StartupGuardMainTests(HardwareFreeMainLoopTests):
             "ERROR ProfileError: expected one coretemp hwmon; found 0\n"))
         self.assertFalse(any(item.startswith("READY=1") for item in notifications))
         self.apply.assert_not_called()
+        self.assertEqual(writes, [])
+
+    def test_failed_hwmon_wait_heartbeat_still_fails_startup(self):
+        # The heartbeats of the hwmon wait come before READY=1 and stay strict.
+        missing = DAEMON.ProfileError("expected one msi_wmi_platform hwmon; found 0")
+        result, stderr, writes, notifications, sleeps = self.run_entrypoint(
+            hwmon=(missing,) * 4 + (pathlib.Path("/fake/wmi"), pathlib.Path("/fake/core")),
+            real_identity=False, notify_failure=lambda message: (
+                TimeoutError("timed out") if "Waiting for" in message else None))
+        self.assertEqual(result, 1)
+        self.assertTrue(stderr.endswith("ERROR TimeoutError: timed out\n"))
+        # The first wait's heartbeat failed: no retry, no apply and no write.
+        self.assertEqual(sleeps, [])
+        self.assertEqual(self.discovery.call_count, 1)
+        self.apply.assert_not_called()
+        self.assertEqual(notifications, [])
         self.assertEqual(writes, [])
 
     def test_duplicate_hwmon_is_never_accepted_while_waiting(self):
