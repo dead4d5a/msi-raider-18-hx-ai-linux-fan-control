@@ -743,7 +743,8 @@ class RecoveryHandoffMainLoopTests(HardwareFreeMainLoopTests):
                     event_at=None, suspend_offset_at=None, initial_verified=True,
                     clock_gap_at=None, sensor_delay_at=None, timing_setting=None,
                     control_at=None, override_at=None, factory_released=True,
-                    initial_boost="on", stop_readings_at=None):
+                    initial_boost="on", stop_readings_at=None, notify_failure_at=None,
+                    via_entrypoint=False):
         class Clock:
             now = 0.0
 
@@ -786,6 +787,17 @@ class RecoveryHandoffMainLoopTests(HardwareFreeMainLoopTests):
         self.ec_arguments = []
         self.release_samples = []
         self.notifications = []
+        self.failed_notifications = []
+
+        def fake_notify(message):
+            failure = notify_failure_at(clock.now, message) if notify_failure_at else None
+            if failure is None:
+                self.notifications.append((clock.now, message))
+                return
+            # An undrained notify socket makes the send time out after 0.5 s.
+            self.failed_notifications.append((clock.now, message))
+            clock.now += 0.5
+            raise failure
 
         def fake_read(path):
             text = str(path)
@@ -892,9 +904,7 @@ class RecoveryHandoffMainLoopTests(HardwareFreeMainLoopTests):
                     self.factory_release = stack.enter_context(mock.patch.object(
                         DAEMON, "release_factory_if_cool", return_value=factory_released))
                 stack.enter_context(mock.patch.object(
-                    DAEMON, "notify",
-                    side_effect=lambda message: self.notifications.append(
-                        (clock.now, message))))
+                    DAEMON, "notify", side_effect=fake_notify))
                 stack.enter_context(mock.patch.object(
                     DAEMON.os, "geteuid", return_value=0))
                 stack.enter_context(mock.patch.object(DAEMON.os, "open", return_value=9))
@@ -906,9 +916,15 @@ class RecoveryHandoffMainLoopTests(HardwareFreeMainLoopTests):
                     DAEMON.time, "clock_gettime", side_effect=clock.boottime))
                 stack.enter_context(mock.patch.object(
                     DAEMON.time, "sleep", side_effect=clock.sleep))
+                if via_entrypoint:
+                    # entrypoint() would install the daemon's signal handlers here.
+                    stack.enter_context(mock.patch.object(DAEMON.signal, "signal"))
                 self.stderr = io.StringIO()
                 with contextlib.redirect_stderr(self.stderr):
-                    self.assertEqual(DAEMON.main(), 0)
+                    if via_entrypoint:
+                        self.exit_status = DAEMON.entrypoint()
+                    else:
+                        self.assertEqual(DAEMON.main(), 0)
         finally:
             DAEMON.STOP = original_stop
             DAEMON.BOOST_REQUEST = original_boost_request
@@ -1529,6 +1545,86 @@ class RecoveryHandoffMainLoopTests(HardwareFreeMainLoopTests):
         self.health_publisher.side_effect = OSError("publication unavailable")
         state, _, *_ = self.run_startup(False)
         self.assertEqual(state["boost"], "on")
+
+    @staticmethod
+    def notification_reports(stderr):
+        lines = stderr.splitlines()
+        return ([line for line in lines
+                 if line.startswith("WARNING runtime watchdog notification failed")],
+                [line for line in lines
+                 if line.startswith("runtime watchdog notification succeeded again")])
+
+    def test_failed_runtime_notifications_do_not_stop_working_cooling(self):
+        # A service manager that does not drain its notify socket during a
+        # host-wide out-of-memory stall: three passes in a row time out.
+        def blocked(now, message):
+            if 10 <= now <= 12 and message.startswith("WATCHDOG=1\n"):
+                return TimeoutError("timed out")
+            return None
+        control_state, control_writes, *_ = self.run_startup(True)
+        control_health = [call.args[0] for call in self.health_publisher.call_args_list]
+        self.health_publisher.reset_mock()
+        with mock.patch.object(DAEMON.time, "perf_counter_ns",
+                               side_effect=AssertionError("diagnostics disabled")):
+            state, writes, *_ = self.run_startup(True, notify_failure_at=blocked)
+        self.assertEqual([at for at, _ in self.failed_notifications], [10.0, 11.0, 12.0])
+        # Same EC writes and health snapshots, at the same one-second cadence.
+        self.assertEqual(writes, control_writes)
+        self.assertEqual(writes, [(30.0, "off")])
+        self.assertEqual(state, control_state)
+        self.assertEqual([call.args[0] for call in self.health_publisher.call_args_list],
+                         control_health)
+        warnings, recovered = self.notification_reports(self.stderr.getvalue())
+        self.assertEqual(warnings, [
+            "WARNING runtime watchdog notification failed (consecutive failures: 1); "
+            "monitoring continues, and systemd's watchdog ends the daemon if "
+            "notifications stay broken: TimeoutError: timed out"])
+        self.assertEqual(recovered, [
+            "runtime watchdog notification succeeded again (consecutive failures: 3)"])
+        beats = [at for at, message in self.notifications if message.startswith("WATCHDOG=1\n")]
+        self.assertEqual([at for at in beats if 8 <= at <= 14], [8.0, 9.0, 13.0, 14.0])
+
+    def test_failed_runtime_notifications_warn_at_most_once_a_minute(self):
+        # No watchdog runs here, so one run of failures can outlast a minute.
+        # A short run within a minute of the last warning stays silent.
+        failing = set(range(5, 71)) | {80, 81, 130}
+
+        def refused(now, message):
+            if now in failing and message.startswith("WATCHDOG=1\n"):
+                return ConnectionRefusedError(errno.ECONNREFUSED, "Connection refused")
+            return None
+        state, writes, *_ = self.run_startup(True, duration=135, notify_failure_at=refused)
+        self.assertEqual(len(self.failed_notifications), len(failing))
+        self.assertEqual(writes, [(30.0, "off")])
+        self.assertEqual(state["boost"], "off")
+        warnings, recovered = self.notification_reports(self.stderr.getvalue())
+        self.assertEqual([line.split(";")[0] for line in warnings], [
+            "WARNING runtime watchdog notification failed (consecutive failures: 1)",
+            "WARNING runtime watchdog notification failed (consecutive failures: 61)",
+            "WARNING runtime watchdog notification failed (consecutive failures: 1)"])
+        self.assertTrue(all(line.endswith(
+            f": ConnectionRefusedError: [Errno {errno.ECONNREFUSED}] Connection refused")
+            for line in warnings))
+        self.assertEqual(recovered, [
+            "runtime watchdog notification succeeded again (consecutive failures: 66)",
+            "runtime watchdog notification succeeded again (consecutive failures: 1)"])
+
+    def test_failed_ready_notification_still_fails_startup(self):
+        def refused(_now, message):
+            if message.startswith("READY=1\n"):
+                return ConnectionRefusedError(errno.ECONNREFUSED, "Connection refused")
+            return None
+        _, writes, *_ = self.run_startup(True, notify_failure_at=refused, via_entrypoint=True)
+        self.assertEqual(self.exit_status, 1)
+        self.assertTrue(self.stderr.getvalue().endswith(
+            f"ERROR ConnectionRefusedError: [Errno {errno.ECONNREFUSED}] Connection refused\n"))
+        self.assertNotIn("runtime watchdog notification", self.stderr.getvalue())
+        # The first pass published health and failed READY=1; no pass followed.
+        self.assertEqual(len(self.health_publisher.call_args_list), 1)
+        self.assertEqual([message.split("\n")[0] for _, message in self.failed_notifications],
+                         ["READY=1"])
+        self.assertEqual(self.notifications, [])
+        self.assertEqual(writes, [])
 
 
 class CleanStopReleaseTests(HardwareFreeMainLoopTests):

@@ -440,7 +440,8 @@ class FanResponseTests(HardwareIsolatedTestCase):
 
 class IncrementalKeeperTests(HardwareIsolatedTestCase):
     def run_keeper_cycles(self, rpm, unavailable=False, *, duration=14,
-                          resume_at=None, timing_setting="0", rpm_delay=0.0):
+                          resume_at=None, timing_setting="0", rpm_delay=0.0,
+                          heartbeat_error_at=None, ready_error=None):
         """Mock sysfs and clock; switch Boost off after every repair cycle."""
         clock = {"now": 0.0, "offset": 0.0}
         state = {
@@ -451,9 +452,20 @@ class IncrementalKeeperTests(HardwareIsolatedTestCase):
         writes = []
         sleeps = []
         heartbeats = []
+        self.failed_heartbeats = []
         stderr = io.StringIO()
         original_stop = RECOVER.STOP
         RECOVER.STOP = False
+
+        def fake_heartbeat(status):
+            error = heartbeat_error_at(clock["now"]) if heartbeat_error_at else None
+            if error is None:
+                heartbeats.append(status)
+                return
+            # An undrained notify socket makes the send time out after 0.5 s.
+            self.failed_heartbeats.append(clock["now"])
+            clock["now"] += 0.5
+            raise error
 
         def fake_write(path, value):
             writes.append((clock["now"], path.name, value))
@@ -491,14 +503,14 @@ class IncrementalKeeperTests(HardwareIsolatedTestCase):
         try:
             with mock.patch.object(RECOVER, "stage_full_cooling"), \
                     mock.patch.object(RECOVER, "mark_recovery_latch"), \
-                    mock.patch.object(RECOVER, "notify"), \
+                    mock.patch.object(RECOVER, "notify", side_effect=ready_error), \
                     mock.patch.object(RECOVER, "recovery_identity", return_value={
                         RECOVER.fan_control.SOURCE_PATH: RECOVER.fan_control.LEGACY_SRCVERSION}), \
                     mock.patch.object(RECOVER, "read", side_effect=lambda path: state[path.name]), \
                     mock.patch.object(RECOVER, "write", side_effect=fake_write), \
                     mock.patch.object(RECOVER, "read_uint", side_effect=fake_rpm) as reading_rpm, \
                     mock.patch.object(RECOVER, "one_hwmon", discovery), \
-                    mock.patch.object(RECOVER, "keeper_heartbeat", side_effect=heartbeats.append), \
+                    mock.patch.object(RECOVER, "keeper_heartbeat", side_effect=fake_heartbeat), \
                     mock.patch.object(RECOVER, "verify_boost", side_effect=AssertionError("blocking verification")), \
                     mock.patch.object(RECOVER.time, "monotonic", side_effect=lambda: clock["now"]), \
                     mock.patch.object(RECOVER.time, "clock_gettime", side_effect=boottime), \
@@ -621,6 +633,70 @@ class IncrementalKeeperTests(HardwareIsolatedTestCase):
         self.assertEqual(timing.last_observation_gap_seconds, 2.5)
         self.assertEqual(timing.max_observation_gap_seconds, 2.5)
         self.assertEqual(timing.max_rpm_read_duration_ms, 100.0)
+
+    @staticmethod
+    def notification_reports(stderr):
+        lines = stderr.splitlines()
+        return ([line for line in lines
+                 if line.startswith("WARNING runtime watchdog notification failed")],
+                [line for line in lines
+                 if line.startswith("runtime watchdog notification succeeded again")])
+
+    def test_failed_runtime_notifications_do_not_interrupt_repair(self):
+        # Three passes in a row cannot reach a service manager that does not
+        # drain its notify socket; the keeper still repairs every second.
+        control_state, control_writes, _, control_heartbeats = self.run_keeper_cycles(5000)
+        state, writes, sleeps, heartbeats = self.run_keeper_cycles(
+            5000, heartbeat_error_at=lambda now: (
+                TimeoutError("timed out") if 4 <= now <= 6 else None))
+        self.assertEqual(self.failed_heartbeats, [4.0, 5.0, 6.0])
+        self.assertEqual(writes, control_writes)
+        self.assertEqual(writes, [(float(now), "cooler_boost", "on") for now in range(1, 14)])
+        self.assertEqual(state, control_state)
+        # Each timed-out send costs 0.5 s of its pass; the cadence holds.
+        self.assertEqual(sleeps, [1.0] * 4 + [0.5] * 3 + [1.0] * 7)
+        self.assertEqual(len(heartbeats), len(control_heartbeats) - 3)
+        self.assertEqual(self.diagnostic_reads, 0)
+        warnings, recovered = self.notification_reports(self.stderr)
+        self.assertEqual(warnings, [
+            "WARNING runtime watchdog notification failed (consecutive failures: 1); "
+            "full cooling stays asserted, and systemd's watchdog ends the keeper if "
+            "notifications stay broken: TimeoutError: timed out"])
+        self.assertEqual(recovered, [
+            "runtime watchdog notification succeeded again (consecutive failures: 3)"])
+
+    def test_failed_runtime_notifications_warn_at_most_once_a_minute(self):
+        # No watchdog runs here, so one run of failures can outlast a minute.
+        # A short run within a minute of the last warning stays silent.
+        failing = set(range(5, 71)) | {80, 81, 130}
+        state, writes, _, _ = self.run_keeper_cycles(
+            5000, duration=135, heartbeat_error_at=lambda now: (
+                ConnectionRefusedError(errno.ECONNREFUSED, "Connection refused")
+                if now in failing else None))
+        self.assertEqual(len(self.failed_heartbeats), len(failing))
+        self.assertEqual(writes, [(float(now), "cooler_boost", "on") for now in range(1, 135)])
+        self.assertEqual(state["cooler_boost"], "on")
+        warnings, recovered = self.notification_reports(self.stderr)
+        self.assertEqual([line.split(";")[0] for line in warnings], [
+            "WARNING runtime watchdog notification failed (consecutive failures: 1)",
+            "WARNING runtime watchdog notification failed (consecutive failures: 61)",
+            "WARNING runtime watchdog notification failed (consecutive failures: 1)"])
+        self.assertTrue(all(line.endswith(
+            f": ConnectionRefusedError: [Errno {errno.ECONNREFUSED}] Connection refused")
+            for line in warnings))
+        self.assertEqual(recovered, [
+            "runtime watchdog notification succeeded again (consecutive failures: 66)",
+            "runtime watchdog notification succeeded again (consecutive failures: 1)"])
+
+    def test_failed_startup_notifications_still_fail_the_keeper(self):
+        # The heartbeat before READY=1 and READY=1 itself stay strict: the
+        # exception leaves run_keeper() and main(), and the process exits 1.
+        for label, failure in (
+                ("first heartbeat",
+                 {"heartbeat_error_at": lambda _now: TimeoutError("timed out")}),
+                ("READY=1", {"ready_error": TimeoutError("timed out")})):
+            with self.subTest(label), self.assertRaises(TimeoutError):
+                self.run_keeper_cycles(5000, **failure)
 
 
 class IdentitySnapshotTests(HardwareIsolatedTestCase):

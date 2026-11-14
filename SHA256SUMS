@@ -2,7 +2,7 @@
 0072eedaed218fa9252de44c7d6bc73adf395b90e437f41b1ded9eee30bbbbce  ./.github/ISSUE_TEMPLATE/compatibility.yml
 497151dc12ad9b0a5527a38ecf8703c9e9ce8c2d6c8af3b33809b294c230a1b6  ./.github/workflows/checks.yml
 47f5d2d77b0f5f1615c97d66c027f581c55d8388810c38d566cf14c3cd304bf4  ./.gitignore
-ec9a823c7b0df0d1f656bc1e0e9b1a8a8db6c6acae618bac226bd2a63f900766  ./CHANGELOG.md
+efacf19b5ffdc6b2b71e7fb5880d2e9e514c9ed35cebb1928c018388a9f70720  ./CHANGELOG.md
 6633d875a37172286ab88eb20e611e3d222abc2607b5fe4d170604dd64a269d0  ./CONTRIBUTING.md
 e81c85b024709a55bdbe56407c8160fde57303aabd3cf2b389cf44529f32807a  ./LICENSE.md
 8177f97513213526df2cf6184d8ff986c675afb514d4e68a404010521b880643  ./LICENSES/GPL-2.0-or-later.txt
@@ -22,7 +22,7 @@ ded2668f6553c3879f8f3eb8ab3610b3dbde452f787187d5f10efefc2590f280  ./docs/INSTALL
 eee64c6788d28c1f3ac35b3d5815ef525ef42ed566cf34bb12d5cb5ca6b9db64  ./docs/OPERATIONS.md
 4815c16e5e409c029aa7dd00efd80040960ea689cf4e782e41295f367efbd9aa  ./docs/PROFILE.md
 2fc99db9b85782d84984c07b3c8fec2a0fa5305f87057328c55bac00d11883eb  ./docs/ROLLBACK.md
-51ba215cac0c96291558726232fe9f5def834d2c2818201c317f4e80f538e25b  ./docs/SAFETY.md
+d900ab373fdb43bec81ba39db609822a65f9b2b5936b437a0594ed1a421dbf16  ./docs/SAFETY.md
 c80910a48c42d83396d2c032102c858474dc4cbf43b140df613f93ad47a371a5  ./docs/VALIDATION.md
 d3858dfc3ed367dbbefd03f11e483019a47fd25335f44bfb8103de335efa75f8  ./kernel/postinst.d/zz-msi-fan-profile-readiness
 0b27ad8fb03613fe3bdbdc39598dc59c438c30f78c311eb125076f7562069f37  ./patches/msi-ec-0.13.1-exact-fan-curve.patch
@@ -37,8 +37,8 @@ e96e13bcd881524f13eb7b1eb42e2e34a79a1e2044e1183f20148f924902fe5d  ./scripts/sele
 588ead13d0dff48351e048b1d5ff06f6ec9de099c466602b0355b6c12f2db171  ./scripts/verify-release-unprivileged.sh
 e54ef084d8e7d22e778351aedc94695a879165876436a430b4719a3a3d8ff25e  ./scripts/verify-release.sh
 ad12cfc4fc6f6e10cf0468a462f0e95fe43cec8c1117e09330a101aab007f6cd  ./src/msi-fan-profile
-924d38b426ef35277637d968768351a01dfec5d798ca9ae5fca9dac6ec54eb7a  ./src/msi-fan-profiled
-b73cdffaa24036c09c21cc3294916d01e20920f28225d37f85e397159d7c23bd  ./src/msi-gpu-recover
+b858bbf22672879d2d82aeaf814c2534be7ce4b06f7e4448d450b83a6fbd15fc  ./src/msi-fan-profiled
+d4eac6ca74663abb0579b2c76ec4c1fca7bdb20628b6b1c42cf74aa83681f4f9  ./src/msi-gpu-recover
 53073c9c20b30a91d1f08e50812c10f6716d16e9f19d8ded630437c77a12cf81  ./src/msi_fan_control.py
 6a42777cebba89850bbbefd12c743ea27d44b94dc65dacc0cb9e62460e1e3a8f  ./systemd/msi-fan-profile-keeper.service
 3fe34cbdc80c482fa9cbc64738340cc76717935de1698e0ec87273e5b57bb07a  ./systemd/msi-fan-profile.service
@@ -47,8 +47,8 @@ b73cdffaa24036c09c21cc3294916d01e20920f28225d37f85e397159d7c23bd  ./src/msi-gpu-
 487d94dada00e422feaf9fbda7ba922758bba0d0a688d63700e2a79144c84af1  ./tests/test_kernel_readiness.py
 b26f61f0838001ab635369e23eba5ce0c38d86b5b3f1f09ad38c7662577078e7  ./tests/test_msi_fan_control.py
 8d0a6e0fbe77e18120d969c1ceb6d0b0c37e8c3194537d8075837217e711f783  ./tests/test_msi_fan_profile.py
-abb245063342e388e919c3161c57ec5ec73444579319af57f06e6906aa58af21  ./tests/test_msi_fan_profiled.py
-69e3075478ef44f65081a705a14a1b1eb8f6b9de2c9c1efc471242d86b0a5fdc  ./tests/test_msi_gpu_recover.py
+bb84699f83cf537146c8e68d1fab14a3285d2a5e655c7ae0fe9133c17985f8eb  ./tests/test_msi_fan_profiled.py
+ddcb28983072fb65c46570065ca828c5c01dd6d8ada9a156c7902046cd748a17  ./tests/test_msi_gpu_recover.py
 c0efa440c9874000dd711552b1f01b44813290692cdc14fdeee89fce2bc81772  ./tests/test_systemd_integration.py
 2aa1cf03e482dd64a1c34a70357c368b0cf2fe8695749407eef8ad4a4e312059  ./tests/test_systemd_units.py
 5a3c8353b33251357293201e3850103c520db4550f82d890d19e3983ff91a785  ./tests/test_uninstall_profile.py

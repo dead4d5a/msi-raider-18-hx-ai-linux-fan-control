@@ -90,8 +90,10 @@ High temperature alone is not proof that the fan controller is unsafe: once
 both physical fans have verified at maximum cooling, stopping the daemon would
 only lose monitoring during a persistent high-heat condition. The daemon still
 fails and invokes full-cooling recovery for an invalid identity, curve/state
-drift, a write/readback error, watchdog failure, or a plausible-but-low physical
-fan response. Invalid telemetry instead enters the degraded state below.
+drift, a write/readback error, a watchdog timeout, or a plausible-but-low
+physical fan response. A failed watchdog notification alone is reported and
+does not end it (section 7). Invalid telemetry instead enters the degraded
+state below.
 The response floor is 3,000 RPM per fan, not proof of maximum physical speed.
 Runtime response evidence is checked once per monitoring pass, separately for
 each healthy fan channel. A failure requires the 12-second response allowance
@@ -181,6 +183,33 @@ The keeper has the same value because the same stall delays it: on 2026-11-13
 its former 5 s watchdog killed it three times within four minutes of one
 host-wide out-of-memory stall, and its start limit of three starts in 15
 minutes then left the EC at full cooling with no process supervising it.
+
+A failed runtime watchdog notification is reported and does not stop cooling.
+Each monitoring pass of the daemon and each repair pass of the keeper ends
+with one `WATCHDOG=1` notification that also carries the status line. If that
+send fails, for example because the service manager does not drain its
+notification socket during a host-wide out-of-memory stall, the program logs
+`WARNING runtime watchdog notification failed (consecutive failures: N)` with
+the error, at the first failure and then at most once a minute, and the loop
+goes on. Once a notification succeeds again after such a warning, one line
+says so. The watchdog, not a single failed notification, ends a controller
+that stays silent: when no notification reaches systemd for 30 s, systemd
+kills the unit and records the result `watchdog`. As after any other
+watchdog timeout, `ExecStopPost` and the keeper then take over from the
+daemon, and a killed keeper is restarted within its start limit. Before 0.2.1,
+one failed notification ended the daemon with exit status 1, recorded as the
+result `exit-code` like a fault the daemon detects itself, and the keeper took
+over at full cooling at once. It ended the keeper too, and three such exits
+within 15 minutes would have used up the keeper's start limit. This is the one
+deliberate exception to preferring a noisy machine: a failed notification no
+longer brings full cooling at once. Monitoring is not reduced: until the
+watchdog acts, the daemon keeps its one-second checks and latches Boost on
+every alarm, gap or invalid sample as before. Startup stays strict: a failed
+`READY=1`, or a failed heartbeat before it, still ends startup with exit
+status 1. Two other places stay strict too. A failed heartbeat while the
+daemon verifies Boost during a Candidate 14 reapply still ends the daemon in
+full-cooling recovery, and a failed heartbeat during the clean stop still
+refuses the Boost release and ends the stop in full cooling.
 
 After verified recovery cooling is staged, the helper or keeper records a
 root-owned, mode-`0600`, same-boot recovery-Boost marker. The daemon validates

@@ -41,6 +41,7 @@ FAN_RESPONSE_FLOOR_RPM = 3000
 FAN_PLAUSIBILITY_LIMIT_RPM = 10000
 FAN_RESPONSE_ALLOWANCE_SECONDS = 12.0
 KEEPER_REPORT_INTERVAL_SECONDS = 60.0
+NOTIFY_FAILURE_REPORT_SECONDS = 60.0
 POLL_INTERVAL_SECONDS = 1.0
 MAX_OBSERVATION_GAP_SECONDS = 2.0
 
@@ -207,6 +208,38 @@ class KeeperFanVerification:
             self.reported_classification = classification
             self.last_report = now
         return status, report
+
+
+@dataclass
+class NotificationFailures:
+    """Count failed runtime watchdog notifications and bound their reports.
+
+    A failed per-pass notification never ends the keeper; systemd's watchdog
+    decides whether notifications stay broken. The first failure is reported
+    at once and later ones at most once per NOTIFY_FAILURE_REPORT_SECONDS,
+    across runs of failures. A run with a report gets one line when a
+    notification succeeds again; a run without one stays silent.
+    """
+    consecutive: int = 0
+    reported: bool = False
+    last_report: float | None = None
+
+    def failed(self, now: float) -> bool:
+        """Count one failure; return whether to report it now."""
+        self.consecutive += 1
+        if (self.last_report is not None and
+                now - self.last_report < NOTIFY_FAILURE_REPORT_SECONDS):
+            return False
+        self.reported = True
+        self.last_report = now
+        return True
+
+    def succeeded(self) -> int:
+        """End a run of failures; return its length if it was reported, else 0."""
+        count = self.consecutive if self.reported else 0
+        self.consecutive = 0
+        self.reported = False
+        return count
 
 
 @dataclass
@@ -508,6 +541,7 @@ def run_keeper(profile: str) -> int:
     print("recovery keeper active; Candidate14/advanced and Cooler Boost will remain asserted",
           file=sys.stderr)
     verification = KeeperFanVerification()
+    notify_failures = NotificationFailures()
     wmi: pathlib.Path | None = None
     suspend_offset = time.clock_gettime(time.CLOCK_BOOTTIME) - time.monotonic()
     while not STOP:
@@ -543,8 +577,26 @@ def run_keeper(profile: str) -> int:
         # Exactly one RPM sample follows each completed control repair. Failed
         # telemetry never creates a multi-second verification sleep, and each
         # heartbeat describes both completed repair and current fan response.
-        response_status, report = verification.observe(response, time.monotonic())
-        keeper_heartbeat(f"{state}; {response_status}")
+        now = time.monotonic()
+        response_status, report = verification.observe(response, now)
+        try:
+            keeper_heartbeat(f"{state}; {response_status}")
+        except OSError as error:
+            # One undelivered datagram must not end the guard: three such exits
+            # within 15 minutes would use up the keeper's start limit. The
+            # watchdog ends a keeper whose notifications stay broken. Only this
+            # per-pass notification is caught; the startup ones still fail.
+            if notify_failures.failed(now):
+                print("WARNING runtime watchdog notification failed "
+                      f"(consecutive failures: {notify_failures.consecutive}); "
+                      "full cooling stays asserted, and systemd's watchdog ends "
+                      "the keeper if notifications stay broken: "
+                      f"{type(error).__name__}: {error}", file=sys.stderr)
+        else:
+            recovered = notify_failures.succeeded()
+            if recovered:
+                print("runtime watchdog notification succeeded again "
+                      f"(consecutive failures: {recovered})", file=sys.stderr)
         if report:
             print(f"recovery keeper retains Cooler Boost; {response_status}",
                   file=sys.stderr)

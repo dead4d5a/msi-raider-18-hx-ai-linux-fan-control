@@ -13,6 +13,14 @@ ends with its roadmap item ID in parentheses, and with its issue number too
 once that issue exists: `(ST-1)`, later `(ST-1, #N)`. When a version is cut,
 its section starts with a short summary, upgrade notes and known issues.
 
+### Changed
+
+- A failed runtime watchdog notification no longer ends the daemon, after
+  which the keeper took over at full cooling, or the keeper: a warning is
+  logged, the loop continues, and systemd's watchdog decides if notifications
+  stay broken. `READY=1` and the heartbeats during startup, a Candidate 14
+  reapply and the clean stop stay strict (ST-2).
+
 ### Fixed
 
 - Raise `WatchdogSec` of the controller and the keeper from 5 s to 30 s, so

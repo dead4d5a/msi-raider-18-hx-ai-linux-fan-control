@@ -49,6 +49,7 @@ RELEASE_REQUEST = False
 SUSTAINED_ALARM_SECONDS = 15.0
 SUSTAINED_ALARM_REPORT_SECONDS = 60.0
 SENSOR_DEGRADED_REPORT_SECONDS = 60.0
+NOTIFY_FAILURE_REPORT_SECONDS = 60.0
 BOOST_RESPONSE_SECONDS = 12.0
 BOOST_LOW_EVIDENCE_SECONDS = 2.0
 BOOST_RESPONSE_RPM = 3000
@@ -698,6 +699,38 @@ class SensorHold:
         return True
 
 
+@dataclass
+class NotificationFailures:
+    """Count failed runtime watchdog notifications and bound their reports.
+
+    A failed per-pass notification never ends the loop; systemd's watchdog
+    decides whether notifications stay broken. The first failure is reported
+    at once and later ones at most once per NOTIFY_FAILURE_REPORT_SECONDS,
+    across runs of failures. A run with a report gets one line when a
+    notification succeeds again; a run without one stays silent.
+    """
+    consecutive: int = 0
+    reported: bool = False
+    last_report: float | None = None
+
+    def failed(self, now: float) -> bool:
+        """Count one failure; return whether to report it now."""
+        self.consecutive += 1
+        if (self.last_report is not None and
+                now - self.last_report < NOTIFY_FAILURE_REPORT_SECONDS):
+            return False
+        self.reported = True
+        self.last_report = now
+        return True
+
+    def succeeded(self) -> int:
+        """End a run of failures; return its length if it was reported, else 0."""
+        count = self.consecutive if self.reported else 0
+        self.consecutive = 0
+        self.reported = False
+        return count
+
+
 def acknowledge(action: str) -> None:
     temporary = pathlib.Path(f"/run/.msi-fan-profile.ack.{os.getpid()}")
     payload = f"pid={os.getpid()} action={action} monotonic_ns={time.monotonic_ns()}\n"
@@ -832,6 +865,7 @@ def main() -> int:
         observed_monotonic_ns: int | None = None
         ready = False
         last_health_error: float | None = None
+        notify_failures = NotificationFailures()
 
         def observe_response(boost: str, sample: RuntimeSample | None,
                              now: float) -> bool:
@@ -891,10 +925,32 @@ def main() -> int:
                           file=sys.stderr, flush=True)
                     last_health_error = now
             if not ready:
+                # Startup stays strict: a failed READY=1 ends the daemon.
                 notify(f"READY=1\nWATCHDOG=1\nSTATUS={status}")
                 ready = True
-            else:
+                return
+            try:
                 heartbeat(status)
+            except OSError as error:
+                # One undelivered datagram, such as to a service manager that
+                # does not drain its socket during a host-wide out-of-memory
+                # stall, must not end working cooling: the watchdog ends a
+                # daemon whose notifications stay broken. Only this per-pass
+                # notification is caught; the startup, reapply and clean-stop
+                # heartbeats still fail the daemon.
+                if notify_failures.failed(now):
+                    print("WARNING runtime watchdog notification failed "
+                          f"(consecutive failures: {notify_failures.consecutive}); "
+                          "monitoring continues, and systemd's watchdog ends the "
+                          "daemon if notifications stay broken: "
+                          f"{type(error).__name__}: {error}",
+                          file=sys.stderr, flush=True)
+            else:
+                recovered = notify_failures.succeeded()
+                if recovered:
+                    print("runtime watchdog notification succeeded again "
+                          f"(consecutive failures: {recovered})",
+                          file=sys.stderr, flush=True)
 
         def complete_iteration(started: float) -> None:
             if timing is not None:
