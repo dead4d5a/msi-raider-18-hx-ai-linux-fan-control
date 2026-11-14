@@ -13,6 +13,17 @@ ends with its roadmap item ID in parentheses, and with its issue number too
 once that issue exists: `(ST-1)`, later `(ST-1, #N)`. When a version is cut,
 its section starts with a short summary, upgrade notes and known issues.
 
+### Fixed
+
+- Raise `WatchdogSec` of the controller and the keeper from 5 s to 30 s, so
+  that a host-wide out-of-memory stall shorter than the watchdog no longer
+  makes systemd kill a healthy daemon or keeper, as the 5 s watchdog did on
+  2026-11-10 and 2026-11-13; the daemon still latches Cooler Boost in the
+  first pass that sees a gap of more than 2 s. A daemon stall of 7 to 30 s now
+  passes without Boost until the daemon resumes, and
+  `systemctl show -p WatchdogUSec msi-fan-profile.service` prints
+  `WatchdogUSec=30s` (ST-1).
+
 ## 0.2.0 - 2026-10-11
 
 Hardening release for the same laptop and firmware. A genuine daemon fault

@@ -140,7 +140,7 @@ budget, one-second monitoring, the watchdog or the 30-second cooldown.
 
 ### 7. systemd watchdog and recovery
 
-The service is `Type=notify` with a five-second watchdog and `SIGKILL` watchdog
+The service is `Type=notify` with a 30-second watchdog and `SIGKILL` watchdog
 action. `ExecStopPost` is root-owned and independently:
 
 - verifies exact immutable identity;
@@ -163,6 +163,24 @@ primary-service faults.
 Keeper RPM verification is incremental and never stalls control repair. An
 upgrade failure after activation begins likewise leaves runtime recovery and
 boot enablement intact instead of invoking factory rollback.
+
+Both units use `WatchdogSec=30s`. The watchdog does not enforce the one-second
+monitoring or the two-second freshness rule; the daemon enforces both itself.
+However late it resumes, the pass that sees an observation gap or a sensor
+acquisition of more than two seconds latches Cooler Boost and resets the
+cooldown (section 6). The watchdog only bounds how long a daemon that does not
+resume stays in place before `ExecStopPost` and the keeper take over. Compared
+with the former 5 s, a daemon that alone hangs is replaced up to 25 s later,
+and a daemon stall of 7 to 30 s now passes without Boost until the daemon
+resumes; with 5 s, the kill and the recovery helper had Boost on about 7 s into
+such a stall. For that time the EC runs its curve without alarm escalation: in
+the field, with Boost off and the CPU at 88 °C or above, the median fan speeds
+were about 3,100 RPM (fan 1) and 3,700 RPM (fan 2), roughly half and 60 % of
+full speed. A stall longer than 30 s still ends in a kill and a keeper hold.
+The keeper has the same value because the same stall delays it: on 2026-11-13
+its former 5 s watchdog killed it three times within four minutes of one
+host-wide out-of-memory stall, and its start limit of three starts in 15
+minutes then left the EC at full cooling with no process supervising it.
 
 After verified recovery cooling is staged, the helper or keeper records a
 root-owned, mode-`0600`, same-boot recovery-Boost marker. The daemon validates
@@ -307,7 +325,7 @@ instead of being killed. A stop that the `factory-auto` marker starts before
 any signal gets the full 10 s, because the stop timer is not running yet. The
 daemon sends a watchdog heartbeat with every sample. That matters when the
 `factory-auto` marker starts the stop before the stop request arrives, because
-systemd still enforces `WatchdogSec=5s` then. `ExecStopPost` runs under its own
+systemd still enforces `WatchdogSec=30s` then. `ExecStopPost` runs under its own
 `TimeoutStopSec=30s`; on its success path it spends at most 10 s confirming.
 The manager has no watchdog, and its 50 s `systemctl stop` covers the daemon's
 and the helper's waits. A cool clean stop takes about 2.5 s longer than before,

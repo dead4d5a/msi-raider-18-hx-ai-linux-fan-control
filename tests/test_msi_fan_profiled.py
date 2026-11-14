@@ -996,7 +996,8 @@ class RecoveryHandoffMainLoopTests(HardwareFreeMainLoopTests):
 
     def test_clean_stop_keeps_the_watchdog_fed_throughout_the_confirmation(self):
         # The factory-auto marker starts this stop while the unit still runs, so
-        # WatchdogSec=5s is enforced; the refused wait lasts longer than that.
+        # WatchdogSec=30s is enforced; the wait feeds it with every sample instead
+        # of relying on finishing within it.
         with self.assertRaises(DAEMON.ProfileError):
             self.run_startup(recovery_latched=False, duration=60.0, override_at=5.0,
                              stop_readings_at=lambda now: self.HOT_RELEASE)
@@ -1315,6 +1316,33 @@ class RecoveryHandoffMainLoopTests(HardwareFreeMainLoopTests):
         _, writes, *_ = self.run_startup(
             True, duration=65, clock_gap_at=lambda now: 2 if now == 29 else 0)
         self.assertEqual(writes, [(61.0, "off")])
+
+    def test_twenty_second_stall_latches_boost_and_restarts_the_cooldown(self):
+        # Under the former 5 s watchdog a stall this long ended in a kill; under
+        # 30 s the daemon resumes and its two-second rule acts. Without a latch
+        # the gap latches Boost; with the handoff latch 28 s into its cooldown,
+        # the cooldown starts again. Either way Boost goes off only 30 cool
+        # seconds after the first pass after the stall, at 49 s.
+        for latched, initial, expected in (
+                (False, "off", [(49.0, "on"), (79.0, "off")]),
+                (True, "on", [(79.0, "off")])):
+            with self.subTest(recovery_latched=latched):
+                self.health_publisher.reset_mock()
+                state, writes, *_ = self.run_startup(
+                    latched, duration=85, initial_boost=initial,
+                    clock_gap_at=lambda now: 20 if now == 29 else 0)
+                self.assertEqual(writes, expected)
+                self.assertEqual(state["boost"], "off")
+                self.assertIn("WARNING monitoring gap; Boost latched and cooldown reset",
+                              self.stderr.getvalue())
+                before = self.health_at(28)
+                self.assertEqual(before["automatic_boost"], latched)
+                self.assertEqual(before["cooldown_elapsed_seconds"], 28 if latched else 0)
+                resumed = self.health_at(49)
+                self.assertTrue(resumed["automatic_boost"])
+                self.assertEqual(resumed["cooldown_elapsed_seconds"], 0)
+                self.assertEqual(self.health_at(78)["state"], "cooling")
+                self.assertEqual(self.health_at(79)["state"], "normal")
 
     def test_slow_current_poll_cannot_release_automatic_boost_at_cooldown_boundary(self):
         for delay in (2.5, 3.0):

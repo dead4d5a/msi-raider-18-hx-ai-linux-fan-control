@@ -42,7 +42,7 @@ SOURCE_PATH = MODULE_PATH / "srcversion"
 # 5 s exit margin, as the timeout, and refuses the release without sampling
 # when that cannot hold one window; it then exits into full-cooling recovery
 # instead of being killed. It sends a watchdog heartbeat with every sample, so
-# WatchdogSec=5s, which is still enforced when the factory-auto marker starts
+# WatchdogSec=30s, which is still enforced when the factory-auto marker starts
 # the stop before SIGTERM, never expires. ExecStopPost runs under its own
 # TimeoutStopSec=30s. The manager has no watchdog; factory-auto's 50 s
 # systemctl stop covers both waits above. Entering cooling never waits for
