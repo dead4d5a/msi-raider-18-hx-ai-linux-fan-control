@@ -2,6 +2,89 @@
 
 ## Unreleased
 
+Entries for the next version go below this paragraph, one or two sentences
+each, under the headings `### Changed`, `### Fixed`, `### Added` and
+`### Operator-visible`, in that order; a heading without entries is left out.
+Changed is for behavior that differs, Fixed for a corrected defect, Added for
+something new, and Operator-visible for a change to what an operator reads or
+follows, such as a status field, a log line, a message or a documented
+procedure. An entry goes under the one heading that names its main effect and
+ends with its roadmap item ID in parentheses, and with its issue number too
+once that issue exists: `(ST-1)`, later `(ST-1, #N)`. When a version is cut,
+its section starts with a short summary, upgrade notes and known issues.
+
+## 0.2.0 - 2026-10-11
+
+Hardening release for the same laptop and firmware. A genuine daemon fault
+now ends in full cooling, Candidate 14 in `advanced` mode with Cooler Boost
+on, held by a separate keeper. A memory leak that let the 64 MiB limit kill
+the controller after about 6.8 days is fixed. A read-only kernel readiness
+check finds a driver build that would fail at the next boot; it runs before a
+reboot and from a kernel hook after each kernel installation. A clean
+stop, `factory-auto` or the uninstall script switches Cooler Boost off only
+after six consecutive valid, cool samples. The upgrade waits for a cool margin
+and continues at full cooling when the installed manager cannot confirm a
+cool release.
+
+Deployed on the validation host on 2026-10-11 as commit `e4d4e19` and tagged
+`v0.2.0` on 2026-11-11, when all 12 installed files were verified
+byte-identical to that commit. At the tag, this file still lists the changes
+below under Unreleased; they are moved here unchanged and predate the entry
+format above.
+
+### Upgrade notes
+
+- Upgrade an installed profile with the guarded
+  `sudo ./scripts/upgrade-profile.sh` (`docs/INSTALL.md`);
+  `install-profile.sh` refuses to overwrite a deployment.
+- The upgrade runs the release checks without root, which heats the CPU, and
+  then waits until the CPU package and EC CPU are below 80 °C and the EC GPU
+  below 65 °C for 10 consecutive seconds. If that takes longer than 600 s
+  (`MSI_FAN_UPGRADE_COOL_TIMEOUT`, 10 to 86400), it exits with nothing
+  changed.
+- Its first change to the running controller is the installed release's
+  `factory-auto`. Releases before this one decide from one reading and also
+  disable the service when they refuse. If the refusal leaves verified full
+  cooling, the upgrade continues at full cooling; otherwise it stops with
+  nothing replaced, and `sudo msi-fan-profile apply-default` must be run
+  before a cool retry.
+- The upgrade adds the readiness check
+  `/usr/local/libexec/msi-fan-kernel-readiness` and the kernel hook
+  `/etc/kernel/postinst.d/zz-msi-fan-profile-readiness`. Run the check before
+  every reboot (`docs/ROLLBACK.md`).
+- The upgrade does not touch the driver. This version accepts the deployed
+  legacy build of the patched `msi_ec 0.13.1` (srcversion
+  `AB0BFAE2391B5ADD66E01BD`). The snapshot build it also accepts
+  (`9086C45007CBB7FA1264430`) has not been deployed or validated on hardware.
+
+### Known issues
+
+- A host-wide out-of-memory stall can delay the daemon past its 5 s systemd
+  watchdog, and systemd then kills a healthy daemon, as on 2026-11-10. The
+  keeper then holds Candidate 14/`advanced` with Cooler Boost on until
+  `sudo msi-fan-profile apply-default` is run; no reboot is needed
+  (`docs/OPERATIONS.md`, "After a keeper takeover"). The keeper has the same
+  5 s watchdog: on 2026-11-13, after such a kill of the daemon, the keeper was
+  itself killed three times within four minutes, and systemd then refused to
+  restart it (its start limit is three starts in 15 minutes). The EC kept
+  Candidate 14/`advanced` with Cooler Boost on, but no process supervised the
+  fans until `apply-default` was run. 0.2.1 raises the watchdog of both units
+  to 30 s (ST-1).
+- Fan 2, the GPU-side fan, runs one step below the Candidate 14 table while
+  the machine warms up: about 3,750 instead of 4,330 RPM at a GPU temperature
+  of 44 to 54 °C (observed). Next to each curve the EC keeps six falling
+  thresholds that decide when a step is left again. The driver writes the six
+  rising thresholds and seven speeds of each fan but leaves the falling
+  thresholds at their factory values, which for fan 2 lie above Candidate
+  14's rising thresholds. The factory values imply the same up to 78 °C;
+  above 54 °C that is inferred, not observed. Fan 1 is essentially
+  unaffected. The alarms and Cooler Boost do not depend on the curve, and
+  every measurement behind Candidate 14 was taken with this behavior present.
+  A driver build that also writes the falling thresholds, followed by a
+  re-tune of the curve, is planned for 1.0 (decision D-2).
+
+### Changes
+
 - Continue an upgrade at full cooling when the installed manager cannot
   confirm a cool release. An upgrade runs the installed release's
   `factory-auto`, and releases before this one decide from one reading, which a
