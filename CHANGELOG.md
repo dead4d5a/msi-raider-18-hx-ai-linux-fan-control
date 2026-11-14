@@ -16,10 +16,11 @@ its section starts with a short summary, upgrade notes and known issues.
 ### Added
 
 - `docs/AUDIT.md` records what became of each of the 46 findings and 10
-  review gaps of the October 2026 audit: its severity after the audit's
-  verification pass, one disposition and an anchor that can be checked, such
-  as a commit, a file and line or a CI run. A row whose work is not finished
-  reads open and names the roadmap item that carries it (LD-1).
+  review gaps of the October 2026 audit: its severity (for a finding, after
+  the audit's verification pass), one disposition and an anchor that can be
+  checked, such as a commit, a file and line or a CI run. A row whose work is
+  not finished, or the part of a finding that a fix left unfinished, reads
+  open and names the roadmap item that carries it (LD-1).
 
 ## 0.2.1
 

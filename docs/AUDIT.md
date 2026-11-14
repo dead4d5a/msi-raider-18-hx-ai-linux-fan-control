@@ -45,16 +45,20 @@ prints the line cited as `docs/SAFETY.md:95`. The commits `afddd83` (ST-2),
 roadmap to 1.0; each gets a link to its GitHub issue once the issues are
 published.
 
-| Disposition | Rows |
-|---|---:|
-| fixed | 18 |
-| closed by evidence | 5 |
-| accepted | 4 |
-| dropped | 4 |
-| deferred beyond 1.0 | 1 |
-| host action | 2 |
-| open | 22 |
-| total | 56 |
+The table counts the rows by disposition. Its last column counts those whose
+`left:` part is open, so 28 rows still carry open work: the 22 open rows and
+6 fixed or accepted ones.
+
+| Disposition | Rows | With an open `left:` part |
+|---|---:|---:|
+| fixed | 18 | 5 |
+| closed by evidence | 5 | 0 |
+| accepted | 4 | 1 |
+| dropped | 4 | 0 |
+| deferred beyond 1.0 | 1 | 0 |
+| host action | 2 | 0 |
+| open | 22 | 0 |
+| total | 56 | 6 |
 
 ## Kernel and driver
 
@@ -81,13 +85,13 @@ published.
 | D6 | A transient `sd_notify` or acknowledgement-write failure ends the daemon at once instead of letting the watchdog decide | info | open | ST-8 for acknowledgement writes; `afddd83` (ST-2) already lets a failed runtime notification pass to the watchdog |
 | D7 | Controller memory is swappable and not protected from the OOM killer | low | open | ST-4, whose check on the validation host follows the deployment of 0.2.1, and ST-7. `0b95cea` set `MemorySwapMax=0`, `MemoryMin=32M` and `OOMScoreAdjust=-900` on both units; `MemoryMin` has no effect on the validation host, which `6ec0761` (ST-4) reports in `status` and `c29e7fc` (ST-5) documents; ST-7 will lock the memory instead |
 | D8 | Test gaps around timing-dependent and I/O paths | low | open | LD-8 for a slow-reapply test and ST-8 for the acknowledgement path. Done: the whole-loop allocation tests (`7c198b5`), the Boost ownership scenarios (`f87e432`) and failed runtime notifications (`afddd83`) |
-| D9 | Each pass is dominated by deliberate checks; only small redundant EC reads remain | info | fixed | `2fe747e` drops the separate firmware read of each legacy monitoring pass and reuses the Boost value read for the fan-response check; the deliberate checks stay |
+| D9 | Each pass is dominated by deliberate checks; only small redundant EC reads remain | info | fixed; left: the other Boost reads, accepted | `2fe747e` drops the separate firmware read of each legacy monitoring pass and reuses the Boost value read for the fan-response check. The deliberate checks stay, and so do the other Boost reads, which give each decision a fresh value |
 
 ## Recovery keeper and manager
 
 | ID | Finding | Severity | Disposition | Anchor |
 |---|---|---|---|---|
-| R1 | A hot `factory-auto` disables the service and cannot succeed afterwards: Boost forced on, upgrade retries blocked | medium | fixed; left: a residual, accepted | `13b85bc`: a refused cool release exits 1 with Boost on and keeps the service enabled and the recovery latch; `7853461` corrects the upgrade's message when a later step fails after `factory-auto`. The residual: a refusal with no recovery latch leaves Boost on as manual Boost until `boost-release`, the noisy direction; LD-14 will document it |
+| R1 | A hot `factory-auto` disables the service and cannot succeed afterwards: Boost forced on, upgrade retries blocked | medium | fixed; left: a residual, accepted; its documentation, open (LD-14) | `13b85bc`: a refused cool release exits 1 with Boost on and keeps the service enabled and the recovery latch; `7853461` corrects the upgrade's message when a later step fails after `factory-auto`. The residual: a refusal with no recovery latch leaves Boost on as manual Boost until `boost-release`, the noisy direction; LD-14 will document it |
 | R2 | `ExecStopPost` returns 0 for systemd `success` results that are not a clean exit, so full cooling is staged but no keeper starts | info | accepted | Kept on purpose: it needs a stop within about 100 ms of a start, it leaves full cooling staged, and a failure status would start the keeper after such operator stops; `c5e4aeb` pins the behaviour in a test |
 | R3 | Latch creation is not atomic; a torn or invalid latch disables the keeper, the daemon start and `factory-auto` | info | open | ST-9; until then `c29e7fc` (ST-5) documents the way out in `docs/OPERATIONS.md`, section "Torn recovery latch" |
 | R4 | `factory-auto` creates its marker before stopping the daemon, and the daemon treats the marker as a fault | low | fixed | `13b85bc` makes the daemon take a new marker as a clean stop request |
@@ -115,7 +119,7 @@ published.
 |---|---|---|---|---|
 | S1 | An upgrade is blocked whenever a keeper recovery latch exists: three daemon tests read the real `/run` latch | medium | fixed | `6b91e17` moves the latch of those tests into a temporary directory; `7859ca0` puts a latch into the upgrade's sandbox test |
 | S2 | Install and upgrade run the whole unit-test suite as root on the live machine | low | open | ST-6. `7859ca0` runs the release checks without root. That the drop from root to the invoking user works is inferred from the two real upgrades of 2026-10-11, whose terminal output was not kept; the transcript of session A is to show its `Running release checks as uid` line |
-| S3 | Kernel upgrades are unverified until after boot, and a missing patched driver makes the controller skip silently | low | fixed; left: a boot-time check, accepted | `0b95cea` (visible failure) and `b306c7e` (readiness check). The boot-time check was not built: a missing driver already fails the unit, a status check at boot risked false failures, and the opt-in notifier of ST-17 will report an absent controller from its timer |
+| S3 | Kernel upgrades are unverified until after boot, and a missing patched driver makes the controller skip silently | low | fixed; left: a boot-time check, accepted; a notification of an absent controller, open (ST-17) | `0b95cea` (visible failure) and `b306c7e` (readiness check). The boot-time check was not built: a missing driver already fails the unit, a status check at boot risked false failures, and the opt-in notifier of ST-17 will report an absent controller from its timer |
 | S4 | CI builds neither the deployed legacy driver nor the HWE 7.0 kernel series, runs on no schedule, and does not assert the Python minor version | low | open | LD-7 for the Python-version assertion. The CI part is closed by evidence: `9b6811a` and CI run 42631122198 (evidence below) |
 | S5 | The memory limit is not a hard bound, since swap is unbounded, and nothing warns before an out-of-memory kill | low | open; left: a memory warning, deferred beyond 1.0 (LD-13) | ST-4, whose check on the validation host follows the deployment of 0.2.1: `6ec0761` adds the restart counts to `status`. `0b95cea` made `MemoryMax=64M` a hard bound with `MemorySwapMax=0` and added `controller_memory` to `status`. The warning waits because the bound is hard and `status` already shows the figures |
 | S6 | A failure after file replacement leaves old and new files mixed, a stale `INSTALL_RECORD` and no documented restore | low | open; left: a two-phase replacement, deferred beyond 1.0 | LD-5 will add a marker, a failure message with the backup path and a restore procedure. The two-phase replacement waits because those make a partly replaced install visible and recoverable, which is what the roadmap's default for a partial upgrade asks of 1.0 |
@@ -124,7 +128,7 @@ published.
 | S9 | The root services choose their interpreter through `PATH`, with `/usr/local/bin` first | low | fixed | `0b95cea` pins `#!/usr/bin/python3 -I`, and the release checks verify it |
 | S10 | The upgrade stops the keeper outside the manager lock before the identity gate of `factory-auto`, and bare `[[ ]]` assertions fail without a message | low | open | LD-4 |
 | S11 | `uninstall-profile.sh` releases Boost in bash without the plausibility checks of the programs, and leaves files behind | info | fixed; left: the leftovers, open (LD-4) | `ff58abf` and `e4d4e19`: the uninstall uses the shared cool confirmation and checks the identity again before the next EC write (`scripts/uninstall-profile.sh:84-97`) |
-| S12 | The units rely on `/run` being writable under `ProtectSystem=strict`, which the systemd documentation calls read-only | info | dropped | Refuted by the verification pass: under `ProtectSystem=strict` (`systemd/msi-fan-profile.service:25`) the daemon rewrites `/run/msi-fan-profile.health.json` every second |
+| S12 | The units rely on `/run` being writable under `ProtectSystem=strict`, which the systemd documentation calls read-only | info | dropped | Refuted by the verification pass. Checked on 2026-11-14 (evidence below): `/run` stays writable under `ProtectSystem=strict` (`systemd/msi-fan-profile.service:25`), and the daemon rewrites `/run/msi-fan-profile.health.json` every second |
 | S13 | `INSTALL_RECORD` always says `source_tree_dirty=yes`, and nothing checks that `SHA256SUMS` lists every tracked file | info | open | LD-3 |
 
 ## Review gaps
@@ -209,9 +213,18 @@ does not use it; it reads the GPU temperature from the EC.
 When the daemon's run of about 10.3 days ended on 2026-11-10, systemd
 reported `Consumed 45min 21.802s CPU time` for it, about 0.3 % of one core.
 
+### `/run` under `ProtectSystem=strict`
+
+On 2026-11-14, under systemd 255, the mount table of the running daemon of
+`msi-fan-profile.service`, read without root from `/proc/<PID>/mountinfo`,
+showed `/` mounted read-only and `/run` mounted read-write. The unit sets
+`ProtectSystem=strict` and no `ReadWritePaths=`. At each of four readings
+over about four minutes, `/run/msi-fan-profile.health.json` was less than a
+second old.
+
 ## Keeping this record current
 
-When a work item named here is finished, its rows change to their final
-disposition, with its commit or evidence as the anchor. RL-4 will make a
-current record a precondition of each release, and RL-10 will check before
-1.0 that no row is open.
+When a work item named here is finished, its rows and `left:` parts change
+to their final disposition, with its commit or evidence as the anchor. RL-4
+will make a current record a precondition of each release, and RL-10 will
+check before 1.0 that no row and no `left:` part is open.
