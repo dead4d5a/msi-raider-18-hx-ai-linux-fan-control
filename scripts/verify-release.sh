@@ -116,7 +116,7 @@ for setting in (
     "Before=msi-fan-profile.service",
     "ExecStart=/usr/local/libexec/msi-gpu-recover --keeper candidate14",
     "Restart=on-failure",
-    "WatchdogSec=5s",
+    "WatchdogSec=30s",
 ):
     assert setting in keeper, setting
 assert "[Install]" not in keeper

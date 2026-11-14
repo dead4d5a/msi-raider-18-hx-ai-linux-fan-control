@@ -27,6 +27,10 @@ BASE = pathlib.Path("/sys/devices/platform/msi-ec")
 LOCK = pathlib.Path("/run/msi-fanctl.lock")
 RECOVERY_LATCH = pathlib.Path("/run/msi-fan-profile.recovery-boost")
 RECOVERY_LATCH_PAYLOAD = b"candidate14\n"
+# Read only for a stall, after Boost is reasserted and the warning logged.
+HOST_MEMORY_PRESSURE = pathlib.Path("/proc/pressure/memory")
+CGROUP_ROOT = pathlib.Path("/sys/fs/cgroup")
+SELF_CGROUP = pathlib.Path("/proc/self/cgroup")
 FACTORY = (
     "58 64 70 76 82 88 0 25 35 44 58 70 75 "
     "52 58 64 70 76 82 0 25 35 44 58 70 75"
@@ -41,6 +45,7 @@ FAN_RESPONSE_FLOOR_RPM = 3000
 FAN_PLAUSIBILITY_LIMIT_RPM = 10000
 FAN_RESPONSE_ALLOWANCE_SECONDS = 12.0
 KEEPER_REPORT_INTERVAL_SECONDS = 60.0
+NOTIFY_FAILURE_REPORT_SECONDS = 60.0
 POLL_INTERVAL_SECONDS = 1.0
 MAX_OBSERVATION_GAP_SECONDS = 2.0
 
@@ -114,6 +119,78 @@ def notify(message: str) -> None:
         sock.settimeout(0.5)
         sock.connect(address)
         sock.sendall(message.encode("utf-8"))
+
+
+def read_pressure(path: pathlib.Path) -> str:
+    """Read one kernel memory-pressure or cgroup file for a stall warning.
+
+    Kept apart from read(), which serves the EC and the sensors, so that
+    every read made for a stall warning can be observed on its own.
+    """
+    with path.open("r", encoding="ascii") as stream:
+        return stream.read()
+
+
+def pressure_figures(text: str) -> str:
+    """Return the some and full avg10 and total of a memory.pressure file.
+
+    The text must start with the kernel's some and full lines; anything else
+    raises ValueError. Only checked decimal values reach the journal.
+    """
+    figures = []
+    for kind, line in zip(("some", "full"), text.splitlines()):
+        name, *pairs = line.split() or [""]
+        fields = dict(pair.partition("=")[::2] for pair in pairs)
+        avg10, total = fields.get("avg10", ""), fields.get("total", "")
+        whole, point, hundredths = avg10.partition(".")
+        if name != kind or not point or not all(
+                part.isascii() and part.isdecimal() for part in (whole, hundredths, total)):
+            raise ValueError(f"malformed {kind} memory pressure line")
+        figures.append(f"{kind} avg10={avg10} total={total}")
+    if len(figures) != 2:
+        raise ValueError("memory pressure lacks its some and full lines")
+    return " ".join(figures)
+
+
+def unit_memory_pressure_file() -> pathlib.Path | None:
+    """Return the keeper unit's own cgroup memory.pressure file, or None.
+
+    systemd names it in $MEMORY_PRESSURE_WATCH. Any other value there, such
+    as /dev/null while the unit's watch is off, falls back to the
+    unified-hierarchy line ("0::/path") of /proc/self/cgroup.
+    """
+    watch = os.environ.get("MEMORY_PRESSURE_WATCH", "")
+    named = pathlib.PurePosixPath(watch)
+    if (watch.startswith(f"{CGROUP_ROOT}/") and named.name == "memory.pressure" and
+            ".." not in named.parts):
+        return pathlib.Path(watch)
+    try:
+        cgroup = read_pressure(SELF_CGROUP)
+    except (OSError, ValueError):
+        return None
+    for line in cgroup.splitlines():
+        if line.startswith("0::/") and ".." not in line.split("/"):
+            return CGROUP_ROOT / line.removeprefix("0::/") / "memory.pressure"
+    return None
+
+
+def memory_pressure_note(unit: pathlib.Path | None) -> str:
+    """Describe the unit's and the host's memory pressure for a stall warning.
+
+    Log only, and called only after a stall's warning, which follows the
+    reassertion of Cooler Boost. A missing, unreadable or malformed file
+    gives no figures, never an exception.
+    """
+    notes = []
+    for label, path in (("unit", unit), ("host", HOST_MEMORY_PRESSURE)):
+        figures = "unavailable: no cgroup file"
+        if path is not None:
+            try:
+                figures = pressure_figures(read_pressure(path))
+            except (OSError, ValueError) as error:
+                figures = f"unavailable: {type(error).__name__}"
+        notes.append(f"{label} memory pressure {figures}")
+    return "; ".join(notes)
 
 
 @dataclass(frozen=True)
@@ -207,6 +284,38 @@ class KeeperFanVerification:
             self.reported_classification = classification
             self.last_report = now
         return status, report
+
+
+@dataclass
+class NotificationFailures:
+    """Count failed runtime watchdog notifications and bound their reports.
+
+    A failed per-pass notification never ends the keeper; systemd's watchdog
+    decides whether notifications stay broken. The first failure is reported
+    at once and later ones at most once per NOTIFY_FAILURE_REPORT_SECONDS,
+    across runs of failures. A run with a report gets one line when a
+    notification succeeds again; a run without one stays silent.
+    """
+    consecutive: int = 0
+    reported: bool = False
+    last_report: float | None = None
+
+    def failed(self, now: float) -> bool:
+        """Count one failure; return whether to report it now."""
+        self.consecutive += 1
+        if (self.last_report is not None and
+                now - self.last_report < NOTIFY_FAILURE_REPORT_SECONDS):
+            return False
+        self.reported = True
+        self.last_report = now
+        return True
+
+    def succeeded(self) -> int:
+        """End a run of failures; return its length if it was reported, else 0."""
+        count = self.consecutive if self.reported else 0
+        self.consecutive = 0
+        self.reported = False
+        return count
 
 
 @dataclass
@@ -508,8 +617,11 @@ def run_keeper(profile: str) -> int:
     print("recovery keeper active; Candidate14/advanced and Cooler Boost will remain asserted",
           file=sys.stderr)
     verification = KeeperFanVerification()
+    notify_failures = NotificationFailures()
     wmi: pathlib.Path | None = None
     suspend_offset = time.clock_gettime(time.CLOCK_BOOTTIME) - time.monotonic()
+    previous_end: float | None = None
+    previous_sleep = 0.0
     while not STOP:
         started = time.monotonic()
         if timing is not None:
@@ -543,15 +655,52 @@ def run_keeper(profile: str) -> int:
         # Exactly one RPM sample follows each completed control repair. Failed
         # telemetry never creates a multi-second verification sleep, and each
         # heartbeat describes both completed repair and current fan response.
-        response_status, report = verification.observe(response, time.monotonic())
-        keeper_heartbeat(f"{state}; {response_status}")
+        now = time.monotonic()
+        response_status, report = verification.observe(response, now)
+        try:
+            keeper_heartbeat(f"{state}; {response_status}")
+        except OSError as error:
+            # One undelivered datagram must not end the guard: three such exits
+            # within 15 minutes would use up the keeper's start limit. The
+            # watchdog ends a keeper whose notifications stay broken. Only this
+            # per-pass notification is caught; the startup ones still fail.
+            if notify_failures.failed(now):
+                print("WARNING runtime watchdog notification failed "
+                      f"(consecutive failures: {notify_failures.consecutive}); "
+                      "full cooling stays asserted, and systemd's watchdog ends "
+                      "the keeper if notifications stay broken: "
+                      f"{type(error).__name__}: {error}", file=sys.stderr)
+        else:
+            recovered = notify_failures.succeeded()
+            if recovered:
+                print("runtime watchdog notification succeeded again "
+                      f"(consecutive failures: {recovered})", file=sys.stderr)
         if report:
             print(f"recovery keeper retains Cooler Boost; {response_status}",
                   file=sys.stderr)
         if timing is not None:
             timing.finish_loop()
             timing.report(time.monotonic())
-        delay = POLL_INTERVAL_SECONDS - (time.monotonic() - started)
+        finished = time.monotonic()
+        # A stall is this pass plus any overrun of the sleep before it. Log
+        # only. Boost may have been switched off during the stall, after this
+        # pass's repair, so it is reasserted first. The warning is flushed
+        # before the memory-pressure files are read, and their figures follow
+        # on a line of their own. The time those take belongs to this pass:
+        # it shortens the sleep and counts toward no later stall.
+        overrun = (0.0 if previous_end is None else
+                   max(0.0, started - previous_end - previous_sleep))
+        if overrun + (finished - started) > MAX_OBSERVATION_GAP_SECONDS:
+            request_boost_best_effort()
+            print(f"WARNING recovery keeper stall {overrun + finished - started:.1f}s "
+                  f"(sleep overrun {overrun:.1f}s, pass {finished - started:.1f}s); "
+                  "full cooling stays asserted", file=sys.stderr, flush=True)
+            note = memory_pressure_note(unit_memory_pressure_file())
+            ended, finished = finished, time.monotonic()
+            print(f"recovery keeper stall memory pressure, read {finished - ended:.1f}s "
+                  f"after the stall: {note}", file=sys.stderr, flush=True)
+        delay = POLL_INTERVAL_SECONDS - (finished - started)
+        previous_end, previous_sleep = finished, max(delay, 0.0)
         if delay > 0:
             time.sleep(delay)
     print("recovery keeper stopped by operator; leaving full-cooling state intact",

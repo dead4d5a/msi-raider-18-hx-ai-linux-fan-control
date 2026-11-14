@@ -40,6 +40,7 @@ REAL_RECOVERY_WRITE = RECOVER.write
 REAL_MARK_RECOVERY_LATCH = RECOVER.mark_recovery_latch
 REAL_RECOVERY_LATCH_PRESENT = RECOVER.recovery_latch_present
 REAL_ACQUIRE_LOCK = RECOVER.acquire_lock
+REAL_KEEPER_HEARTBEAT = RECOVER.keeper_heartbeat
 HOST_PATH_PREFIXES = ("/run/", "/sys/", "/proc/", "/dev/", "/etc/", "/var/")
 REAL_PATH_OPEN = pathlib.Path.open
 
@@ -59,10 +60,14 @@ class HardwareIsolatedTestCase(unittest.TestCase):
         directory = tempfile.TemporaryDirectory(prefix="msi-gpu-recover-test-")
         self.addCleanup(directory.cleanup)
         runtime = pathlib.Path(directory.name)
-        for name in ("BASE", "LOCK", "RECOVERY_LATCH"):
+        for name in ("BASE", "LOCK", "RECOVERY_LATCH", "HOST_MEMORY_PRESSURE", "CGROUP_ROOT"):
             patcher = mock.patch.object(RECOVER, name, runtime / getattr(RECOVER, name).name)
             patcher.start()
             self.addCleanup(patcher.stop)
+        # /proc/self/cgroup has the same last name as the cgroup root.
+        patcher = mock.patch.object(RECOVER, "SELF_CGROUP", runtime / "self-cgroup")
+        patcher.start()
+        self.addCleanup(patcher.stop)
         leaked = sorted(
             name for name, value in vars(RECOVER).items()
             if isinstance(value, pathlib.PurePath) and
@@ -77,7 +82,7 @@ class HardwareIsolatedTestCase(unittest.TestCase):
             return reject
 
         for name in ("read", "write", "one_hwmon", "notify", "mark_recovery_latch",
-                     "recovery_latch_present", "acquire_lock"):
+                     "recovery_latch_present", "acquire_lock", "read_pressure"):
             patcher = mock.patch.object(RECOVER, name, side_effect=blocked(name))
             patcher.start()
             self.addCleanup(patcher.stop)
@@ -440,8 +445,20 @@ class FanResponseTests(HardwareIsolatedTestCase):
 
 class IncrementalKeeperTests(HardwareIsolatedTestCase):
     def run_keeper_cycles(self, rpm, unavailable=False, *, duration=14,
-                          resume_at=None, timing_setting="0", rpm_delay=0.0):
-        """Mock sysfs and clock; switch Boost off after every repair cycle."""
+                          resume_at=None, timing_setting="0", rpm_delay=0.0,
+                          heartbeat_error_at=None, notify_failure_at=None,
+                          real_heartbeat=False, clock_gap_at=None, pressure=None,
+                          pressure_delay=0.0, boost_off_during_rpm_at=None):
+        """Mock sysfs and clock; switch Boost off after every repair cycle.
+
+        rpm_delay is seconds per RPM read, or a function of the time. pressure
+        maps memory-pressure and cgroup paths to their text or an exception,
+        and each such read takes pressure_delay seconds. The RPM read that
+        starts at boost_off_during_rpm_at switches Boost off while it blocks.
+        notify_failure_at(now, message) returns the error that notify() raises
+        for that message, or None. real_heartbeat sends the heartbeats through
+        the real keeper_heartbeat(), and so through notify().
+        """
         clock = {"now": 0.0, "offset": 0.0}
         state = {
             "fan_mode": "advanced",
@@ -451,17 +468,54 @@ class IncrementalKeeperTests(HardwareIsolatedTestCase):
         writes = []
         sleeps = []
         heartbeats = []
+        self.failed_heartbeats = []
+        # Messages sent through notify(), and those whose send failed.
+        self.notifications = []
+        self.failed_notifications = []
+        # Boost writes, external Boost-off toggles and memory-pressure reads
+        # in the order they happen.
+        self.events = []
         stderr = io.StringIO()
         original_stop = RECOVER.STOP
         RECOVER.STOP = False
 
+        def fake_read_pressure(path):
+            self.events.append((clock["now"], "read", path))
+            clock["now"] += pressure_delay
+            text = (pressure or {}).get(path, FileNotFoundError(path))
+            if isinstance(text, BaseException):
+                raise text
+            return text
+
+        def fake_heartbeat(status):
+            error = heartbeat_error_at(clock["now"]) if heartbeat_error_at else None
+            if error is None:
+                heartbeats.append(status)
+                return
+            # An undrained notify socket makes the send time out after 0.5 s.
+            self.failed_heartbeats.append(clock["now"])
+            clock["now"] += 0.5
+            raise error
+
+        def fake_notify(message):
+            error = notify_failure_at(clock["now"], message) if notify_failure_at else None
+            if error is None:
+                self.notifications.append((clock["now"], message))
+                return
+            self.failed_notifications.append((clock["now"], message))
+            clock["now"] += 0.5
+            raise error
+
         def fake_write(path, value):
             writes.append((clock["now"], path.name, value))
+            self.events.append((clock["now"], "write", path.name, value))
             state[path.name] = value
 
         def fake_sleep(seconds):
             sleeps.append(seconds)
             clock["now"] += seconds
+            if clock_gap_at:
+                clock["now"] += clock_gap_at(clock["now"])
             if clock["now"] >= duration:
                 RECOVER.STOP = True
             else:
@@ -469,7 +523,12 @@ class IncrementalKeeperTests(HardwareIsolatedTestCase):
 
         def fake_rpm(_path):
             value = rpm(clock["now"]) if callable(rpm) else rpm
-            clock["now"] += rpm_delay
+            began = clock["now"]
+            clock["now"] += rpm_delay(clock["now"]) if callable(rpm_delay) else rpm_delay
+            if began == boost_off_during_rpm_at:
+                # The Cooler Boost key, for example, while this read blocks.
+                state["cooler_boost"] = "off"
+                self.events.append((clock["now"], "external", "cooler_boost", "off"))
             if clock["now"] >= duration:
                 RECOVER.STOP = True
             if isinstance(value, Exception):
@@ -491,14 +550,16 @@ class IncrementalKeeperTests(HardwareIsolatedTestCase):
         try:
             with mock.patch.object(RECOVER, "stage_full_cooling"), \
                     mock.patch.object(RECOVER, "mark_recovery_latch"), \
-                    mock.patch.object(RECOVER, "notify"), \
+                    mock.patch.object(RECOVER, "notify", side_effect=fake_notify), \
                     mock.patch.object(RECOVER, "recovery_identity", return_value={
                         RECOVER.fan_control.SOURCE_PATH: RECOVER.fan_control.LEGACY_SRCVERSION}), \
                     mock.patch.object(RECOVER, "read", side_effect=lambda path: state[path.name]), \
                     mock.patch.object(RECOVER, "write", side_effect=fake_write), \
+                    mock.patch.object(RECOVER, "read_pressure", side_effect=fake_read_pressure), \
                     mock.patch.object(RECOVER, "read_uint", side_effect=fake_rpm) as reading_rpm, \
                     mock.patch.object(RECOVER, "one_hwmon", discovery), \
-                    mock.patch.object(RECOVER, "keeper_heartbeat", side_effect=heartbeats.append), \
+                    mock.patch.object(RECOVER, "keeper_heartbeat", side_effect=(
+                        REAL_KEEPER_HEARTBEAT if real_heartbeat else fake_heartbeat)), \
                     mock.patch.object(RECOVER, "verify_boost", side_effect=AssertionError("blocking verification")), \
                     mock.patch.object(RECOVER.time, "monotonic", side_effect=lambda: clock["now"]), \
                     mock.patch.object(RECOVER.time, "clock_gettime", side_effect=boottime), \
@@ -510,10 +571,11 @@ class IncrementalKeeperTests(HardwareIsolatedTestCase):
                 self.assertEqual(RECOVER.run_keeper("candidate14"), 0)
         finally:
             RECOVER.STOP = original_stop
+            # Kept when the keeper raises, as what it had logged by then.
+            self.stderr = stderr.getvalue()
         self.discovery_calls = discovery.call_count
         self.rpm_read_calls = reading_rpm.call_count
         self.diagnostic_reads = diagnostic.call_count
-        self.stderr = stderr.getvalue()
         self.timing_records = [json.loads(line.removeprefix("TIMING keeper "))
                                for line in self.stderr.splitlines()
                                if line.startswith("TIMING keeper ")]
@@ -621,6 +683,248 @@ class IncrementalKeeperTests(HardwareIsolatedTestCase):
         self.assertEqual(timing.last_observation_gap_seconds, 2.5)
         self.assertEqual(timing.max_observation_gap_seconds, 2.5)
         self.assertEqual(timing.max_rpm_read_duration_ms, 100.0)
+
+    @staticmethod
+    def notification_reports(stderr):
+        lines = stderr.splitlines()
+        return ([line for line in lines
+                 if line.startswith("WARNING runtime watchdog notification failed")],
+                [line for line in lines
+                 if line.startswith("runtime watchdog notification succeeded again")])
+
+    def test_failed_runtime_notifications_do_not_interrupt_repair(self):
+        # Three passes in a row cannot reach a service manager that does not
+        # drain its notify socket; the keeper still repairs every second.
+        control_state, control_writes, _, control_heartbeats = self.run_keeper_cycles(5000)
+        state, writes, sleeps, heartbeats = self.run_keeper_cycles(
+            5000, heartbeat_error_at=lambda now: (
+                TimeoutError("timed out") if 4 <= now <= 6 else None))
+        self.assertEqual(self.failed_heartbeats, [4.0, 5.0, 6.0])
+        self.assertEqual(writes, control_writes)
+        self.assertEqual(writes, [(float(now), "cooler_boost", "on") for now in range(1, 14)])
+        self.assertEqual(state, control_state)
+        # Each timed-out send costs 0.5 s of its pass; the cadence holds.
+        self.assertEqual(sleeps, [1.0] * 4 + [0.5] * 3 + [1.0] * 7)
+        self.assertEqual(len(heartbeats), len(control_heartbeats) - 3)
+        self.assertEqual(self.diagnostic_reads, 0)
+        warnings, recovered = self.notification_reports(self.stderr)
+        self.assertEqual(warnings, [
+            "WARNING runtime watchdog notification failed (consecutive failures: 1); "
+            "full cooling stays asserted, and systemd's watchdog ends the keeper if "
+            "notifications stay broken: TimeoutError: timed out"])
+        self.assertEqual(recovered, [
+            "runtime watchdog notification succeeded again (consecutive failures: 3)"])
+
+    def test_failed_runtime_notifications_warn_at_most_once_a_minute(self):
+        # No watchdog runs here, so one run of failures can outlast a minute.
+        # A short run within a minute of the last warning stays silent.
+        failing = set(range(5, 71)) | {80, 81, 130}
+        state, writes, _, _ = self.run_keeper_cycles(
+            5000, duration=135, heartbeat_error_at=lambda now: (
+                ConnectionRefusedError(errno.ECONNREFUSED, "Connection refused")
+                if now in failing else None))
+        self.assertEqual(len(self.failed_heartbeats), len(failing))
+        self.assertEqual(writes, [(float(now), "cooler_boost", "on") for now in range(1, 135)])
+        self.assertEqual(state["cooler_boost"], "on")
+        warnings, recovered = self.notification_reports(self.stderr)
+        self.assertEqual([line.split(";")[0] for line in warnings], [
+            "WARNING runtime watchdog notification failed (consecutive failures: 1)",
+            "WARNING runtime watchdog notification failed (consecutive failures: 61)",
+            "WARNING runtime watchdog notification failed (consecutive failures: 1)"])
+        self.assertTrue(all(line.endswith(
+            f": ConnectionRefusedError: [Errno {errno.ECONNREFUSED}] Connection refused")
+            for line in warnings))
+        self.assertEqual(recovered, [
+            "runtime watchdog notification succeeded again (consecutive failures: 66)",
+            "runtime watchdog notification succeeded again (consecutive failures: 1)"])
+
+    def test_failed_startup_notifications_still_fail_the_keeper(self):
+        # The heartbeat before READY=1 and READY=1 itself stay strict: the
+        # exception leaves run_keeper() and main(), and the process exits 1.
+        # Only the named notification fails. The first heartbeat goes through
+        # the real keeper_heartbeat(), so a catch inside it fails this too.
+        for label, failing, options in (
+                ("first heartbeat", "WATCHDOG=1", {"real_heartbeat": True}),
+                ("READY=1", "READY=1", {})):
+            with self.subTest(label):
+                def fail(_now, message):
+                    return (TimeoutError("timed out") if message.split("\n")[0] == failing
+                            else None)
+                with self.assertRaises(TimeoutError):
+                    self.run_keeper_cycles(5000, notify_failure_at=fail, **options)
+                # The failed send was the last one: no READY=1 after a failed
+                # first heartbeat, no repair pass and no STOPPING=1.
+                self.assertEqual([message.split("\n")[0]
+                                  for _, message in self.failed_notifications], [failing])
+                self.assertEqual(self.notifications, [])
+                self.assertEqual(self.events, [])
+
+    def test_missing_notify_socket_at_runtime_still_ends_the_keeper(self):
+        # Without NOTIFY_SOCKET, notify() raises RuntimeError, not an OSError,
+        # and the per-pass catch lets it end the keeper.
+        with self.assertRaisesRegex(RuntimeError, "^NOTIFY_SOCKET is absent$"):
+            self.run_keeper_cycles(5000, heartbeat_error_at=lambda now: (
+                RuntimeError("NOTIFY_SOCKET is absent") if now == 5 else None))
+        self.assertEqual(self.failed_heartbeats, [5.0])
+        # The pass at 5 s repaired Boost before its heartbeat; no pass followed.
+        self.assertEqual([event[:2] for event in self.events],
+                         [(float(now), "write") for now in range(1, 6)])
+
+    NO_PRESSURE = ("unit memory pressure unavailable: no cgroup file; "
+                   "host memory pressure unavailable: FileNotFoundError")
+    KERNEL = ("some avg10=1.25 avg60=0.50 avg300=0.10 total=4567\n"
+              "full avg10=0.50 avg60=0.20 avg300=0.05 total=890\n")
+
+    def stall_lines(self):
+        """Every WARNING, and the memory-pressure line that follows a stall's."""
+        return [line for line in self.stderr.splitlines()
+                if line.startswith(("WARNING", "recovery keeper stall"))]
+
+    @staticmethod
+    def stall_report(total, overrun, duration, note, read_after="0.0"):
+        return [f"WARNING recovery keeper stall {total}s (sleep overrun {overrun}s, "
+                f"pass {duration}s); full cooling stays asserted",
+                f"recovery keeper stall memory pressure, read {read_after}s after the "
+                f"stall: {note}"]
+
+    def pressure_reads(self):
+        return [event for event in self.events if event[1] == "read"]
+
+    def test_a_three_second_pass_logs_one_warning_with_its_duration(self):
+        _, writes, _, _ = self.run_keeper_cycles(
+            5000, rpm_delay=lambda now: 3.0 if now == 5 else 0.0)
+        self.assertEqual(self.stall_lines(),
+                         self.stall_report("3.0", "0.0", "3.0", self.NO_PRESSURE))
+        # Only the slow pass reads, at its end, after its own repair at 5 s.
+        self.assertEqual(self.pressure_reads(), [
+            (8.0, "read", RECOVER.SELF_CGROUP), (8.0, "read", RECOVER.HOST_MEMORY_PRESSURE)])
+        first_read = self.events.index(self.pressure_reads()[0])
+        self.assertEqual(self.events[first_read - 1], (5.0, "write", "cooler_boost", "on"))
+        # That pass asks for no sleep, so Boost is still on at 8 s.
+        self.assertEqual(writes, [(float(now), "cooler_boost", "on")
+                                  for now in (1, 2, 3, 4, 5, 9, 10, 11, 12, 13)])
+        self.assertEqual(self.diagnostic_reads, 0)
+
+    def test_boost_switched_off_during_a_stall_is_back_on_before_the_reads(self):
+        # Boost goes off during a 3 s fan 1 read at 5 s, after that pass's
+        # repair. As in 0.2.0 it is back on at 8 s, before the warning and the
+        # memory-pressure reads, which take 2 s each here. Their 4 s go on the
+        # figures line and into no later stall: the next pass follows at once,
+        # and the repair each second resumes after it.
+        _, writes, _, _ = self.run_keeper_cycles(
+            5000, duration=30, rpm_delay=lambda now: 3.0 if now == 5 else 0.0,
+            boost_off_during_rpm_at=5.0, pressure_delay=2.0)
+        self.assertEqual([event for event in self.events if 5.0 <= event[0] < 13.0], [
+            (5.0, "write", "cooler_boost", "on"), (8.0, "external", "cooler_boost", "off"),
+            (8.0, "write", "cooler_boost", "on"), (8.0, "read", RECOVER.SELF_CGROUP),
+            (10.0, "read", RECOVER.HOST_MEMORY_PRESSURE)])
+        self.assertEqual(self.stall_lines(), self.stall_report(
+            "3.0", "0.0", "3.0", self.NO_PRESSURE, read_after="4.0"))
+        self.assertEqual(writes, [(float(now), "cooler_boost", "on")
+                                  for now in (1, 2, 3, 4, 5, 8, *range(13, 30))])
+
+    def test_a_kill_during_the_reads_still_leaves_the_stall_warning(self):
+        # A read that blocks until the watchdog kills the keeper must not take
+        # the stall's warning with it: that is printed before the first read.
+        class Killed(BaseException):
+            """Stands for the watchdog's SIGKILL while a read blocks."""
+
+        with self.assertRaises(Killed):
+            self.run_keeper_cycles(5000, rpm_delay=lambda now: 3.0 if now == 5 else 0.0,
+                                   pressure={RECOVER.SELF_CGROUP: Killed()})
+        self.assertEqual(self.stall_lines(), self.stall_report(
+            "3.0", "0.0", "3.0", self.NO_PRESSURE)[:1])
+        self.assertEqual(self.pressure_reads(), [(8.0, "read", RECOVER.SELF_CGROUP)])
+
+    def test_a_stall_and_a_failed_heartbeat_in_one_pass_warn_once_each(self):
+        # A 2.5 s RPM read, then that pass's heartbeat times out after 0.5 s.
+        # The repair at 5 s comes first, the notification warning when the
+        # heartbeat fails, then the stall's warning and pressure line; the
+        # next pass, at once, is no stall.
+        _, writes, _, _ = self.run_keeper_cycles(
+            5000, rpm_delay=lambda now: 2.5 if now == 5 else 0.0,
+            heartbeat_error_at=lambda now: TimeoutError("timed out") if now == 7.5 else None)
+        self.assertEqual(self.failed_heartbeats, [7.5])
+        self.assertEqual(self.stall_lines(), [
+            "WARNING runtime watchdog notification failed (consecutive failures: 1); "
+            "full cooling stays asserted, and systemd's watchdog ends the keeper if "
+            "notifications stay broken: TimeoutError: timed out",
+            *self.stall_report("3.0", "0.0", "3.0", self.NO_PRESSURE)])
+        self.assertEqual([event for event in self.events if 5.0 <= event[0] < 9.0], [
+            (5.0, "write", "cooler_boost", "on"), (8.0, "read", RECOVER.SELF_CGROUP),
+            (8.0, "read", RECOVER.HOST_MEMORY_PRESSURE)])
+        _, recovered = self.notification_reports(self.stderr)
+        self.assertEqual(recovered, [
+            "runtime watchdog notification succeeded again (consecutive failures: 1)"])
+        self.assertEqual(writes, [(float(now), "cooler_boost", "on")
+                                  for now in (1, 2, 3, 4, 5, 9, 10, 11, 12, 13)])
+
+    def test_a_sleep_overrun_logs_one_warning_after_that_pass_repair(self):
+        # The sleep after the pass at 5 s ends 4 s late, at 10 s. That pass
+        # first switches Boost back on, and only then reads memory pressure.
+        _, writes, _, _ = self.run_keeper_cycles(
+            5000, clock_gap_at=lambda now: 4.0 if now == 6 else 0.0)
+        self.assertEqual(self.stall_lines(),
+                         self.stall_report("4.0", "4.0", "0.0", self.NO_PRESSURE))
+        self.assertEqual([event for event in self.events if event[0] == 10.0], [
+            (10.0, "write", "cooler_boost", "on"), (10.0, "read", RECOVER.SELF_CGROUP),
+            (10.0, "read", RECOVER.HOST_MEMORY_PRESSURE)])
+        self.assertEqual(writes, [(float(now), "cooler_boost", "on")
+                                  for now in (1, 2, 3, 4, 5, 10, 11, 12, 13)])
+
+    def test_stall_warning_adds_memory_pressure_and_survives_bad_files(self):
+        unit = RECOVER.CGROUP_ROOT / "system.slice/msi-fan-profile-keeper.service/memory.pressure"
+        cgroup = {RECOVER.SELF_CGROUP: "0::/system.slice/msi-fan-profile-keeper.service\n"}
+        for pressure, note in (
+                ({**cgroup, unit: self.KERNEL, RECOVER.HOST_MEMORY_PRESSURE: self.KERNEL},
+                 "unit memory pressure some avg10=1.25 total=4567 full avg10=0.50 total=890; "
+                 "host memory pressure some avg10=1.25 total=4567 full avg10=0.50 total=890"),
+                ({**cgroup, unit: "some avg10=1.25 total=4567\n",
+                  RECOVER.HOST_MEMORY_PRESSURE: PermissionError(13, "Permission denied")},
+                 "unit memory pressure unavailable: ValueError; "
+                 "host memory pressure unavailable: PermissionError"),
+                ({RECOVER.SELF_CGROUP: OSError(12, "Cannot allocate memory")},
+                 self.NO_PRESSURE)):
+            with self.subTest(note=note):
+                state, writes, _, _ = self.run_keeper_cycles(
+                    5000, rpm_delay=lambda now: 2.5 if now == 5 else 0.0, pressure=pressure)
+                self.assertEqual(self.stall_lines(),
+                                 self.stall_report("2.5", "0.0", "2.5", note))
+                self.assertEqual(state["cooler_boost"], "on")
+                # Repair goes on: 1 to 5 s, then each second from 8.5 s.
+                self.assertEqual([at for at, _, _ in writes],
+                                 [1.0, 2.0, 3.0, 4.0, 5.0, 8.5, 9.5, 10.5, 11.5, 12.5, 13.5])
+
+    def test_unit_file_comes_from_the_watch_variable_or_the_cgroup_line(self):
+        root = RECOVER.CGROUP_ROOT
+        named = root / "named.slice/memory.pressure"
+        with mock.patch.dict(RECOVER.os.environ, {"MEMORY_PRESSURE_WATCH": str(named)},
+                             clear=True), \
+                mock.patch.object(RECOVER, "read_pressure",
+                                  side_effect=AssertionError("cgroup read")):
+            self.assertEqual(RECOVER.unit_memory_pressure_file(), named)
+        derived = root / "system.slice/msi-fan-profile-keeper.service/memory.pressure"
+        for environment in ({}, {"MEMORY_PRESSURE_WATCH": "/dev/null"},
+                            {"MEMORY_PRESSURE_WATCH": f"{root}/../memory.pressure"}):
+            with self.subTest(environment=environment), \
+                    mock.patch.dict(RECOVER.os.environ, environment, clear=True), \
+                    mock.patch.object(RECOVER, "read_pressure", return_value=(
+                        "0::/system.slice/msi-fan-profile-keeper.service\n")) as read:
+                self.assertEqual(RECOVER.unit_memory_pressure_file(), derived)
+                read.assert_called_once_with(RECOVER.SELF_CGROUP)
+        for result in (OSError(12, "Cannot allocate memory"), "1:name=systemd:/x\n"):
+            with self.subTest(result=result), \
+                    mock.patch.dict(RECOVER.os.environ, {}, clear=True), \
+                    mock.patch.object(RECOVER, "read_pressure", side_effect=[result]):
+                self.assertIsNone(RECOVER.unit_memory_pressure_file())
+
+    def test_pressure_figures_take_only_the_kernel_some_and_full_lines(self):
+        self.assertEqual(RECOVER.pressure_figures(self.KERNEL),
+                         "some avg10=1.25 total=4567 full avg10=0.50 total=890")
+        for text in ("", self.KERNEL.splitlines()[0],
+                     "some avg10=1 total=4567\nfull avg10=0.50 total=890\n"):
+            with self.subTest(text=text), self.assertRaises(ValueError):
+                RECOVER.pressure_figures(text)
 
 
 class IdentitySnapshotTests(HardwareIsolatedTestCase):

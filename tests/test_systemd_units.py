@@ -18,7 +18,7 @@ COMMON_DIRECTIVES = (
     ("Unit", "RequiresMountsFor", "/usr/local /usr"),
     ("Service", "Type", "notify"),
     ("Service", "NotifyAccess", "main"),
-    ("Service", "WatchdogSec", "5s"),
+    ("Service", "WatchdogSec", "30s"),
     ("Service", "WatchdogSignal", "SIGKILL"),
     ("Service", "TimeoutStartSec", "30s"),
     ("Service", "TimeoutStopSec", "30s"),
@@ -115,7 +115,7 @@ class FailureKeeperUnitTests(unittest.TestCase):
             "Before=msi-fan-profile.service",
             "ExecStart=/usr/local/libexec/msi-gpu-recover --keeper candidate14",
             "Restart=on-failure",
-            "WatchdogSec=5s",
+            "WatchdogSec=30s",
         ):
             self.assertIn(line, keeper)
         self.assertNotIn("[Install]", keeper)
@@ -129,6 +129,16 @@ class SafetyDirectiveGoldenTests(unittest.TestCase):
                 with self.subTest(unit=filename, key=key):
                     assigned = [item for item in parsed if item[:2] == (section, key)]
                     self.assertEqual(assigned, [(section, key, value)])
+
+    def test_keeper_uses_the_same_watchdog_interval_as_the_primary(self):
+        # The keeper replaces a daemon that a host-wide stall delayed, and the
+        # same stall delays the keeper. A shorter keeper watchdog turns it into
+        # keeper kills, and three within 15 minutes exhaust its start limit.
+        intervals = {filename: [value for section, key, value in directives(filename)
+                                if (section, key) == ("Service", "WatchdogSec")]
+                     for filename in UNIT_DIRECTIVES}
+        self.assertEqual(len(intervals[PRIMARY]), 1)
+        self.assertEqual(intervals[KEEPER], intervals[PRIMARY])
 
     def test_environment_is_exactly_the_profile_and_disabled_diagnostics(self):
         for filename in UNIT_DIRECTIVES:

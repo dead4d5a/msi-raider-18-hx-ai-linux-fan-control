@@ -90,8 +90,10 @@ High temperature alone is not proof that the fan controller is unsafe: once
 both physical fans have verified at maximum cooling, stopping the daemon would
 only lose monitoring during a persistent high-heat condition. The daemon still
 fails and invokes full-cooling recovery for an invalid identity, curve/state
-drift, a write/readback error, watchdog failure, or a plausible-but-low physical
-fan response. Invalid telemetry instead enters the degraded state below.
+drift, a write/readback error, a watchdog timeout, or a plausible-but-low
+physical fan response. A failed watchdog notification alone is reported and
+does not end it (section 7). Invalid telemetry instead enters the degraded
+state below.
 The response floor is 3,000 RPM per fan, not proof of maximum physical speed.
 Runtime response evidence is checked once per monitoring pass, separately for
 each healthy fan channel. A failure requires the 12-second response allowance
@@ -140,7 +142,7 @@ budget, one-second monitoring, the watchdog or the 30-second cooldown.
 
 ### 7. systemd watchdog and recovery
 
-The service is `Type=notify` with a five-second watchdog and `SIGKILL` watchdog
+The service is `Type=notify` with a 30-second watchdog and `SIGKILL` watchdog
 action. `ExecStopPost` is root-owned and independently:
 
 - verifies exact immutable identity;
@@ -163,6 +165,56 @@ primary-service faults.
 Keeper RPM verification is incremental and never stalls control repair. An
 upgrade failure after activation begins likewise leaves runtime recovery and
 boot enablement intact instead of invoking factory rollback.
+
+Both units use `WatchdogSec=30s`. The watchdog does not enforce the one-second
+monitoring or the two-second freshness rule; the daemon enforces both itself.
+However late it resumes, the pass that sees an observation gap or a sensor
+acquisition of more than two seconds latches Cooler Boost and resets the
+cooldown (section 6). The watchdog only bounds how long a daemon that does not
+resume stays in place before `ExecStopPost` and the keeper take over. Compared
+with the former 5 s, a daemon that alone hangs is replaced up to 25 s later,
+and a daemon stall of 7 to 30 s now passes without Boost until the daemon
+resumes; with 5 s, the kill and the recovery helper had Boost on about 7 s into
+such a stall. For that time the EC runs its curve without alarm escalation: in
+the field, with Boost off and the CPU at 88 °C or above, the median fan speeds
+were about 3,100 RPM (fan 1) and 3,700 RPM (fan 2), roughly half and 60 % of
+full speed. A stall longer than 30 s still ends in a kill and a keeper hold,
+with the recovery helper's Boost about 25 s later than with 5 s. The keeper
+has the same value because the same stall delays it: on 2026-11-13 its
+former 5 s watchdog killed it three times within four minutes of one host-wide
+out-of-memory stall, and its start limit of three starts in 15 minutes then
+left the EC at full cooling with no process supervising it.
+
+A failed runtime watchdog notification is reported and does not stop cooling.
+Each monitoring pass of the daemon and each repair pass of the keeper ends
+with one `WATCHDOG=1` notification that also carries the status line. If that
+send fails, for example because the service manager does not drain its
+notification socket during a host-wide out-of-memory stall, the program logs
+`WARNING runtime watchdog notification failed (consecutive failures: N)` with
+the error, at the first failure and then at most once a minute, and the loop
+goes on. Once a notification succeeds again after such a warning, one line
+says so. The minute counts from the last warning, across runs of failures: a
+run that starts less than a minute after a warning logs one only if it still
+fails once that minute is over, and nothing at all, not even that line, if it
+ends first. So a watchdog kill can follow failures that logged no warning of
+their own. The watchdog, not a single failed notification, ends a controller
+that stays silent: when no notification reaches systemd for 30 s, systemd
+kills the unit and records the result `watchdog`. As after any other
+watchdog timeout, `ExecStopPost` and the keeper then take over from the
+daemon, and a killed keeper is restarted within its start limit. Before 0.2.1,
+one failed notification ended the daemon with exit status 1, recorded as the
+result `exit-code` like a fault the daemon detects itself, and the keeper took
+over at full cooling at once. It ended the keeper too, and three such exits
+within 15 minutes would have used up the keeper's start limit. This is the one
+deliberate exception to preferring a noisy machine: a failed notification no
+longer brings full cooling at once. Monitoring is not reduced: until the
+watchdog acts, the daemon keeps its one-second checks and latches Boost on
+every alarm, gap or invalid sample as before. Startup stays strict: a failed
+`READY=1`, or a failed heartbeat before it, still ends startup with exit
+status 1. Two other places stay strict too. A failed heartbeat while the
+daemon verifies Boost during a Candidate 14 reapply still ends the daemon in
+full-cooling recovery, and a failed heartbeat during the clean stop still
+refuses the Boost release and ends the stop in full cooling.
 
 After verified recovery cooling is staged, the helper or keeper records a
 root-owned, mode-`0600`, same-boot recovery-Boost marker. The daemon validates
@@ -305,13 +357,13 @@ release without sampling and logs
 The daemon then exits `1` into full-cooling recovery, as after a hot stop,
 instead of being killed. A stop that the `factory-auto` marker starts before
 any signal gets the full 10 s, because the stop timer is not running yet. The
-daemon sends a watchdog heartbeat with every sample. That matters when the
-`factory-auto` marker starts the stop before the stop request arrives, because
-systemd still enforces `WatchdogSec=5s` then. `ExecStopPost` runs under its own
-`TimeoutStopSec=30s`; on its success path it spends at most 10 s confirming.
-The manager has no watchdog, and its 50 s `systemctl stop` covers the daemon's
-and the helper's waits. A cool clean stop takes about 2.5 s longer than before,
-and a cool `factory-auto`, which confirms three times, about 7.5 s longer.
+daemon sends a watchdog heartbeat with every sample, so the watchdog, which
+systemd still enforces when the `factory-auto` marker starts the stop, stays
+fed throughout. `ExecStopPost` runs under its own `TimeoutStopSec=30s`; on its
+success path it spends at most 10 s confirming. The manager has no watchdog,
+and its 50 s `systemctl stop` covers the daemon's and the helper's waits. A
+cool clean stop takes about 2.5 s longer than before, and a cool
+`factory-auto`, which confirms three times, about 7.5 s longer.
 
 The runtime release of an automatic latch or a queued manual release is not
 changed: it already requires 30 continuously valid, cool seconds, and an
@@ -384,6 +436,68 @@ check fails after the upgrade has continued, its exit message reads Cooler
 Boost and the marker again and reports what it finds, such as
 `cooler_boost is off` or a marker that is `missing`, since the failed check may
 be exactly that.
+
+## Host memory stalls
+
+When the host runs out of memory, the kernel can hold any process for seconds
+while it reclaims memory, in an allocation or in a page fault. Such host-wide
+out-of-memory stalls recur on the validation host. The daemon and the keeper
+are held like every other process and run no code until the kernel lets them
+continue.
+
+A late daemon latches Cooler Boost in its first pass after the stall. When an
+acquisition starts more than 2 s after the previous one, or takes longer than
+2 s, that pass reasserts Boost as an automatic latch and resets the cooldown
+and the fan-response evidence (section 6); time without continuous monitoring
+never counts toward the 30-second cool timer. Each stall is logged once, as a
+`WARNING` with its length and where the time went, followed by a line with the
+memory pressure of the unit and of the host, read after the Boost write and
+the warning, and how long after the stall it was read. The keeper reasserts
+full cooling in every pass; when a pass, with any overrun of the sleep before
+it, takes more than 2 s, it reasserts Cooler Boost once more and logs
+`WARNING recovery keeper stall ...` and a line with the same figures.
+
+The watchdog is for a process that does not resume. Both units use
+`WatchdogSec=30s` with `SIGKILL` (section 7). When no notification from the
+daemon has reached systemd for 30 s, systemd kills it and records the result
+`watchdog`. `ExecStopPost` then stages and verifies Candidate 14 in `advanced`
+mode with Cooler Boost on and records the recovery-Boost marker, and the keeper
+holds that state; a killed keeper is restarted 30 s later, within its start
+limit. This release does not hand back by itself: full cooling stays until
+`apply-default`, which needs no reboot (`OPERATIONS.md`, "After a watchdog
+kill").
+
+The cost of 30 s is that a daemon stall of 7 to 30 s passes without Boost
+until the daemon resumes. In that time no alarm can raise Cooler Boost. In the
+field, with Boost off and the CPU at 88 °C or above, the median fan speeds were
+about 3,100 RPM (fan 1) and 3,700 RPM (fan 2), roughly half and 60 % of full
+speed.
+
+What cannot be guaranteed:
+
+- A stall inside a kernel allocation cannot be bounded from user space. No
+  timer of the daemon, the recovery helper or the keeper runs while the kernel
+  holds it, and even the watchdog's `SIGKILL` takes effect only when the kernel
+  lets the process go: on 2026-11-13 the kernel needed 5 to 14 s to finish off
+  each killed keeper.
+- `MemoryMin=32M` is not effective when the parent cgroup reserves nothing, as
+  `system.slice` does on a stock Ubuntu host (section 7). While a unit is
+  active, `msi-fan-profile status` reports this as
+  `controller_memory.memory_min_effective`, which reads `false` on the
+  validation host.
+- The keeper's start limit still ends the guard. When the keeper fails again
+  after three starts within 15 minutes, systemd refuses to restart it
+  (`Start request repeated too quickly`), and status shows
+  `keeper_active_state` `failed`; `keeper_result` keeps the result of the
+  keeper's last run, such as `watchdog` after watchdog kills. The EC keeps
+  what the keeper last asserted, Candidate 14 in `advanced` mode with Cooler
+  Boost on, but no process reasserts it or watches the temperatures and fans;
+  nothing switches Boost back on if a key press turns it off. This was
+  observed on 2026-11-13: the keeper's former 5 s watchdog killed it three
+  times within four minutes of one stall, and the fans stayed at full cooling
+  without a supervising process for 9 h 35 min, until `apply-default`
+  restored normal control. The 30 s watchdog makes this less likely; it does
+  not rule it out.
 
 ## Suspend/resume
 

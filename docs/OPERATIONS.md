@@ -19,11 +19,38 @@ publishes `/run/msi-fan-profile.health.json` as `root:root:0644`; the manager ch
 ownership, mode, inode, schema, PID, and a five-second freshness limit. Dynamic
 telemetry is not included in the stable configuration comparison.
 
+`service_result` and `keeper_result` are systemd's `Result` for the controller
+and for its keeper: `success`, or why the unit last failed, such as `watchdog`,
+`oom-kill`, `exit-code` (it exited non-zero, as the daemon does on a fault it
+detects itself) or `signal`. `service_restarts` and `keeper_restarts` count
+systemd's automatic restarts (`NRestarts`); only the keeper restarts by itself,
+and its start limit is three starts in 15 minutes. When the keeper fails again
+at that limit, systemd refuses to restart it: `keeper_active_state` reads
+`failed`, `keeper_restarts` counts the refused restart too, `3` after three
+starts, and `keeper_result` keeps the result of the keeper's last run, such as
+`watchdog` after watchdog kills or `exit-code` with a torn recovery latch.
+`service_main_code` and `service_main_status`, and the same two `keeper_` keys,
+tell how the unit's last main process ended: `exited` with its exit status, or
+`killed` or `dumped` with the signal number. `9` is `SIGKILL`, which both a
+watchdog kill and an out-of-memory kill send. Both are `null` while that
+process runs and before one has ended. `apply-default` resets the failed state
+of both units, after which the results read `success` and the restart counts
+`0`; the keeper's `keeper_main_code` and `keeper_main_status` keep how its last
+process ended until it starts again. A key is `null` when systemd does not
+report its property. None of these keys enters the stable comparison or the
+exit status.
+
 `controller_memory` names the active unit (the controller or its keeper) and
 reports its cgroup's current, peak, and swap memory in bytes from the same
-batched `systemctl show` query. It is `null` when neither unit is active, and a
-value is `null` when systemd cannot report it. It is diagnostic only and never
-enters the stable comparison or the exit status. Both units have a hard
+batched `systemctl show` query. `locked_bytes` is the main process's locked
+memory (`VmLck` in `/proc/<pid>/status`); neither the controller nor the keeper
+locks memory, so it reads `0`. `memory_min_effective` says whether the unit's
+`MemoryMin=32M` can protect it: `true` when every ancestor cgroup below the
+root reserves at least as much in its `memory.min`, `false` when one reserves
+less, as `system.slice` does on a stock Ubuntu host. `controller_memory` is
+`null` when neither unit is active, and a value is `null` when systemd cannot
+report it or its file cannot be read. It is diagnostic only and never enters
+the stable comparison or the exit status. Both units have a hard
 `MemoryMax=64M` without swap, so a peak approaching 64 MiB foreshadows a
 memory-limit kill and keeper takeover.
 
@@ -339,6 +366,114 @@ keeper keeps cooling:
    replaced, after a `Not continuing at full cooling: ...` line. Afterwards,
    check `controller_memory.memory_peak_bytes` over several days; it should
    stay far below 64 MiB.
+
+### After a watchdog kill
+
+`msi-fan-profile status` shows `service_result` `watchdog`, and the
+controller's journal has systemd's `Watchdog timeout (limit 30s)!` and
+`Failed with result 'watchdog'`: no watchdog notification from the daemon
+reached systemd for 30 s. The usual cause is a host-wide out-of-memory stall,
+which leaves the kernel's `Out of memory` lines in the same minute:
+
+```bash
+sudo journalctl -k --no-pager | grep -F 'Out of memory'
+```
+
+If the daemon resumed during the stall before it was killed, its journal also
+has a stall warning, `WARNING monitoring gap; ...` or
+`WARNING slow sensor acquisition ...`, with the stall's length, and after it a
+`stall memory pressure, ...` line with the memory pressure of the unit and the
+host, unless the kill came while the daemon was reading those figures.
+`SAFETY.md` describes this under "Host memory stalls".
+
+If the daemon kept running while its notifications failed, its journal can
+also have `WARNING runtime watchdog notification failed ...` before systemd's
+lines, with no `runtime watchdog notification succeeded again` after it.
+`SAFETY.md` describes this under "systemd watchdog and recovery".
+
+Neither an upgrade nor a reboot is needed. Once the machine is responsive
+again and cool, run `sudo msi-fan-profile apply-default` and continue with
+steps 3 and 4 above.
+
+- If both units are `failed`, the keeper failed too, and systemd does not
+  restart it again: it restarts a failed keeper only within its start limit
+  of three starts in 15 minutes. `keeper_restarts` then reads `3`,
+  `keeper_result` keeps the result of the keeper's last run, such as
+  `watchdog`, and the keeper's journal has `Start request repeated too quickly`.
+  If the keeper resumed during a stall before it was killed, its journal also
+  has `WARNING recovery keeper stall ...`. The EC still holds Candidate 14 in
+  `advanced` mode with Cooler Boost on, but no process supervises it. Run the
+  same `apply-default`; it also resets the keeper's start count.
+- If `apply-default` reports `service disabled, factory auto with Boost on`,
+  it failed before it started the daemon, for example because a `systemctl`
+  call timed out, and its fail-safe disabled the service. Run it again. Check
+  `systemctl is-enabled msi-fan-profile.service` before any reboot.
+- If it fails with `activation failed after start was attempted` and no keeper
+  is active, see [Torn recovery latch](#torn-recovery-latch).
+
+## Torn recovery latch
+
+The recovery helper and the keeper record the recovery-Boost marker in two
+steps: they create `/run/msi-fan-profile.recovery-boost`, then write its
+12-byte payload. If one of them is killed between the two, an empty file
+remains, which no `msi-fan-profile` command removes. Then:
+
+- the daemon refuses to start, before any EC write, with
+  `ERROR ProfileError: invalid recovery Boost latch payload`;
+- the keeper stages full cooling and then exits at every start with
+  `FATAL: recovery keeper could not establish full cooling: invalid recovery Boost latch payload`,
+  until systemd stops restarting it. The EC keeps Candidate 14 in `advanced`
+  mode with Cooler Boost on, with no process supervising it;
+- `apply-default` fails with
+  `apply-default activation failed after start was attempted: ...`.
+
+Do not run `factory-auto` in this state, and do not start an upgrade, which
+hands over through `factory-auto`. On a cool machine `factory-auto` restores
+the factory curve, then fails to clear the empty marker and ends in its
+fail-safe: the service disabled, and the factory curve in `auto` mode with
+Cooler Boost on.
+
+Confirm the state first. `msi-fan-profile status` exits `1` and shows
+`recovery_boost_latched` `true`, `cooler_boost` `on`, and neither
+`service_active_state` nor `keeper_active_state` `active`, and
+
+```bash
+sudo stat -c %s /run/msi-fan-profile.recovery-boost
+```
+
+prints `0`. A complete marker has 12 bytes. If it prints `12`, or the file does
+not exist, the latch is not torn; the journal of both units names the reason.
+
+Then take one of two ways out, the first where possible:
+
+1. Reboot once the machine is cool, with the service still enabled. `/run` is
+   emptied at boot, and the boot applies Candidate 14 as usual. Cooler Boost
+   does not survive the reboot, and nothing monitors the machine until the
+   daemon has applied Candidate 14 (see [Boot window](#boot-window)), so do
+   not reboot while hot. Check first:
+
+   ```bash
+   systemctl is-enabled msi-fan-profile.service
+   ```
+
+   If it prints `disabled`, take the second way out instead, because
+   `apply-default` enables the service again and a reboot does not.
+2. Remove the empty file as root, then hand over to the daemon:
+
+   ```bash
+   sudo rm /run/msi-fan-profile.recovery-boost
+   sudo msi-fan-profile apply-default
+   ```
+
+   Without a marker, the daemon keeps the Cooler Boost it finds as manual
+   Boost, and `status` shows `health.manual_boost` `true`. Release it with
+   `sudo msi-fan-profile boost-release`, which completes after 30 continuously
+   valid, cool seconds. If the keeper restarted between the two commands, it
+   recorded a complete marker: `status` then shows `health.automatic_boost`
+   `true` instead, and the daemon releases Boost by itself after 30
+   continuously valid, cool seconds.
+
+After either way out, `msi-fan-profile status` exits `0`.
 
 ## Controller failed: driver not loaded
 

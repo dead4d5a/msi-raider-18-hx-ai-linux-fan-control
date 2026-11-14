@@ -36,7 +36,8 @@ DAEMON = load_daemon()
 # latch here exactly when an operator upgrades, so tests must never read it.
 HOST_RECOVERY_LATCH = DAEMON.RECOVERY_LATCH
 HOST_PATH_PREFIXES = ("/run/", "/sys/", "/proc/", "/dev/", "/etc/", "/var/")
-RELOCATED_PATHS = ("BASE", "LOCK", "OVERRIDE", "ACK", "HEALTH", "RECOVERY_LATCH")
+RELOCATED_PATHS = ("BASE", "LOCK", "OVERRIDE", "ACK", "HEALTH", "RECOVERY_LATCH",
+                   "HOST_MEMORY_PRESSURE", "CGROUP_ROOT")
 
 
 class AlarmHoldTests(unittest.TestCase):
@@ -186,6 +187,101 @@ class SensorHoldTests(unittest.TestCase):
                 mock.patch.object(DAEMON.time, "sleep"):
             DAEMON.verify_boost(pathlib.Path("/fake/wmi"), heartbeat.append)
         self.assertTrue(any("invalid fan telemetry" in item for item in heartbeat))
+
+    def test_each_channel_read_reports_its_own_duration(self):
+        # A blocked EC CPU read that then fails still reports its 4 s.
+        clock = {"now": 100.0}
+
+        def fake_read_uint(path):
+            if str(path) == "/fake/ec/cpu/realtime_temperature":
+                clock["now"] += 4.0
+                raise OSError("EC busy")
+            clock["now"] += 0.25
+            return 50000 if path.name == "temp1_input" else 4400 if "fan" in path.name else 40
+
+        core, wmi = pathlib.Path("/fake/core"), pathlib.Path("/fake/wmi")
+        with mock.patch.object(DAEMON, "BASE", pathlib.Path("/fake/ec")), \
+                mock.patch.object(DAEMON, "read_uint", side_effect=fake_read_uint), \
+                mock.patch.object(DAEMON.time, "monotonic", side_effect=lambda: clock["now"]):
+            legacy, snapshot = {}, {}
+            with self.assertRaises(DAEMON.SensorSampleError) as raised:
+                DAEMON.read_runtime_sample(core, wmi, read_times=legacy)
+            DAEMON.read_runtime_sample(core, wmi, ec_temperatures=(51, 42),
+                                       read_times=snapshot)
+        self.assertEqual(set(raised.exception.channel_errors), {"ec_cpu"})
+        self.assertEqual(legacy, {"package": 0.25, "ec_cpu": 4.0, "ec_gpu": 0.25,
+                                  "fan1": 0.25, "fan2": 0.25})
+        # Snapshot temperatures are not read here and get no entry.
+        self.assertEqual(snapshot, {"package": 0.25, "fan1": 0.25, "fan2": 0.25})
+        # Without a request for read times no clock is read at all.
+        with mock.patch.object(DAEMON, "read_uint", return_value=40), \
+                mock.patch.object(DAEMON.time, "monotonic",
+                                  side_effect=AssertionError("clock read")):
+            DAEMON.read_runtime_sample(core, wmi, ec_temperatures=(51, 42))
+
+
+class MemoryPressureTests(unittest.TestCase):
+    KERNEL = ("some avg10=1.25 avg60=0.50 avg300=0.10 total=4567\n"
+              "full avg10=0.50 avg60=0.20 avg300=0.05 total=890\n")
+
+    def test_figures_keep_the_some_and_full_avg10_and_total(self):
+        self.assertEqual(DAEMON.pressure_figures(self.KERNEL),
+                         "some avg10=1.25 total=4567 full avg10=0.50 total=890")
+
+    def test_malformed_pressure_text_is_rejected(self):
+        for text in ("", "\n", self.KERNEL.splitlines()[0],
+                     "full avg10=0.50 total=890\nsome avg10=1.25 total=4567\n",
+                     "some avg10=1 total=4567\nfull avg10=0.50 total=890\n",
+                     "some avg10=1.25 total=-1\nfull avg10=0.50 total=890\n",
+                     "some avg10=1.25\nfull avg10=0.50 total=890\n",
+                     "some avg10=1.25 total=4567 \nfull avg10=0,50 total=890\n",
+                     # Arabic-Indic digits are decimal, but not ASCII.
+                     f"some avg10={chr(0x661)}.{chr(0x662)}{chr(0x665)} total=4567\n"
+                     "full avg10=0.50 total=890\n"):
+            with self.subTest(text=text):
+                with self.assertRaises(ValueError):
+                    DAEMON.pressure_figures(text)
+
+    def test_unit_file_comes_from_the_watch_variable_or_the_cgroup_line(self):
+        root = pathlib.Path("/fake/cgroup")
+        cgroup = "0::/system.slice/msi-fan-profile.service"
+        derived = root / "system.slice/msi-fan-profile.service/memory.pressure"
+        for watch, expected in (
+                (None, derived),
+                ("/fake/cgroup/system.slice/x.service/memory.pressure",
+                 root / "system.slice/x.service/memory.pressure"),
+                ("/dev/null", derived),
+                ("", derived),
+                ("/fake/cgroup/system.slice/x.service/cpu.pressure", derived),
+                ("/fake/cgroup/../etc/memory.pressure", derived),
+                ("/fake/cgroupx/memory.pressure", derived),
+                ("fake/cgroup/x/memory.pressure", derived)):
+            with self.subTest(watch=watch), \
+                    mock.patch.object(DAEMON, "CGROUP_ROOT", root), \
+                    mock.patch.dict(DAEMON.os.environ):
+                DAEMON.os.environ.pop("MEMORY_PRESSURE_WATCH", None)
+                if watch is not None:
+                    DAEMON.os.environ["MEMORY_PRESSURE_WATCH"] = watch
+                self.assertEqual(DAEMON.unit_memory_pressure_file(cgroup), expected)
+        with mock.patch.object(DAEMON, "CGROUP_ROOT", root), \
+                mock.patch.dict(DAEMON.os.environ, {"MEMORY_PRESSURE_WATCH": "/dev/null"}):
+            for text in ("", "1:name=systemd:/x", "0::/x/../y"):
+                with self.subTest(cgroup=text):
+                    self.assertIsNone(DAEMON.unit_memory_pressure_file(text))
+
+    def test_note_never_raises_and_reports_why_figures_are_missing(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            unit, host = root / "unit", root / "host"
+            unit.write_text(self.KERNEL, encoding="ascii")
+            host.mkdir()
+            with mock.patch.object(DAEMON, "HOST_MEMORY_PRESSURE", host):
+                self.assertEqual(DAEMON.memory_pressure_note(unit), (
+                    "unit memory pressure some avg10=1.25 total=4567 full avg10=0.50 "
+                    "total=890; host memory pressure unavailable: IsADirectoryError"))
+                self.assertEqual(DAEMON.memory_pressure_note(None), (
+                    "unit memory pressure unavailable: no cgroup file; "
+                    "host memory pressure unavailable: IsADirectoryError"))
 
 
 class LegacyMonitoringReadTests(unittest.TestCase):
@@ -401,7 +497,7 @@ class SustainedAlarmMainLoopTests(HardwareFreeMainLoopTests):
             else:
                 raise AssertionError(f"unexpected write: {path}")
 
-        def fake_apply(_wmi, preserve_boost, _heartbeat):
+        def fake_apply(_wmi, preserve_boost, _heartbeat, **_options):
             state["curve"] = DAEMON.DEFAULT
             state["mode"] = "advanced"
             state["boost"] = "on" if preserve_boost else "off"
@@ -519,12 +615,12 @@ class SensorHoldMainLoopTests(HardwareFreeMainLoopTests):
             writes.append(value)
             state["boost"] = value
 
-        def fake_apply(_wmi, preserve_boost, _heartbeat):
+        def fake_apply(_wmi, preserve_boost, _heartbeat, **_options):
             state["curve"] = DAEMON.DEFAULT
             state["mode"] = "advanced"
             state["boost"] = "on" if preserve_boost else "off"
 
-        def fake_sample(_core, _wmi):
+        def fake_sample(_core, _wmi, **_options):
             nonlocal samples
             samples += 1
             if samples == 1:
@@ -646,7 +742,7 @@ class SensorHoldMainLoopTests(HardwareFreeMainLoopTests):
             writes.append(value)
             state["boost"] = value
 
-        def fake_apply(_wmi, preserve_boost, _heartbeat):
+        def fake_apply(_wmi, preserve_boost, _heartbeat, **_options):
             state["curve"] = DAEMON.DEFAULT
             state["mode"] = "advanced"
             state["boost"] = "on" if preserve_boost else "off"
@@ -743,7 +839,8 @@ class RecoveryHandoffMainLoopTests(HardwareFreeMainLoopTests):
                     event_at=None, suspend_offset_at=None, initial_verified=True,
                     clock_gap_at=None, sensor_delay_at=None, timing_setting=None,
                     control_at=None, override_at=None, factory_released=True,
-                    initial_boost="on", stop_readings_at=None):
+                    initial_boost="on", stop_readings_at=None, notify_failure_at=None,
+                    via_entrypoint=False, pressure_watch=None, pressure_delay=0.0):
         class Clock:
             now = 0.0
 
@@ -786,6 +883,26 @@ class RecoveryHandoffMainLoopTests(HardwareFreeMainLoopTests):
         self.ec_arguments = []
         self.release_samples = []
         self.notifications = []
+        self.failed_notifications = []
+        # Boost writes and memory-pressure reads in the order they happen.
+        self.io_events = []
+        real_read_pressure = DAEMON.read_pressure
+
+        def spy_read_pressure(path):
+            self.io_events.append((clock.now, "read", path))
+            # Each read of a pressure file takes pressure_delay seconds.
+            clock.now += pressure_delay
+            return real_read_pressure(path)
+
+        def fake_notify(message):
+            failure = notify_failure_at(clock.now, message) if notify_failure_at else None
+            if failure is None:
+                self.notifications.append((clock.now, message))
+                return
+            # An undrained notify socket makes the send time out after 0.5 s.
+            self.failed_notifications.append((clock.now, message))
+            clock.now += 0.5
+            raise failure
 
         def fake_read(path):
             text = str(path)
@@ -820,25 +937,34 @@ class RecoveryHandoffMainLoopTests(HardwareFreeMainLoopTests):
                 return
             self.assertTrue(str(path).endswith("cooler_boost"))
             writes.append((clock.now, value))
+            self.io_events.append((clock.now, "write", value))
             state["boost"] = value
 
-        def fake_apply(_wmi, preserve_boost, _heartbeat):
+        def fake_apply(_wmi, preserve_boost, heartbeat, *, startup=False):
             events.append("apply")
             preserves.append(preserve_boost)
+            if not startup:
+                # The Boost verification of an in-loop reapply heartbeats.
+                heartbeat("Verifying Cooler Boost: fans 4400/4400 RPM")
             state["curve"] = DAEMON.DEFAULT
             state["mode"] = "advanced"
             state["boost"] = "on" if preserve_boost else "off"
             return initial_verified
 
-        def fake_sample(_core, _wmi, *, ec_temperatures=None):
+        def fake_sample(_core, _wmi, *, ec_temperatures=None, read_times=None):
             self.ec_arguments.append(ec_temperatures)
             observed_at = clock.now
             try:
                 return (sample_at(observed_at) if sample_at else
                         DAEMON.RuntimeSample(50000, 50, 40, 4400, 4400))
             finally:
-                if sensor_delay_at:
-                    clock.now += sensor_delay_at(observed_at)
+                delay = sensor_delay_at(observed_at) if sensor_delay_at else 0
+                clock.now += delay
+                if read_times is not None:
+                    # A delayed acquisition here is a slow fan 1 read.
+                    channels = (("package", "fan1", "fan2") if ec_temperatures is not None
+                                else ("package", "ec_cpu", "ec_gpu", "fan1", "fan2"))
+                    read_times.update(dict.fromkeys(channels, 0.0), fan1=delay)
 
         original_stop = DAEMON.STOP
         original_boost_request = DAEMON.BOOST_REQUEST
@@ -850,8 +976,13 @@ class RecoveryHandoffMainLoopTests(HardwareFreeMainLoopTests):
             with contextlib.ExitStack() as stack:
                 stack.enter_context(mock.patch.dict(DAEMON.os.environ))
                 DAEMON.os.environ.pop("MSI_FAN_TIMING_METRICS", None)
+                DAEMON.os.environ.pop("MEMORY_PRESSURE_WATCH", None)
                 if timing_setting is not None:
                     DAEMON.os.environ["MSI_FAN_TIMING_METRICS"] = timing_setting
+                if pressure_watch is not None:
+                    DAEMON.os.environ["MEMORY_PRESSURE_WATCH"] = pressure_watch
+                stack.enter_context(mock.patch.object(
+                    DAEMON, "read_pressure", side_effect=spy_read_pressure))
                 stack.enter_context(
                     mock.patch.object(DAEMON, "BASE", pathlib.Path("/fake/ec")))
                 stack.enter_context(mock.patch.object(DAEMON, "LOCK", Lock()))
@@ -892,9 +1023,7 @@ class RecoveryHandoffMainLoopTests(HardwareFreeMainLoopTests):
                     self.factory_release = stack.enter_context(mock.patch.object(
                         DAEMON, "release_factory_if_cool", return_value=factory_released))
                 stack.enter_context(mock.patch.object(
-                    DAEMON, "notify",
-                    side_effect=lambda message: self.notifications.append(
-                        (clock.now, message))))
+                    DAEMON, "notify", side_effect=fake_notify))
                 stack.enter_context(mock.patch.object(
                     DAEMON.os, "geteuid", return_value=0))
                 stack.enter_context(mock.patch.object(DAEMON.os, "open", return_value=9))
@@ -906,9 +1035,15 @@ class RecoveryHandoffMainLoopTests(HardwareFreeMainLoopTests):
                     DAEMON.time, "clock_gettime", side_effect=clock.boottime))
                 stack.enter_context(mock.patch.object(
                     DAEMON.time, "sleep", side_effect=clock.sleep))
+                if via_entrypoint:
+                    # entrypoint() would install the daemon's signal handlers here.
+                    stack.enter_context(mock.patch.object(DAEMON.signal, "signal"))
                 self.stderr = io.StringIO()
                 with contextlib.redirect_stderr(self.stderr):
-                    self.assertEqual(DAEMON.main(), 0)
+                    if via_entrypoint:
+                        self.exit_status = DAEMON.entrypoint()
+                    else:
+                        self.assertEqual(DAEMON.main(), 0)
         finally:
             DAEMON.STOP = original_stop
             DAEMON.BOOST_REQUEST = original_boost_request
@@ -996,7 +1131,8 @@ class RecoveryHandoffMainLoopTests(HardwareFreeMainLoopTests):
 
     def test_clean_stop_keeps_the_watchdog_fed_throughout_the_confirmation(self):
         # The factory-auto marker starts this stop while the unit still runs, so
-        # WatchdogSec=5s is enforced; the refused wait lasts longer than that.
+        # WatchdogSec=30s is enforced; the wait feeds it with every sample instead
+        # of relying on finishing within it.
         with self.assertRaises(DAEMON.ProfileError):
             self.run_startup(recovery_latched=False, duration=60.0, override_at=5.0,
                              stop_readings_at=lambda now: self.HOT_RELEASE)
@@ -1316,6 +1452,34 @@ class RecoveryHandoffMainLoopTests(HardwareFreeMainLoopTests):
             True, duration=65, clock_gap_at=lambda now: 2 if now == 29 else 0)
         self.assertEqual(writes, [(61.0, "off")])
 
+    def test_twenty_second_stall_latches_boost_and_restarts_the_cooldown(self):
+        # Under the former 5 s watchdog a stall this long ended in a kill; under
+        # 30 s the daemon resumes and its two-second rule acts. Without a latch
+        # the gap latches Boost; with the handoff latch 28 s into its cooldown,
+        # the cooldown starts again. Either way Boost goes off only 30 cool
+        # seconds after the first pass after the stall, at 49 s.
+        for latched, initial, expected in (
+                (False, "off", [(49.0, "on"), (79.0, "off")]),
+                (True, "on", [(79.0, "off")])):
+            with self.subTest(recovery_latched=latched):
+                self.health_publisher.reset_mock()
+                state, writes, *_ = self.run_startup(
+                    latched, duration=85, initial_boost=initial,
+                    clock_gap_at=lambda now: 20 if now == 29 else 0)
+                self.assertEqual(writes, expected)
+                self.assertEqual(state["boost"], "off")
+                self.assertEqual(self.stall_lines(), [
+                    self.gap_warning("20.0", "0.0", "20.0", "0.0", "0.0"),
+                    self.pressure_line()])
+                before = self.health_at(28)
+                self.assertEqual(before["automatic_boost"], latched)
+                self.assertEqual(before["cooldown_elapsed_seconds"], 28 if latched else 0)
+                resumed = self.health_at(49)
+                self.assertTrue(resumed["automatic_boost"])
+                self.assertEqual(resumed["cooldown_elapsed_seconds"], 0)
+                self.assertEqual(self.health_at(78)["state"], "cooling")
+                self.assertEqual(self.health_at(79)["state"], "normal")
+
     def test_slow_current_poll_cannot_release_automatic_boost_at_cooldown_boundary(self):
         for delay in (2.5, 3.0):
             with self.subTest(delay=delay):
@@ -1393,6 +1557,279 @@ class RecoveryHandoffMainLoopTests(HardwareFreeMainLoopTests):
                     if "acquisition" in call.args[0]["channel_errors"])
         self.assertEqual(slow["state"], "degraded")
         self.assertFalse(slow["physical_response_verified"])
+
+    NO_PRESSURE = ("unit memory pressure unavailable: FileNotFoundError; "
+                   "host memory pressure unavailable: FileNotFoundError")
+
+    def unit_pressure(self):
+        # Built from the relocated cgroup root, never the host's.
+        path = DAEMON.CGROUP_ROOT / "system.slice/msi-fan-profile.service/memory.pressure"
+        self.assertTrue(path.is_relative_to(self.runtime))
+        return path
+
+    def warnings(self):
+        return [line for line in self.stderr.getvalue().splitlines()
+                if line.startswith("WARNING")]
+
+    def stall_lines(self):
+        """Every WARNING, and the memory-pressure line that follows a stall's."""
+        return [line for line in self.stderr.getvalue().splitlines()
+                if line.startswith(("WARNING", "stall memory pressure"))]
+
+    @staticmethod
+    def stall(total, after, overrun, before, acquisition):
+        return (f"stall {total}s (previous pass after acquisition {after}s, sleep overrun "
+                f"{overrun}s, this pass before acquisition {before}s, acquisition "
+                f"{acquisition}s)")
+
+    def gap_warning(self, *split):
+        return ("WARNING monitoring gap; Boost latched and cooldown reset; "
+                f"{self.stall(*split)}")
+
+    def slow_warning(self, detail, reads, *split):
+        return (f"WARNING slow sensor acquisition {detail}s exceeded 2s observation budget; "
+                f"Boost latched and cooldown reset; {self.stall(*split)}; channel reads "
+                f"{reads}")
+
+    @staticmethod
+    def pressure_line(read_after="0.0", pressure=NO_PRESSURE):
+        return f"stall memory pressure, read {read_after}s after the stall: {pressure}"
+
+    def test_a_seven_second_gap_logs_one_warning_with_its_length_and_split(self):
+        for latched, initial in ((True, "on"), (False, "off")):
+            with self.subTest(recovery_latched=latched):
+                self.run_startup(latched, duration=40, initial_boost=initial,
+                                 clock_gap_at=lambda now: 7 if now == 29 else 0)
+                self.assertEqual(self.stall_lines(), [
+                    self.gap_warning("7.0", "0.0", "7.0", "0.0", "0.0"),
+                    self.pressure_line()])
+
+    def test_gap_split_shows_where_the_time_went(self):
+        # Pass 28 acquires for 0.125 s and publishes for 0.375 s, so it asks
+        # to sleep 0.5 s; that sleep overruns by 1.5 s, and the next pass then
+        # takes 0.625 s before its acquisition. The gap of 3.125 s less the
+        # requested sleep is the stall.
+        def publish(payload):
+            if payload["sampled_monotonic_ns"] == 28_000_000_000:
+                DAEMON.time.sleep(0.375)
+
+        def before_acquisition(now, _state):
+            if now == 30.5:
+                DAEMON.time.sleep(0.625)
+            return None  # keep the legacy monitoring pass
+
+        self.health_publisher.side_effect = publish
+        self.run_startup(True, duration=40, control_at=before_acquisition,
+                         sensor_delay_at=lambda now: 0.125 if now == 28 else 0,
+                         clock_gap_at=lambda now: 1.5 if now == 29 else 0)
+        self.assertEqual(self.stall_lines(), [
+            self.gap_warning("2.6", "0.4", "1.5", "0.6", "0.1"), self.pressure_line()])
+
+    def test_a_slow_acquisition_logs_one_warning_with_each_channel_read_time(self):
+        # 2026-11-10: 5.943 s inside one acquisition, then a gap on the next
+        # pass. The gap only repeats that stall: it still latches Boost and
+        # resets the cooldown, but logs no second warning.
+        for control_at, reads in (
+                (None, "package 0.0s, ec_cpu 0.0s, ec_gpu 0.0s, fan1 5.9s, fan2 0.0s"),
+                (self.snapshot_control, "package 0.0s, fan1 5.9s, fan2 0.0s")):
+            with self.subTest(snapshot=control_at is not None):
+                self.health_publisher.reset_mock()
+                _, writes, *_ = self.run_startup(
+                    True, duration=40, control_at=control_at,
+                    sensor_delay_at=lambda now: 5.943 if now == 29 else 0)
+                self.assertEqual(self.stall_lines(), [self.slow_warning(
+                    "5.943", reads, "5.9", "0.0", "0.0", "0.0", "5.9"), self.pressure_line()])
+                self.assertEqual(writes, [])
+                resumed = self.health_at(34.943)
+                self.assertTrue(resumed["automatic_boost"])
+                self.assertEqual(resumed["cooldown_elapsed_seconds"], 0)
+
+    def test_each_second_of_a_stall_is_reported_once(self):
+        # A 7 s gap, then 3 s more in the same pass's acquisition: the slow
+        # warning counts only those 3 s, and the next gap repeats nothing. A
+        # slow acquisition at 49 is followed by 2.5 s in its own publication:
+        # the next gap reports only those 2.5 s.
+        def publish(payload):
+            if payload["sampled_monotonic_ns"] == 49_000_000_000:
+                DAEMON.time.sleep(2.5)
+
+        self.health_publisher.side_effect = publish
+        self.run_startup(True, duration=60,
+                         clock_gap_at=lambda now: 7 if now == 29 else 0,
+                         sensor_delay_at=lambda now: 3 if now in (36, 49) else 0)
+        reads = "package 0.0s, ec_cpu 0.0s, ec_gpu 0.0s, fan1 3.0s, fan2 0.0s"
+        self.assertEqual(self.stall_lines(), [
+            self.gap_warning("7.0", "0.0", "7.0", "0.0", "0.0"), self.pressure_line(),
+            self.slow_warning("3.000", reads, "3.0", "0.0", "0.0", "0.0", "3.0"),
+            self.pressure_line(),
+            self.slow_warning("3.000", reads, "3.0", "0.0", "0.0", "0.0", "3.0"),
+            self.pressure_line(),
+            self.gap_warning("2.5", "2.5", "0.0", "0.0", "0.0"), self.pressure_line()])
+
+    SLOW_FAN1 = "package 0.0s, ec_cpu 0.0s, ec_gpu 0.0s, fan1 3.0s, fan2 0.0s"
+
+    def stall_paths(self, gap):
+        """A gap of that many seconds and a 3 s slow acquisition, both at 29 s.
+
+        Each comes with the time of its Boost write and its warning.
+        """
+        return (({"clock_gap_at": lambda now: gap if now == 29 else 0}, 29.0 + gap,
+                 self.gap_warning(f"{gap:.1f}", "0.0", f"{gap:.1f}", "0.0", "0.0")),
+                ({"sensor_delay_at": lambda now: 3 if now == 29 else 0}, 32.0,
+                 self.slow_warning("3.000", self.SLOW_FAN1, "3.0", "0.0", "0.0", "0.0",
+                                   "3.0")))
+
+    def test_time_spent_reading_pressure_is_reported_once_on_its_own_line(self):
+        # Each pressure read takes 2.5 s. The legacy gap path logs its warning
+        # after the Boost write, reads until 5 s later and reports those 5 s
+        # on the next line; only then does its acquisition start. After the
+        # slow acquisition the next pass finds a gap that only repeats the
+        # reported seconds: it latches Boost and resets the cooldown but logs
+        # nothing more.
+        for stall, at, warning in self.stall_paths(7):
+            with self.subTest(stall=next(iter(stall))):
+                self.health_publisher.reset_mock()
+                _, writes, *_ = self.run_startup(False, duration=50, initial_boost="off",
+                                                 pressure_delay=2.5, **stall)
+                self.assertEqual(self.stall_lines(), [warning, self.pressure_line("5.0")])
+                self.assertEqual(self.io_events, [
+                    (at, "write", "on"), (at, "read", self.unit_pressure()),
+                    (at + 2.5, "read", DAEMON.HOST_MEMORY_PRESSURE)])
+                self.assertEqual(writes, [(at, "on")])
+                sampled = {call.args[0]["sampled_monotonic_ns"]
+                           for call in self.health_publisher.call_args_list}
+                self.assertIn(int((at + 5) * 1_000_000_000), sampled)
+                self.assertEqual(self.health_at(at + 5)["cooldown_elapsed_seconds"], 0)
+
+    def test_a_kill_during_the_reads_still_leaves_the_stall_warning(self):
+        # The reads come right after a stall, when memory is short. One that
+        # blocks until the watchdog kills the daemon must not take the
+        # stall's warning with it: that is printed before the first read.
+        class Killed(BaseException):
+            """Stands for the watchdog's SIGKILL while a read blocks."""
+
+        for stall, at, warning in self.stall_paths(20):
+            with self.subTest(stall=next(iter(stall))), \
+                    mock.patch.object(DAEMON, "read_pressure", side_effect=Killed()):
+                with self.assertRaises(Killed):
+                    self.run_startup(False, duration=60, initial_boost="off", **stall)
+                self.assertEqual(self.stall_lines(), [warning])
+                self.assertEqual(self.io_events, [
+                    (at, "write", "on"), (at, "read", self.unit_pressure())])
+
+    def test_a_stall_and_a_failed_notification_in_one_pass_warn_once_each(self):
+        # The 5.943 s acquisition of 2026-11-10, and that pass's heartbeat
+        # times out. Boost is written first, the pressure reads follow and
+        # the notification fails last; each logs one WARNING, and the next
+        # pass's gap, which only repeats reported time, logs nothing.
+        failed = []
+
+        def first_runtime_heartbeat_after_29(now, message):
+            if message.startswith("WATCHDOG=1\n") and now > 29 and not failed:
+                failed.append(now)
+                return TimeoutError("timed out")
+            return None
+
+        self.run_startup(False, duration=40, initial_boost="off", pressure_delay=0.25,
+                         sensor_delay_at=lambda now: 5.943 if now == 29 else 0,
+                         notify_failure_at=first_runtime_heartbeat_after_29)
+        reads = "package 0.0s, ec_cpu 0.0s, ec_gpu 0.0s, fan1 5.9s, fan2 0.0s"
+        self.assertEqual(self.stall_lines(), [
+            self.slow_warning("5.943", reads, "5.9", "0.0", "0.0", "0.0", "5.9"),
+            self.pressure_line("0.5"),
+            "WARNING runtime watchdog notification failed (consecutive failures: 1); "
+            "monitoring continues, and systemd's watchdog ends the daemon if "
+            "notifications stay broken: TimeoutError: timed out"])
+        self.assertEqual([event[1] for event in self.io_events], ["write", "read", "read"])
+        self.assertEqual([at for at, _ in self.failed_notifications], failed)
+        self.assertLess(self.io_events[-1][0], failed[0])
+        _, recovered = self.notification_reports(self.stderr.getvalue())
+        self.assertEqual(recovered, [
+            "runtime watchdog notification succeeded again (consecutive failures: 1)"])
+
+    def test_pressure_is_read_only_in_a_stall_and_after_its_boost_write(self):
+        # Without a latch and with Boost off, each stall path writes Boost on
+        # first. Only then are the two pressure files read, never on a pass
+        # without a stall, and no diagnostic clock is read.
+        with mock.patch.object(DAEMON.time, "perf_counter_ns",
+                               side_effect=AssertionError("diagnostics disabled")):
+            self.run_startup(False, duration=33, initial_boost="off")
+            self.assertEqual(self.io_events, [])
+            for stall, at in (({"clock_gap_at": lambda now: 7 if now == 29 else 0}, 36.0),
+                              ({"sensor_delay_at": lambda now: 3 if now == 29 else 0}, 32.0)):
+                with self.subTest(stall=next(iter(stall))):
+                    self.run_startup(False, duration=45, initial_boost="off", **stall)
+                    self.assertEqual(self.io_events, [
+                        (at, "write", "on"), (at, "read", self.unit_pressure()),
+                        (at, "read", DAEMON.HOST_MEMORY_PRESSURE)])
+                    self.assertEqual(len(self.warnings()), 1)
+
+    def test_stall_warning_adds_the_unit_and_host_memory_pressure(self):
+        named = DAEMON.CGROUP_ROOT / "named.slice/memory.pressure"
+        for path, (some, full) in (
+                (self.unit_pressure(), (("1.25", "4567"), ("0.50", "890"))),
+                (named, (("0.75", "11"), ("0.25", "7"))),
+                (DAEMON.HOST_MEMORY_PRESSURE, (("12.00", "123456789"), ("3.40", "98765")))):
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(
+                f"some avg10={some[0]} avg60=0.40 avg300=0.10 total={some[1]}\n"
+                f"full avg10={full[0]} avg60=0.20 avg300=0.05 total={full[1]}\n",
+                encoding="ascii")
+        derived = "some avg10=1.25 total=4567 full avg10=0.50 total=890"
+        for watch, unit in ((None, derived), ("/dev/null", derived),
+                            (str(named), "some avg10=0.75 total=11 full avg10=0.25 total=7")):
+            with self.subTest(watch=watch):
+                self.run_startup(True, duration=33, pressure_watch=watch,
+                                 clock_gap_at=lambda now: 7 if now == 9 else 0)
+                self.assertEqual(self.stall_lines(), [
+                    self.gap_warning("7.0", "0.0", "7.0", "0.0", "0.0"),
+                    self.pressure_line(pressure=(
+                        f"unit memory pressure {unit}; host memory pressure some "
+                        "avg10=12.00 total=123456789 full avg10=3.40 total=98765"))])
+
+    def test_unreadable_or_malformed_pressure_still_logs_the_warning(self):
+        # After a control run with figures, a directory in place of the
+        # unit's file and a host file that is missing, cut short, malformed or
+        # not ASCII: the warning still comes, without figures, and cooling and
+        # health are exactly the same in every run.
+        kernel = b"some avg10=1.25 total=4567\nfull avg10=0.50 total=890\n"
+        named = DAEMON.CGROUP_ROOT / "named.slice/memory.pressure"
+        named.parent.mkdir(parents=True)
+        named.write_bytes(kernel)
+        self.unit_pressure().mkdir(parents=True)
+        host = DAEMON.HOST_MEMORY_PRESSURE
+        self.assertTrue(host.is_relative_to(self.runtime))
+        figures = "some avg10=1.25 total=4567 full avg10=0.50 total=890"
+        runs = []
+        for watch, content, note in (
+                (str(named), kernel,
+                 f"unit memory pressure {figures}; host memory pressure {figures}"),
+                (None, None, "host memory pressure unavailable: FileNotFoundError"),
+                (None, b"some avg10=1.25 avg60=0.50 avg300=0.10 total=4567\n",
+                 "host memory pressure unavailable: ValueError"),
+                (None, b"some avg10=1.25 total=4567\nfull avg10=-0.50 total=890\n",
+                 "host memory pressure unavailable: ValueError"),
+                (None, b"some avg10=1.25 total=4567\nfull avg10=0.50 total=\xff\n",
+                 "host memory pressure unavailable: UnicodeDecodeError")):
+            if watch is None:
+                note = f"unit memory pressure unavailable: IsADirectoryError; {note}"
+            with self.subTest(note=note):
+                if content is None:
+                    host.unlink()
+                else:
+                    host.write_bytes(content)
+                self.health_publisher.reset_mock()
+                _, writes, *_ = self.run_startup(
+                    False, duration=50, initial_boost="off", pressure_watch=watch,
+                    clock_gap_at=lambda now: 7 if now == 9 else 0)
+                self.assertEqual(self.stall_lines(), [
+                    self.gap_warning("7.0", "0.0", "7.0", "0.0", "0.0"),
+                    self.pressure_line(pressure=note)])
+                runs.append((writes, [call.args[0]
+                                      for call in self.health_publisher.call_args_list]))
+        self.assertEqual(len(runs), 5)
+        self.assertEqual(runs[0][0], [(16.0, "on"), (46.0, "off")])
+        self.assertTrue(all(run == runs[0] for run in runs))
 
     def test_timing_metrics_unset_or_zero_never_reads_diagnostic_clock(self):
         for setting in (None, "0"):
@@ -1501,6 +1938,165 @@ class RecoveryHandoffMainLoopTests(HardwareFreeMainLoopTests):
         self.health_publisher.side_effect = OSError("publication unavailable")
         state, _, *_ = self.run_startup(False)
         self.assertEqual(state["boost"], "on")
+
+    @staticmethod
+    def notification_reports(stderr):
+        lines = stderr.splitlines()
+        return ([line for line in lines
+                 if line.startswith("WARNING runtime watchdog notification failed")],
+                [line for line in lines
+                 if line.startswith("runtime watchdog notification succeeded again")])
+
+    def test_failed_runtime_notifications_do_not_stop_working_cooling(self):
+        # A service manager that does not drain its notify socket during a
+        # host-wide out-of-memory stall: three passes in a row time out.
+        def blocked(now, message):
+            if 10 <= now <= 12 and message.startswith("WATCHDOG=1\n"):
+                return TimeoutError("timed out")
+            return None
+        control_state, control_writes, *_ = self.run_startup(True)
+        control_health = [call.args[0] for call in self.health_publisher.call_args_list]
+        self.health_publisher.reset_mock()
+        with mock.patch.object(DAEMON.time, "perf_counter_ns",
+                               side_effect=AssertionError("diagnostics disabled")):
+            state, writes, *_ = self.run_startup(True, notify_failure_at=blocked)
+        self.assertEqual([at for at, _ in self.failed_notifications], [10.0, 11.0, 12.0])
+        # Same EC writes and health snapshots, at the same one-second cadence.
+        self.assertEqual(writes, control_writes)
+        self.assertEqual(writes, [(30.0, "off")])
+        self.assertEqual(state, control_state)
+        self.assertEqual([call.args[0] for call in self.health_publisher.call_args_list],
+                         control_health)
+        warnings, recovered = self.notification_reports(self.stderr.getvalue())
+        self.assertEqual(warnings, [
+            "WARNING runtime watchdog notification failed (consecutive failures: 1); "
+            "monitoring continues, and systemd's watchdog ends the daemon if "
+            "notifications stay broken: TimeoutError: timed out"])
+        self.assertEqual(recovered, [
+            "runtime watchdog notification succeeded again (consecutive failures: 3)"])
+        beats = [at for at, message in self.notifications if message.startswith("WATCHDOG=1\n")]
+        self.assertEqual([at for at in beats if 8 <= at <= 14], [8.0, 9.0, 13.0, 14.0])
+
+    def test_failed_runtime_notifications_warn_at_most_once_a_minute(self):
+        # No watchdog runs here, so one run of failures can outlast a minute.
+        # A short run within a minute of the last warning stays silent.
+        failing = set(range(5, 71)) | {80, 81, 130}
+
+        def refused(now, message):
+            if now in failing and message.startswith("WATCHDOG=1\n"):
+                return ConnectionRefusedError(errno.ECONNREFUSED, "Connection refused")
+            return None
+        state, writes, *_ = self.run_startup(True, duration=135, notify_failure_at=refused)
+        self.assertEqual(len(self.failed_notifications), len(failing))
+        self.assertEqual(writes, [(30.0, "off")])
+        self.assertEqual(state["boost"], "off")
+        warnings, recovered = self.notification_reports(self.stderr.getvalue())
+        self.assertEqual([line.split(";")[0] for line in warnings], [
+            "WARNING runtime watchdog notification failed (consecutive failures: 1)",
+            "WARNING runtime watchdog notification failed (consecutive failures: 61)",
+            "WARNING runtime watchdog notification failed (consecutive failures: 1)"])
+        self.assertTrue(all(line.endswith(
+            f": ConnectionRefusedError: [Errno {errno.ECONNREFUSED}] Connection refused")
+            for line in warnings))
+        self.assertEqual(recovered, [
+            "runtime watchdog notification succeeded again (consecutive failures: 66)",
+            "runtime watchdog notification succeeded again (consecutive failures: 1)"])
+
+    def test_failed_ready_notification_still_fails_startup(self):
+        def refused(_now, message):
+            if message.startswith("READY=1\n"):
+                return ConnectionRefusedError(errno.ECONNREFUSED, "Connection refused")
+            return None
+        _, writes, *_ = self.run_startup(True, notify_failure_at=refused, via_entrypoint=True)
+        self.assertEqual(self.exit_status, 1)
+        self.assertTrue(self.stderr.getvalue().endswith(
+            f"ERROR ConnectionRefusedError: [Errno {errno.ECONNREFUSED}] Connection refused\n"))
+        self.assertNotIn("runtime watchdog notification", self.stderr.getvalue())
+        # The first pass published health and failed READY=1; no pass followed.
+        self.assertEqual(len(self.health_publisher.call_args_list), 1)
+        self.assertEqual([message.split("\n")[0] for _, message in self.failed_notifications],
+                         ["READY=1"])
+        self.assertEqual(self.notifications, [])
+        self.assertEqual(writes, [])
+
+    def last_health_sample(self):
+        return max(call.args[0]["sampled_monotonic_ns"]
+                   for call in self.health_publisher.call_args_list)
+
+    def test_missing_notify_socket_at_runtime_still_ends_the_daemon(self):
+        # Without NOTIFY_SOCKET, notify() raises ProfileError, not an OSError,
+        # and the per-pass catch lets it end the daemon.
+        def absent(now, message):
+            if now == 10 and message.startswith("WATCHDOG=1\n"):
+                return DAEMON.ProfileError("NOTIFY_SOCKET is absent")
+            return None
+        self.run_startup(True, notify_failure_at=absent, via_entrypoint=True)
+        self.assertEqual(self.exit_status, 1)
+        self.assertTrue(self.stderr.getvalue().endswith(
+            "ERROR ProfileError: NOTIFY_SOCKET is absent\n"))
+        self.assertNotIn("runtime watchdog notification", self.stderr.getvalue())
+        self.assertEqual(self.last_health_sample(), 10_000_000_000)
+
+    def test_failed_reapply_heartbeat_still_ends_the_daemon(self):
+        # A resume and a revert to the factory curve each make the loop reapply
+        # Candidate 14; a failed heartbeat of its Boost verification is fatal.
+        def revert(now, state):
+            if now == 5:
+                state.update(curve=DAEMON.FACTORY, mode="auto")
+
+        def verifying(_now, message):
+            return TimeoutError("timed out") if "Verifying Cooler Boost" in message else None
+        for label, trigger in (
+                ("resume", {"suspend_offset_at": lambda now: 1000 if now >= 5 else 0}),
+                ("factory revert", {"event_at": revert})):
+            with self.subTest(label):
+                self.health_publisher.reset_mock()
+                *_, events = self.run_startup(
+                    True, notify_failure_at=verifying, via_entrypoint=True, **trigger)
+                self.assertEqual(self.exit_status, 1)
+                self.assertTrue(self.stderr.getvalue().endswith(
+                    "ERROR TimeoutError: timed out\n"))
+                self.assertEqual(events, ["apply", "consume", "apply"])
+                self.assertEqual([at for at, _ in self.failed_notifications], [5.0])
+                # No pass followed: the last sample and heartbeat are those at 4 s.
+                self.assertEqual(self.last_health_sample(), 4_000_000_000)
+                self.assertEqual(self.notifications[-1][0], 4.0)
+                self.assertNotIn("runtime watchdog notification", self.stderr.getvalue())
+
+    def test_failed_restoring_heartbeat_ends_the_stop_before_the_factory_restore(self):
+        # Every notification fails from 3 s on. The loop reports the runtime
+        # failures and goes on; the clean stop's first heartbeat is fatal.
+        self.run_startup(False, duration=60.0, override_at=5.0, via_entrypoint=True,
+                         notify_failure_at=lambda now, _message: (
+                             TimeoutError("timed out") if now >= 3 else None))
+        self.assertEqual(self.exit_status, 1)
+        self.assertTrue(self.stderr.getvalue().endswith("ERROR TimeoutError: timed out\n"))
+        warnings, _ = self.notification_reports(self.stderr.getvalue())
+        self.assertEqual(len(warnings), 1)
+        self.assertEqual([at for at, _ in self.failed_notifications], [3.0, 4.0, 5.0])
+        self.assertEqual(self.failed_notifications[-1][1],
+                         "WATCHDOG=1\nSTATUS=Restoring factory auto")
+        self.factory_restore.assert_not_called()
+        self.factory_release.assert_not_called()
+
+    def test_failed_confirmation_heartbeat_keeps_boost_on_and_ends_the_daemon(self):
+        # The readings are cool, but the clean stop's first confirmation
+        # heartbeat times out: the release is refused and Boost stays on.
+        def confirming(_now, message):
+            return TimeoutError("timed out") if "Factory auto restored" in message else None
+        state, writes, *_ = self.run_startup(
+            False, duration=60.0, override_at=5.0, via_entrypoint=True,
+            stop_readings_at=lambda _now: self.COOL_RELEASE, notify_failure_at=confirming)
+        self.assertEqual(self.exit_status, 1)
+        self.assertTrue(self.stderr.getvalue().endswith(
+            "ERROR ProfileError: factory restored; Boost release unsafe\n"))
+        self.factory_restore.assert_called_once_with()
+        self.assertEqual(self.release_samples, [5.0])
+        self.assertEqual([at for at, _ in self.failed_notifications], [5.0])
+        # The refusal reasserted Boost after the 0.5 s timeout; nothing wrote off.
+        self.assertEqual(writes, [(5.5, "on")])
+        self.assertEqual(state["boost"], "on")
+        self.assertFalse(any("STOPPING=1" in message for _, message in self.notifications))
 
 
 class CleanStopReleaseTests(HardwareFreeMainLoopTests):
@@ -1664,7 +2260,9 @@ class StartupGuardMainTests(HardwareFreeMainLoopTests):
 
     KERNEL = "7.0.0-99-generic"
 
-    def run_entrypoint(self, *, driver_loaded=True, hwmon=(), real_identity=True):
+    def run_entrypoint(self, *, driver_loaded=True, hwmon=(), real_identity=True,
+                       notify_failure=None):
+        """notify_failure(message) returns the error notify() raises, or None."""
         class Clock:
             now = 0.0
 
@@ -1708,10 +2306,16 @@ class StartupGuardMainTests(HardwareFreeMainLoopTests):
                 raise FileNotFoundError(2, "No such file or directory", text)
             return host[text]
 
-        def fake_apply(_wmi, _preserve_boost, _heartbeat):
+        def fake_apply(_wmi, _preserve_boost, _heartbeat, **_options):
             # Stop after the startup transaction; the loop is covered elsewhere.
             DAEMON.STOP = True
             return True
+
+        def fake_notify(message):
+            error = notify_failure(message) if notify_failure else None
+            if error is not None:
+                raise error
+            notifications.append(message)
 
         original_stop = DAEMON.STOP
         DAEMON.STOP = False
@@ -1745,7 +2349,7 @@ class StartupGuardMainTests(HardwareFreeMainLoopTests):
                 stack.enter_context(mock.patch.object(
                     DAEMON, "release_factory_if_cool", return_value=True))
                 stack.enter_context(mock.patch.object(
-                    DAEMON, "notify", side_effect=notifications.append))
+                    DAEMON, "notify", side_effect=fake_notify))
                 stack.enter_context(mock.patch.object(DAEMON.signal, "signal"))
                 stack.enter_context(mock.patch.object(DAEMON.os, "geteuid", return_value=0))
                 stack.enter_context(mock.patch.object(DAEMON.os, "open", return_value=9))
@@ -1807,6 +2411,22 @@ class StartupGuardMainTests(HardwareFreeMainLoopTests):
         self.apply.assert_not_called()
         self.assertEqual(writes, [])
 
+    def test_failed_hwmon_wait_heartbeat_still_fails_startup(self):
+        # The heartbeats of the hwmon wait come before READY=1 and stay strict.
+        missing = DAEMON.ProfileError("expected one msi_wmi_platform hwmon; found 0")
+        result, stderr, writes, notifications, sleeps = self.run_entrypoint(
+            hwmon=(missing,) * 4 + (pathlib.Path("/fake/wmi"), pathlib.Path("/fake/core")),
+            real_identity=False, notify_failure=lambda message: (
+                TimeoutError("timed out") if "Waiting for" in message else None))
+        self.assertEqual(result, 1)
+        self.assertTrue(stderr.endswith("ERROR TimeoutError: timed out\n"))
+        # The first wait's heartbeat failed: no retry, no apply and no write.
+        self.assertEqual(sleeps, [])
+        self.assertEqual(self.discovery.call_count, 1)
+        self.apply.assert_not_called()
+        self.assertEqual(notifications, [])
+        self.assertEqual(writes, [])
+
     def test_duplicate_hwmon_is_never_accepted_while_waiting(self):
         duplicate = DAEMON.ProfileError("expected one msi_wmi_platform hwmon; found 2")
         result, stderr, writes, _, _ = self.run_entrypoint(
@@ -1815,6 +2435,218 @@ class StartupGuardMainTests(HardwareFreeMainLoopTests):
         self.assertIn("found 2", stderr)
         self.apply.assert_not_called()
         self.assertEqual(writes, [])
+
+
+class PreApplyStateLogTests(HardwareFreeMainLoopTests):
+    """The startup apply logs the EC state it found; in-loop reapplies do not.
+
+    entrypoint() runs the real main(), force_apply_default(), read() and
+    write() for a few passes against a private file-backed EC tree, and every
+    EC read, EC write, notification and journal line is recorded in one
+    ordered list. Only the clock, notification, hwmon discovery, host
+    identity, the lock and the clean stop's factory restore and release are
+    virtual, so a failed heartbeat of the real startup Boost verification is
+    tested here too.
+    """
+
+    # Candidate 14 with fan 1's top speed changed: a curve status calls unknown.
+    UNKNOWN = DAEMON.DEFAULT.replace(" 80 110 ", " 80 100 ")
+    THREE_READS = [("read", "fan_curve"), ("read", "fan_mode"), ("read", "cooler_boost")]
+
+    def run_entrypoint(self, curve, mode, boost, *, passes=3, resume_at=None,
+                       revert_at=None, notify_failure=None, fans=("4400", "4400")):
+        """notify_failure(message) returns the error notify() raises, or None."""
+        ec, wmi, core = DAEMON.BASE, self.runtime / "wmi", self.runtime / "core"
+        for path, value in {
+            ec / "fw_version": DAEMON.fan_control.FIRMWARE,
+            ec / "shift_mode": "comfort",
+            ec / "fan_curve": curve,
+            ec / "fan_mode": mode,
+            ec / "cooler_boost": boost,
+            ec / "cpu/realtime_temperature": "50",
+            ec / "gpu/realtime_temperature": "40",
+            wmi / "fan1_input": fans[0],
+            wmi / "fan2_input": fans[1],
+            core / "temp1_input": "50000",
+        }.items():
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(value + "\n")
+        events = []
+        clock = {"now": 0.0, "offset": 0.0, "passes": 0}
+        cgroup = pathlib.Path("/proc/self/cgroup")
+        real_read, real_write = DAEMON.read, DAEMON.write
+        legacy = {DAEMON.fan_control.SOURCE_PATH: DAEMON.fan_control.LEGACY_SRCVERSION}
+
+        class Lock:
+            @staticmethod
+            def stat():
+                return types.SimpleNamespace(
+                    st_mode=DAEMON.stat.S_IFREG | 0o600, st_uid=0, st_gid=0)
+
+        class Journal(io.StringIO):
+            # print() writes the message and its newline in separate calls.
+            def write(self, text):
+                events.extend(("log", line) for line in text.splitlines() if line)
+                return super().write(text)
+
+        def recording_read(path):
+            if path == cgroup:
+                return "0::/system.slice/msi-fan-profile.service"
+            if not path.is_relative_to(self.runtime):
+                raise AssertionError(f"host read blocked: {path}")
+            if path.is_relative_to(ec):
+                events.append(("read", str(path.relative_to(ec))))
+            return real_read(path)
+
+        def recording_write(path, value):
+            events.append(("write", str(path.relative_to(ec)), value))
+            real_write(path, value)
+
+        def recording_notify(message):
+            events.append(("notify", message))
+            error = notify_failure(message) if notify_failure else None
+            if error is not None:
+                raise error
+
+        def sleep(seconds):
+            clock["now"] += seconds
+            clock["passes"] += 1
+            if clock["passes"] == resume_at:
+                clock["offset"] += 100.0
+            if clock["passes"] == revert_at:
+                # The EC reverts to its factory curve in auto mode.
+                (ec / "fan_curve").write_text(DAEMON.FACTORY + "\n")
+                (ec / "fan_mode").write_text("auto\n")
+            if clock["passes"] == passes:
+                DAEMON.STOP = True
+
+        original = (DAEMON.STOP, DAEMON.BOOST_REQUEST, DAEMON.RELEASE_REQUEST)
+        DAEMON.STOP = DAEMON.BOOST_REQUEST = DAEMON.RELEASE_REQUEST = False
+        try:
+            with contextlib.ExitStack() as stack:
+                stack.enter_context(mock.patch.dict(DAEMON.os.environ))
+                DAEMON.os.environ.pop("MSI_FAN_TIMING_METRICS", None)
+                for name, value in (
+                        ("read", recording_read), ("write", recording_write),
+                        ("LOCK", Lock()), ("notify", recording_notify),
+                        ("one_hwmon", lambda name: wmi if name == "msi_wmi_platform" else core)):
+                    stack.enter_context(mock.patch.object(DAEMON, name, value))
+                for name in ("restore_factory_envelope", "release_factory_if_cool"):
+                    stack.enter_context(mock.patch.object(DAEMON, name, return_value=True))
+                stack.enter_context(mock.patch.object(
+                    DAEMON.fan_control, "host_identity", lambda _read, _base: dict(legacy)))
+                stack.enter_context(mock.patch.object(DAEMON.signal, "signal"))
+                stack.enter_context(mock.patch.object(DAEMON.os, "geteuid", return_value=0))
+                stack.enter_context(mock.patch.object(DAEMON.os, "open", return_value=9))
+                stack.enter_context(mock.patch.object(DAEMON.os, "close"))
+                stack.enter_context(mock.patch.object(DAEMON.fcntl, "flock"))
+                for name, value in (
+                        ("monotonic", lambda: clock["now"]),
+                        ("clock_gettime", lambda _clock: clock["now"] + clock["offset"]),
+                        ("sleep", sleep)):
+                    stack.enter_context(mock.patch.object(DAEMON.time, name, value))
+                with contextlib.redirect_stderr(Journal()):
+                    status = DAEMON.entrypoint()
+        finally:
+            DAEMON.STOP, DAEMON.BOOST_REQUEST, DAEMON.RELEASE_REQUEST = original
+        return status, events
+
+    @staticmethod
+    def logs(events):
+        return [event[1] for event in events if event[0] == "log"]
+
+    @staticmethod
+    def counts(events):
+        return (sum(event[0] == "read" for event in events),
+                sum(event[0] == "write" for event in events))
+
+    def test_startup_logs_the_found_state_after_its_reads_and_before_its_first_write(self):
+        cases = (
+            # A boot after a cool clean stop: the factory curve in auto, Boost off.
+            (DAEMON.FACTORY, "auto", "off", "curve=factory mode=auto boost=off",
+             "preserved_boost=False", (28, 6)),
+            # A restart that finds Candidate 14 still active with Cooler Boost on.
+            (DAEMON.DEFAULT, "advanced", "on", "curve=candidate14 mode=advanced boost=on",
+             "preserved_boost=True", (26, 5)),
+        )
+        for curve, mode, boost, found, preserved, accesses in cases:
+            with self.subTest(found=found):
+                status, events = self.run_entrypoint(curve, mode, boost)
+                self.assertEqual(status, 0)
+                logged = f"pre-apply EC state: {found}"
+                # The existing line, which the documented greps match, follows unchanged.
+                applied = f"Candidate14 applied; {preserved} recovery_latch=False"
+                self.assertEqual(self.logs(events)[:2], [logged, applied])
+                startup = events[:events.index(("log", applied))]
+                line = startup.index(("log", logged))
+                self.assertEqual(startup[line - 3:line], self.THREE_READS)
+                self.assertEqual([event for event in startup[:line] if event[0] == "write"], [])
+                self.assertEqual(startup[line + 1], ("write", "cooler_boost", "on"))
+                # The line adds no EC access: the startup path's EC reads and
+                # writes are those of v0.2.0.
+                self.assertEqual(self.counts(startup), accesses)
+
+    def test_a_refused_startup_state_is_logged_before_the_unchanged_error(self):
+        cases = (
+            (self.UNKNOWN, "advanced", "off", "curve=unknown mode=advanced boost=off"),
+            (DAEMON.FACTORY, "advanced", "on", "curve=factory mode=advanced boost=on"),
+        )
+        for curve, mode, boost, found in cases:
+            with self.subTest(found=found):
+                status, events = self.run_entrypoint(curve, mode, boost)
+                self.assertEqual(status, 1)
+                self.assertEqual(self.logs(events), [
+                    f"pre-apply EC state: {found}",
+                    "ERROR ProfileError: unrecognized pre-apply state: "
+                    f"{mode}/{boost}/{curve!r}"])
+                self.assertEqual(events[-5:-2], self.THREE_READS)
+                # As before, the refusal comes before any EC write.
+                self.assertEqual(self.counts(events), (8, 0))
+
+    def test_in_loop_reapplies_log_no_found_state(self):
+        # The boot clock jumps after pass 2, so pass 3 reapplies for a resume;
+        # the EC reverts to factory/auto after pass 4, which pass 5 reapplies.
+        status, events = self.run_entrypoint(
+            DAEMON.FACTORY, "auto", "off", passes=6, resume_at=2, revert_at=4)
+        self.assertEqual(status, 0)
+        logs = self.logs(events)
+        self.assertIn("resume detected; forcing Candidate14 reapply", logs)
+        # Candidate 14 was written by the startup apply and by both reapplies.
+        self.assertEqual([event for event in events if event[:2] == ("write", "fan_curve")],
+                         [("write", "fan_curve", DAEMON.DEFAULT)] * 3)
+        self.assertEqual([line for line in logs if line.startswith("pre-apply EC state")],
+                         ["pre-apply EC state: curve=factory mode=auto boost=off"])
+
+    def test_failed_startup_verification_heartbeat_still_fails_startup(self):
+        # The real verify_boost() of the startup apply heartbeats before READY=1,
+        # and those heartbeats stay strict: here its first one times out. It
+        # reports a valid RPM sample or, with fan 1 at the WMI sentinel 65535,
+        # invalid fan telemetry, from two different calls in verify_boost().
+        for fans, verifying in (
+                (("4400", "4400"), "fans 4400/4400 RPM"),
+                (("65535", "4400"), "invalid fan telemetry: implausible physical "
+                                    "fan telemetry: fan1=65535RPM fan2=4400RPM")):
+            beat = f"WATCHDOG=1\nSTATUS=Verifying Cooler Boost: {verifying}"
+            with self.subTest(verifying):
+                self.health_publisher.reset_mock()
+                status, events = self.run_entrypoint(
+                    DAEMON.FACTORY, "auto", "off", fans=fans,
+                    notify_failure=lambda message: (
+                        TimeoutError("timed out") if message == beat else None))
+                self.assertEqual(status, 1)
+                # Only the ERROR line followed: no READY=1, no pass and no write.
+                failed = events.index(("notify", beat))
+                self.assertEqual(events[failed + 1:],
+                                 [("log", "ERROR TimeoutError: timed out")])
+                self.assertEqual([event for event in events if event[0] == "notify"],
+                                 [("notify", beat)])
+                self.health_publisher.assert_not_called()
+                # The EC is left at Candidate 14 in auto mode with the
+                # verification's Cooler Boost on: nothing wrote advanced mode or
+                # Boost off.
+                self.assertEqual([event for event in events if event[0] == "write"], [
+                    ("write", "cooler_boost", "on"), ("write", "fan_mode", "auto"),
+                    ("write", "fan_curve", DAEMON.DEFAULT), ("write", "cooler_boost", "on")])
 
 
 class HealthPublicationTests(unittest.TestCase):

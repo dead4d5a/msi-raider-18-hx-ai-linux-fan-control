@@ -32,6 +32,9 @@ ACK = pathlib.Path("/run/msi-fan-profile.ack")
 HEALTH = pathlib.Path("/run/msi-fan-profile.health.json")
 RECOVERY_LATCH = pathlib.Path("/run/msi-fan-profile.recovery-boost")
 RECOVERY_LATCH_PAYLOAD = b"candidate14\n"
+# Read only for a stall, after its Cooler Boost write and its warning.
+HOST_MEMORY_PRESSURE = pathlib.Path("/proc/pressure/memory")
+CGROUP_ROOT = pathlib.Path("/sys/fs/cgroup")
 FACTORY = (
     "58 64 70 76 82 88 0 25 35 44 58 70 75 "
     "52 58 64 70 76 82 0 25 35 44 58 70 75"
@@ -49,6 +52,7 @@ RELEASE_REQUEST = False
 SUSTAINED_ALARM_SECONDS = 15.0
 SUSTAINED_ALARM_REPORT_SECONDS = 60.0
 SENSOR_DEGRADED_REPORT_SECONDS = 60.0
+NOTIFY_FAILURE_REPORT_SECONDS = 60.0
 BOOST_RESPONSE_SECONDS = 12.0
 BOOST_LOW_EVIDENCE_SECONDS = 2.0
 BOOST_RESPONSE_RPM = 3000
@@ -152,6 +156,74 @@ def notify(message: str) -> None:
         sock.settimeout(0.5)
         sock.connect(address)
         sock.sendall(message.encode("utf-8"))
+
+
+def read_pressure(path: pathlib.Path) -> str:
+    """Read one kernel memory-pressure file for a stall warning.
+
+    Kept apart from read(), which serves the EC and the sensors, so that
+    every read made for a stall warning can be observed on its own.
+    """
+    with path.open("r", encoding="ascii") as stream:
+        return stream.read()
+
+
+def pressure_figures(text: str) -> str:
+    """Return the some and full avg10 and total of a memory.pressure file.
+
+    The text must start with the kernel's some and full lines; anything else
+    raises ValueError. Only checked decimal values reach the journal.
+    """
+    figures = []
+    for kind, line in zip(("some", "full"), text.splitlines()):
+        name, *pairs = line.split() or [""]
+        fields = dict(pair.partition("=")[::2] for pair in pairs)
+        avg10, total = fields.get("avg10", ""), fields.get("total", "")
+        whole, point, hundredths = avg10.partition(".")
+        if name != kind or not point or not all(
+                part.isascii() and part.isdecimal() for part in (whole, hundredths, total)):
+            raise ValueError(f"malformed {kind} memory pressure line")
+        figures.append(f"{kind} avg10={avg10} total={total}")
+    if len(figures) != 2:
+        raise ValueError("memory pressure lacks its some and full lines")
+    return " ".join(figures)
+
+
+def unit_memory_pressure_file(cgroup: str) -> pathlib.Path | None:
+    """Return this unit's own cgroup memory.pressure file, or None.
+
+    systemd names it in $MEMORY_PRESSURE_WATCH. Any other value there, such
+    as /dev/null while the unit's watch is off, falls back to cgroup, the
+    text of /proc/self/cgroup, whose unified-hierarchy line is "0::/path".
+    """
+    watch = os.environ.get("MEMORY_PRESSURE_WATCH", "")
+    named = pathlib.PurePosixPath(watch)
+    if (watch.startswith(f"{CGROUP_ROOT}/") and named.name == "memory.pressure" and
+            ".." not in named.parts):
+        return pathlib.Path(watch)
+    for line in cgroup.splitlines():
+        if line.startswith("0::/") and ".." not in line.split("/"):
+            return CGROUP_ROOT / line.removeprefix("0::/") / "memory.pressure"
+    return None
+
+
+def memory_pressure_note(unit: pathlib.Path | None) -> str:
+    """Describe the unit's and the host's memory pressure for a stall warning.
+
+    Log only, and called only after the stall's Cooler Boost write and its
+    warning. A missing, unreadable or malformed file gives no figures, never
+    an exception.
+    """
+    notes = []
+    for label, path in (("unit", unit), ("host", HOST_MEMORY_PRESSURE)):
+        figures = "unavailable: no cgroup file"
+        if path is not None:
+            try:
+                figures = pressure_figures(read_pressure(path))
+            except (OSError, ValueError) as error:
+                figures = f"unavailable: {type(error).__name__}"
+        notes.append(f"{label} memory pressure {figures}")
+    return "; ".join(notes)
 
 
 def immutable_identity_error() -> str | None:
@@ -269,12 +341,25 @@ def verify_boost(wmi: pathlib.Path, heartbeat: Callable[[str], None]) -> None:
 
 
 def force_apply_default(wmi: pathlib.Path, preserve_boost: bool,
-                        heartbeat: Callable[[str], None]) -> bool:
-    """Reprogram Candidate14 under auto+Boost, then enter advanced mode."""
+                        heartbeat: Callable[[str], None], *,
+                        startup: bool = False) -> bool:
+    """Reprogram Candidate14 under auto+Boost, then enter advanced mode.
+
+    At startup it first logs the EC state it found, from the reads the state
+    check makes anyway, before that check and before any write, so a state it
+    then refuses is logged too: the journal's record of what the EC kept
+    across the previous stop or boot. In-loop reapplies log nothing here.
+    """
     require_policy_identity()
     curve = read(BASE / "fan_curve")
     mode = read(BASE / "fan_mode")
     boost = read(BASE / "cooler_boost")
+    if startup:
+        # The curve in the words of msi-fan-profile status; mode and Boost as read.
+        found = ("candidate14" if curve == DEFAULT else
+                 "factory" if curve == FACTORY else "unknown")
+        print(f"pre-apply EC state: curve={found} mode={mode} boost={boost}",
+              file=sys.stderr, flush=True)
     recognized = ((curve == FACTORY and mode == "auto") or
                   (curve == DEFAULT and mode == "advanced"))
     if not recognized or boost not in ("on", "off"):
@@ -430,8 +515,14 @@ class RuntimeSample:
 
 
 def read_runtime_sample(core: pathlib.Path, wmi: pathlib.Path, *,
-                        ec_temperatures: tuple[int, int] | None = None) -> RuntimeSample:
-    """Read every channel, retaining healthy values when another one fails."""
+                        ec_temperatures: tuple[int, int] | None = None,
+                        read_times: dict[str, float] | None = None) -> RuntimeSample:
+    """Read every channel, retaining healthy values when another one fails.
+
+    read_times, if given, receives the seconds each channel read here took,
+    failed reads included, for the slow-acquisition warning only. Channels
+    taken from a snapshot are not read here and get no entry.
+    """
     values: dict[str, int | None] = {}
     errors: dict[str, str] = {}
     for name, path, ceiling, unit in (
@@ -441,8 +532,11 @@ def read_runtime_sample(core: pathlib.Path, wmi: pathlib.Path, *,
         ("fan1", wmi / "fan1_input", 10000, "RPM"),
         ("fan2", wmi / "fan2_input", 10000, "RPM"),
     ):
+        provided = ec_temperatures is not None and name in ("ec_cpu", "ec_gpu")
+        timed = read_times is not None and not provided
+        began = time.monotonic() if timed else 0.0
         try:
-            if ec_temperatures is not None and name in ("ec_cpu", "ec_gpu"):
+            if provided:
                 value = ec_temperatures[0 if name == "ec_cpu" else 1]
             else:
                 value = read_uint(path)
@@ -456,6 +550,8 @@ def read_runtime_sample(core: pathlib.Path, wmi: pathlib.Path, *,
         except (SensorSampleError, OSError) as error:
             values[name] = None
             errors[name] = str(error)
+        if timed:
+            read_times[name] = time.monotonic() - began
     sample = RuntimeSample(**values)
     if errors:
         raise SensorSampleError("; ".join(errors.values()), sample, errors)
@@ -698,6 +794,114 @@ class SensorHold:
         return True
 
 
+@dataclass
+class NotificationFailures:
+    """Count failed runtime watchdog notifications and bound their reports.
+
+    A failed per-pass notification never ends the loop; systemd's watchdog
+    decides whether notifications stay broken. The first failure is reported
+    at once and later ones at most once per NOTIFY_FAILURE_REPORT_SECONDS,
+    across runs of failures. A run with a report gets one line when a
+    notification succeeds again; a run without one stays silent.
+    """
+    consecutive: int = 0
+    reported: bool = False
+    last_report: float | None = None
+
+    def failed(self, now: float) -> bool:
+        """Count one failure; return whether to report it now."""
+        self.consecutive += 1
+        if (self.last_report is not None and
+                now - self.last_report < NOTIFY_FAILURE_REPORT_SECONDS):
+            return False
+        self.reported = True
+        self.last_report = now
+        return True
+
+    def succeeded(self) -> int:
+        """End a run of failures; return its length if it was reported, else 0."""
+        count = self.consecutive if self.reported else 0
+        self.consecutive = 0
+        self.reported = False
+        return count
+
+
+@dataclass
+class MonitoringStalls:
+    """Measure a monitoring stall and where its time went, for its warning.
+
+    Log only: it reads no clock and no decision depends on it. The loop hands
+    over monotonic values it reads anyway: each acquisition's start and end,
+    and each pass's end with the sleep it then requests. A stall is the time
+    beyond that requested sleep: for a gap, from the start of the previous
+    acquisition to this pass's check; for a slow acquisition, from the end of
+    the previous acquisition to the end of this one. It is split into the
+    previous pass after its acquisition, the sleep overrun, this pass before
+    its acquisition, and the acquisition, which for a gap is the previous one.
+    The memory-pressure line after each warning adds the time until its reads
+    returned. Time a line has reported is not counted again, so a gap that
+    only repeats the previous pass's slow acquisition, or the reads after its
+    warning, gets no warning of its own.
+    """
+    acquisition: tuple[float, float] = (0.0, 0.0)
+    previous_acquisition: tuple[float, float] | None = None
+    previous_end: float = 0.0
+    previous_sleep: float = 0.0
+    reported_until: float = float("-inf")
+
+    def acquired(self, started: float, finished: float) -> None:
+        self.acquisition = (started, finished)
+
+    def finished(self, now: float, sleep: float) -> None:
+        self.previous_acquisition = self.acquisition
+        self.previous_end = now
+        self.previous_sleep = sleep
+
+    def unreported(self, start: float, end: float) -> float:
+        return max(0.0, end - max(start, self.reported_until))
+
+    def describe(self, started: float, before_until: float,
+                 acquisition: tuple[float, float] | None) -> str:
+        after = overrun = 0.0
+        if self.previous_acquisition is not None:
+            after = self.unreported(self.previous_acquisition[1], self.previous_end)
+            overrun = self.unreported(self.previous_end + self.previous_sleep, started)
+        before = self.unreported(started, before_until)
+        acquired = 0.0 if acquisition is None else self.unreported(*acquisition)
+        return (f"stall {after + overrun + before + acquired:.1f}s (previous pass "
+                f"after acquisition {after:.1f}s, sleep overrun {overrun:.1f}s, "
+                f"this pass before acquisition {before:.1f}s, "
+                f"acquisition {acquired:.1f}s)")
+
+    def gap(self, started: float, sampled_at: float) -> str | None:
+        """Describe a monitoring gap, or None when a warning already covers it."""
+        previous = self.previous_acquisition
+        if (previous is not None and sampled_at - max(previous[0], self.reported_until)
+                <= MAX_OBSERVATION_GAP_SECONDS):
+            return None
+        stall = self.describe(started, sampled_at, previous)
+        self.reported_until = sampled_at
+        return stall
+
+    def slow_acquisition(self, started: float, read_times: dict[str, float]) -> str:
+        """Describe this pass's slow acquisition and each channel's read time."""
+        stall = self.describe(started, self.acquisition[0], self.acquisition)
+        self.reported_until = self.acquisition[1]
+        reads = ", ".join(f"{name} {seconds:.1f}s" for name, seconds in read_times.items())
+        return f"{stall}; channel reads {reads or 'none'}"
+
+    def pressure_line(self, now: float, note: str) -> str:
+        """Describe the memory pressure read after a stall's warning.
+
+        now is when the reads returned. The time since the end of the stall
+        the warning reported holds that path's Boost write, the warning and
+        these reads; it is given here and counted toward no later warning.
+        """
+        since = max(0.0, now - self.reported_until)
+        self.reported_until = max(self.reported_until, now)
+        return f"stall memory pressure, read {since:.1f}s after the stall: {note}"
+
+
 def acknowledge(action: str) -> None:
     temporary = pathlib.Path(f"/run/.msi-fan-profile.ack.{os.getpid()}")
     payload = f"pid={os.getpid()} action={action} monotonic_ns={time.monotonic_ns()}\n"
@@ -770,7 +974,8 @@ def main() -> int:
     global BOOST_REQUEST, RELEASE_REQUEST
     if os.geteuid() != 0:
         raise ProfileError("root required")
-    if read(pathlib.Path("/proc/self/cgroup")) != "0::/system.slice/msi-fan-profile.service":
+    cgroup = read(pathlib.Path("/proc/self/cgroup"))
+    if cgroup != "0::/system.slice/msi-fan-profile.service":
         raise ProfileError("unexpected service cgroup")
     timing = configured_timing_metrics()
     info = LOCK.stat()
@@ -806,7 +1011,7 @@ def main() -> int:
         recovery_latched = recovery_latch_present()
         existing_boost = read(BASE / "cooler_boost") == "on"
         initial_physical_verification = force_apply_default(
-            wmi, existing_boost or recovery_latched, heartbeat)
+            wmi, existing_boost or recovery_latched, heartbeat, startup=True)
         if recovery_latched:
             consume_recovery_latch()
         print(
@@ -832,6 +1037,9 @@ def main() -> int:
         observed_monotonic_ns: int | None = None
         ready = False
         last_health_error: float | None = None
+        notify_failures = NotificationFailures()
+        stalls = MonitoringStalls()
+        unit_pressure = unit_memory_pressure_file(cgroup)
 
         def observe_response(boost: str, sample: RuntimeSample | None,
                              now: float) -> bool:
@@ -891,17 +1099,48 @@ def main() -> int:
                           file=sys.stderr, flush=True)
                     last_health_error = now
             if not ready:
+                # Startup stays strict: a failed READY=1 ends the daemon.
                 notify(f"READY=1\nWATCHDOG=1\nSTATUS={status}")
                 ready = True
-            else:
+                return
+            try:
                 heartbeat(status)
+            except OSError as error:
+                # One undelivered datagram, such as to a service manager that
+                # does not drain its socket during a host-wide out-of-memory
+                # stall, must not end working cooling: the watchdog ends a
+                # daemon whose notifications stay broken. Only this per-pass
+                # notification is caught; the startup, reapply and clean-stop
+                # heartbeats still fail the daemon.
+                if notify_failures.failed(now):
+                    print("WARNING runtime watchdog notification failed "
+                          f"(consecutive failures: {notify_failures.consecutive}); "
+                          "monitoring continues, and systemd's watchdog ends the "
+                          "daemon if notifications stay broken: "
+                          f"{type(error).__name__}: {error}",
+                          file=sys.stderr, flush=True)
+            else:
+                recovered = notify_failures.succeeded()
+                if recovered:
+                    print("runtime watchdog notification succeeded again "
+                          f"(consecutive failures: {recovered})",
+                          file=sys.stderr, flush=True)
 
         def complete_iteration(started: float) -> None:
             if timing is not None:
                 timing.finish_loop()
-            delay = POLL_INTERVAL_SECONDS - (time.monotonic() - started)
+            finished = time.monotonic()
+            delay = POLL_INTERVAL_SECONDS - (finished - started)
+            stalls.finished(finished, max(delay, 0.0))
             if delay > 0:
                 time.sleep(delay)
+
+        def report_stall_pressure() -> None:
+            # Log only, after the stall's Boost write and its flushed warning,
+            # so that a read which blocks until the watchdog fires still
+            # leaves the warning in the journal.
+            note = memory_pressure_note(unit_pressure)
+            print(stalls.pressure_line(time.monotonic(), note), file=sys.stderr, flush=True)
         if initial_physical_verification is False:
             sensor_hold.record(time.monotonic())
             automatic_boost = True
@@ -1010,6 +1249,7 @@ def main() -> int:
                 RELEASE_REQUEST = False
 
             slow_acquisition = False
+            read_times: dict[str, float] = {}
             try:
                 sampled_at = control.acquisition_started if control else time.monotonic()
                 if (last_runtime_poll is not None and
@@ -1022,8 +1262,13 @@ def main() -> int:
                     automatic_boost = True
                     if read(BASE / "cooler_boost") != "on":
                         write(BASE / "cooler_boost", "on")
-                    print("WARNING monitoring gap; Boost latched and cooldown reset",
-                          file=sys.stderr, flush=True)
+                    # Log only, after the Boost write. A gap that only repeats
+                    # time already reported stays quiet.
+                    stall = stalls.gap(started, sampled_at)
+                    if stall is not None:
+                        print("WARNING monitoring gap; Boost latched and cooldown reset; "
+                              f"{stall}", file=sys.stderr, flush=True)
+                        report_stall_pressure()
                 acquisition_started = (control.acquisition_started if control else
                                        time.monotonic())
                 observed_monotonic_ns = int(acquisition_started * 1_000_000_000)
@@ -1033,15 +1278,17 @@ def main() -> int:
                 sensor_error: SensorSampleError | None = None
                 try:
                     if control is None:
-                        sample = read_runtime_sample(core, wmi)
+                        sample = read_runtime_sample(core, wmi, read_times=read_times)
                     else:
                         sample = read_runtime_sample(
                             core, wmi, ec_temperatures=(control.state.ec_cpu,
-                                                       control.state.ec_gpu))
+                                                       control.state.ec_gpu),
+                            read_times=read_times)
                 except SensorSampleError as error:
                     sample = error.partial
                     sensor_error = error
                 acquisition_finished = time.monotonic()
+                stalls.acquired(acquisition_started, acquisition_finished)
                 slow_acquisition = (acquisition_finished - acquisition_started >
                                     MAX_OBSERVATION_GAP_SECONDS)
                 if timing is not None:
@@ -1076,7 +1323,14 @@ def main() -> int:
                 if boost_ack_pending and verified:
                     acknowledge("boost-on")
                     boost_ack_pending = False
-                if transition == "established":
+                if slow_acquisition:
+                    # Log only, after the Boost write above: one warning per
+                    # stall, in place of the degraded-telemetry line.
+                    print(f"WARNING {error}; Boost latched and cooldown reset; "
+                          f"{stalls.slow_acquisition(started, read_times)}",
+                          file=sys.stderr, flush=True)
+                    report_stall_pressure()
+                elif transition == "established":
                     print(
                         "WARNING sensor telemetry degraded; "
                         f"Candidate14 remains active with Cooler Boost requested: {error}",
