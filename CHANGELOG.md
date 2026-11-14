@@ -96,13 +96,16 @@ the accepted driver builds are those of 0.2.0.
 
 - A monitoring stall logs one WARNING with its length to 0.1 s, split into the
   previous pass after its acquisition, the sleep overrun, this pass before its
-  acquisition and the acquisition, with each channel's read time for a slow
-  acquisition and the `some` and `full` memory pressure of the unit and the
-  host, read after the Cooler Boost write; it replaces the `sensor telemetry
-  degraded` warning of a slow acquisition, and a gap that only repeats a
-  reported slow acquisition logs nothing more. The keeper logs one such
-  WARNING when a pass, with any overrun of the sleep before it, takes more than
-  2 s; no decision and no health field uses these figures (ST-3).
+  acquisition and the acquisition (for a gap, the previous one), with each
+  channel's read time for a slow acquisition, and then a
+  `stall memory pressure` line with the `some` and `full` memory pressure of
+  the unit and the host, read after the Cooler Boost write and the warning,
+  and the seconds since the stall, which no later warning counts again; the
+  WARNING replaces the `sensor telemetry degraded` warning of a slow
+  acquisition, and a gap that only repeats reported time logs nothing more.
+  The keeper reasserts Cooler Boost and then logs one such WARNING and line
+  when a pass, with any overrun of the sleep before it, takes more than 2 s;
+  no decision and no health field uses these figures (ST-3).
 - `msi-fan-profile status` says why each unit last stopped: `service_result`
   and `keeper_result` give systemd's `Result`, such as `watchdog`, `oom-kill`
   or `exit-code`, `service_restarts` and `keeper_restarts` its restart count,

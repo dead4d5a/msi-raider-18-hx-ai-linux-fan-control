@@ -449,10 +449,12 @@ acquisition starts more than 2 s after the previous one, or takes longer than
 2 s, that pass reasserts Boost as an automatic latch and resets the cooldown
 and the fan-response evidence (section 6); time without continuous monitoring
 never counts toward the 30-second cool timer. Each stall is logged once, as a
-`WARNING` with its length, where the time went, and the memory pressure of the
-unit and of the host, read after the Boost write. The keeper reasserts full
-cooling in every pass and logs `WARNING recovery keeper stall ...` when a
-pass, with any overrun of the sleep before it, takes more than 2 s.
+`WARNING` with its length and where the time went, followed by a line with the
+memory pressure of the unit and of the host, read after the Boost write and
+the warning, and how long after the stall it was read. The keeper reasserts
+full cooling in every pass; when a pass, with any overrun of the sleep before
+it, takes more than 2 s, it reasserts Cooler Boost once more and logs
+`WARNING recovery keeper stall ...` and a line with the same figures.
 
 The watchdog is for a process that does not resume. Both units use
 `WatchdogSec=30s` with `SIGKILL` (section 7). When the daemon has sent no

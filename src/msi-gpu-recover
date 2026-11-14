@@ -27,7 +27,7 @@ BASE = pathlib.Path("/sys/devices/platform/msi-ec")
 LOCK = pathlib.Path("/run/msi-fanctl.lock")
 RECOVERY_LATCH = pathlib.Path("/run/msi-fan-profile.recovery-boost")
 RECOVERY_LATCH_PAYLOAD = b"candidate14\n"
-# Read only for a stall warning, after the pass's repair.
+# Read only for a stall, after Boost is reasserted and the warning logged.
 HOST_MEMORY_PRESSURE = pathlib.Path("/proc/pressure/memory")
 CGROUP_ROOT = pathlib.Path("/sys/fs/cgroup")
 SELF_CGROUP = pathlib.Path("/proc/self/cgroup")
@@ -177,8 +177,9 @@ def unit_memory_pressure_file() -> pathlib.Path | None:
 def memory_pressure_note(unit: pathlib.Path | None) -> str:
     """Describe the unit's and the host's memory pressure for a stall warning.
 
-    Log only, and called only after the pass's repair. A missing, unreadable
-    or malformed file gives no figures, never an exception.
+    Log only, and called only after a stall's warning, which follows the
+    reassertion of Cooler Boost. A missing, unreadable or malformed file
+    gives no figures, never an exception.
     """
     notes = []
     for label, path in (("unit", unit), ("host", HOST_MEMORY_PRESSURE)):
@@ -682,15 +683,22 @@ def run_keeper(profile: str) -> int:
             timing.report(time.monotonic())
         finished = time.monotonic()
         # A stall is this pass plus any overrun of the sleep before it. Log
-        # only: this pass's repair has reasserted Cooler Boost already, and
-        # only then are the memory-pressure files read.
+        # only. Boost may have been switched off during the stall, after this
+        # pass's repair, so it is reasserted first. The warning is flushed
+        # before the memory-pressure files are read, and their figures follow
+        # on a line of their own. The time those take belongs to this pass:
+        # it shortens the sleep and counts toward no later stall.
         overrun = (0.0 if previous_end is None else
                    max(0.0, started - previous_end - previous_sleep))
         if overrun + (finished - started) > MAX_OBSERVATION_GAP_SECONDS:
+            request_boost_best_effort()
             print(f"WARNING recovery keeper stall {overrun + finished - started:.1f}s "
                   f"(sleep overrun {overrun:.1f}s, pass {finished - started:.1f}s); "
-                  "full cooling stays asserted; "
-                  f"{memory_pressure_note(unit_memory_pressure_file())}", file=sys.stderr)
+                  "full cooling stays asserted", file=sys.stderr, flush=True)
+            note = memory_pressure_note(unit_memory_pressure_file())
+            ended, finished = finished, time.monotonic()
+            print(f"recovery keeper stall memory pressure, read {finished - ended:.1f}s "
+                  f"after the stall: {note}", file=sys.stderr, flush=True)
         delay = POLL_INTERVAL_SECONDS - (finished - started)
         previous_end, previous_sleep = finished, max(delay, 0.0)
         if delay > 0:

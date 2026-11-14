@@ -377,9 +377,10 @@ sudo journalctl -k --no-pager | grep -F 'Out of memory'
 
 If the daemon resumed during the stall before it was killed, its journal also
 has a stall warning, `WARNING monitoring gap; ...` or
-`WARNING slow sensor acquisition ...`, with the stall's length and the memory
-pressure of the unit and the host. `SAFETY.md` describes this under "Host
-memory stalls".
+`WARNING slow sensor acquisition ...`, with the stall's length, and after it a
+`stall memory pressure, ...` line with the memory pressure of the unit and the
+host, unless the kill came while the daemon was reading those figures.
+`SAFETY.md` describes this under "Host memory stalls".
 
 If the daemon kept running while its notifications failed, its journal can
 also have `WARNING runtime watchdog notification failed ...` before systemd's

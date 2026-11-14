@@ -32,7 +32,7 @@ ACK = pathlib.Path("/run/msi-fan-profile.ack")
 HEALTH = pathlib.Path("/run/msi-fan-profile.health.json")
 RECOVERY_LATCH = pathlib.Path("/run/msi-fan-profile.recovery-boost")
 RECOVERY_LATCH_PAYLOAD = b"candidate14\n"
-# Read only for a stall warning, after the stall's Cooler Boost write.
+# Read only for a stall, after its Cooler Boost write and its warning.
 HOST_MEMORY_PRESSURE = pathlib.Path("/proc/pressure/memory")
 CGROUP_ROOT = pathlib.Path("/sys/fs/cgroup")
 FACTORY = (
@@ -210,8 +210,9 @@ def unit_memory_pressure_file(cgroup: str) -> pathlib.Path | None:
 def memory_pressure_note(unit: pathlib.Path | None) -> str:
     """Describe the unit's and the host's memory pressure for a stall warning.
 
-    Log only, and called only after the stall's Cooler Boost write. A missing,
-    unreadable or malformed file gives no figures, never an exception.
+    Log only, and called only after the stall's Cooler Boost write and its
+    warning. A missing, unreadable or malformed file gives no figures, never
+    an exception.
     """
     notes = []
     for label, path in (("unit", unit), ("host", HOST_MEMORY_PRESSURE)):
@@ -837,8 +838,10 @@ class MonitoringStalls:
     the previous acquisition to the end of this one. It is split into the
     previous pass after its acquisition, the sleep overrun, this pass before
     its acquisition, and the acquisition, which for a gap is the previous one.
-    Time a warning has reported is not counted again, so a gap that only
-    repeats the previous pass's slow acquisition gets no warning of its own.
+    The memory-pressure line after each warning adds the time until its reads
+    returned. Time a line has reported is not counted again, so a gap that
+    only repeats the previous pass's slow acquisition, or the reads after its
+    warning, gets no warning of its own.
     """
     acquisition: tuple[float, float] = (0.0, 0.0)
     previous_acquisition: tuple[float, float] | None = None
@@ -886,6 +889,17 @@ class MonitoringStalls:
         self.reported_until = self.acquisition[1]
         reads = ", ".join(f"{name} {seconds:.1f}s" for name, seconds in read_times.items())
         return f"{stall}; channel reads {reads or 'none'}"
+
+    def pressure_line(self, now: float, note: str) -> str:
+        """Describe the memory pressure read after a stall's warning.
+
+        now is when the reads returned. The time since the end of the stall
+        the warning reported holds that path's Boost write, the warning and
+        these reads; it is given here and counted toward no later warning.
+        """
+        since = max(0.0, now - self.reported_until)
+        self.reported_until = max(self.reported_until, now)
+        return f"stall memory pressure, read {since:.1f}s after the stall: {note}"
 
 
 def acknowledge(action: str) -> None:
@@ -1120,6 +1134,13 @@ def main() -> int:
             stalls.finished(finished, max(delay, 0.0))
             if delay > 0:
                 time.sleep(delay)
+
+        def report_stall_pressure() -> None:
+            # Log only, after the stall's Boost write and its flushed warning,
+            # so that a read which blocks until the watchdog fires still
+            # leaves the warning in the journal.
+            note = memory_pressure_note(unit_pressure)
+            print(stalls.pressure_line(time.monotonic(), note), file=sys.stderr, flush=True)
         if initial_physical_verification is False:
             sensor_hold.record(time.monotonic())
             automatic_boost = True
@@ -1242,12 +1263,12 @@ def main() -> int:
                     if read(BASE / "cooler_boost") != "on":
                         write(BASE / "cooler_boost", "on")
                     # Log only, after the Boost write. A gap that only repeats
-                    # the previous pass's reported slow acquisition stays quiet.
+                    # time already reported stays quiet.
                     stall = stalls.gap(started, sampled_at)
                     if stall is not None:
                         print("WARNING monitoring gap; Boost latched and cooldown reset; "
-                              f"{stall}; {memory_pressure_note(unit_pressure)}",
-                              file=sys.stderr, flush=True)
+                              f"{stall}", file=sys.stderr, flush=True)
+                        report_stall_pressure()
                 acquisition_started = (control.acquisition_started if control else
                                        time.monotonic())
                 observed_monotonic_ns = int(acquisition_started * 1_000_000_000)
@@ -1306,9 +1327,9 @@ def main() -> int:
                     # Log only, after the Boost write above: one warning per
                     # stall, in place of the degraded-telemetry line.
                     print(f"WARNING {error}; Boost latched and cooldown reset; "
-                          f"{stalls.slow_acquisition(started, read_times)}; "
-                          f"{memory_pressure_note(unit_pressure)}",
+                          f"{stalls.slow_acquisition(started, read_times)}",
                           file=sys.stderr, flush=True)
+                    report_stall_pressure()
                 elif transition == "established":
                     print(
                         "WARNING sensor telemetry degraded; "

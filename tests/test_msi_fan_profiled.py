@@ -840,7 +840,7 @@ class RecoveryHandoffMainLoopTests(HardwareFreeMainLoopTests):
                     clock_gap_at=None, sensor_delay_at=None, timing_setting=None,
                     control_at=None, override_at=None, factory_released=True,
                     initial_boost="on", stop_readings_at=None, notify_failure_at=None,
-                    via_entrypoint=False, pressure_watch=None):
+                    via_entrypoint=False, pressure_watch=None, pressure_delay=0.0):
         class Clock:
             now = 0.0
 
@@ -890,6 +890,8 @@ class RecoveryHandoffMainLoopTests(HardwareFreeMainLoopTests):
 
         def spy_read_pressure(path):
             self.io_events.append((clock.now, "read", path))
+            # Each read of a pressure file takes pressure_delay seconds.
+            clock.now += pressure_delay
             return real_read_pressure(path)
 
         def fake_notify(message):
@@ -1466,8 +1468,9 @@ class RecoveryHandoffMainLoopTests(HardwareFreeMainLoopTests):
                     clock_gap_at=lambda now: 20 if now == 29 else 0)
                 self.assertEqual(writes, expected)
                 self.assertEqual(state["boost"], "off")
-                self.assertEqual(self.warnings(), [
-                    self.gap_warning("20.0", "0.0", "20.0", "0.0", "0.0")])
+                self.assertEqual(self.stall_lines(), [
+                    self.gap_warning("20.0", "0.0", "20.0", "0.0", "0.0"),
+                    self.pressure_line()])
                 before = self.health_at(28)
                 self.assertEqual(before["automatic_boost"], latched)
                 self.assertEqual(before["cooldown_elapsed_seconds"], 28 if latched else 0)
@@ -1568,28 +1571,38 @@ class RecoveryHandoffMainLoopTests(HardwareFreeMainLoopTests):
         return [line for line in self.stderr.getvalue().splitlines()
                 if line.startswith("WARNING")]
 
+    def stall_lines(self):
+        """Every WARNING, and the memory-pressure line that follows a stall's."""
+        return [line for line in self.stderr.getvalue().splitlines()
+                if line.startswith(("WARNING", "stall memory pressure"))]
+
     @staticmethod
     def stall(total, after, overrun, before, acquisition):
         return (f"stall {total}s (previous pass after acquisition {after}s, sleep overrun "
                 f"{overrun}s, this pass before acquisition {before}s, acquisition "
                 f"{acquisition}s)")
 
-    def gap_warning(self, *split, pressure=NO_PRESSURE):
+    def gap_warning(self, *split):
         return ("WARNING monitoring gap; Boost latched and cooldown reset; "
-                f"{self.stall(*split)}; {pressure}")
+                f"{self.stall(*split)}")
 
     def slow_warning(self, detail, reads, *split):
         return (f"WARNING slow sensor acquisition {detail}s exceeded 2s observation budget; "
                 f"Boost latched and cooldown reset; {self.stall(*split)}; channel reads "
-                f"{reads}; {self.NO_PRESSURE}")
+                f"{reads}")
+
+    @staticmethod
+    def pressure_line(read_after="0.0", pressure=NO_PRESSURE):
+        return f"stall memory pressure, read {read_after}s after the stall: {pressure}"
 
     def test_a_seven_second_gap_logs_one_warning_with_its_length_and_split(self):
         for latched, initial in ((True, "on"), (False, "off")):
             with self.subTest(recovery_latched=latched):
                 self.run_startup(latched, duration=40, initial_boost=initial,
                                  clock_gap_at=lambda now: 7 if now == 29 else 0)
-                self.assertEqual(self.warnings(), [
-                    self.gap_warning("7.0", "0.0", "7.0", "0.0", "0.0")])
+                self.assertEqual(self.stall_lines(), [
+                    self.gap_warning("7.0", "0.0", "7.0", "0.0", "0.0"),
+                    self.pressure_line()])
 
     def test_gap_split_shows_where_the_time_went(self):
         # Pass 28 acquires for 0.125 s and publishes for 0.375 s, so it asks
@@ -1609,8 +1622,8 @@ class RecoveryHandoffMainLoopTests(HardwareFreeMainLoopTests):
         self.run_startup(True, duration=40, control_at=before_acquisition,
                          sensor_delay_at=lambda now: 0.125 if now == 28 else 0,
                          clock_gap_at=lambda now: 1.5 if now == 29 else 0)
-        self.assertEqual(self.warnings(), [
-            self.gap_warning("2.6", "0.4", "1.5", "0.6", "0.1")])
+        self.assertEqual(self.stall_lines(), [
+            self.gap_warning("2.6", "0.4", "1.5", "0.6", "0.1"), self.pressure_line()])
 
     def test_a_slow_acquisition_logs_one_warning_with_each_channel_read_time(self):
         # 2026-11-10: 5.943 s inside one acquisition, then a gap on the next
@@ -1624,8 +1637,8 @@ class RecoveryHandoffMainLoopTests(HardwareFreeMainLoopTests):
                 _, writes, *_ = self.run_startup(
                     True, duration=40, control_at=control_at,
                     sensor_delay_at=lambda now: 5.943 if now == 29 else 0)
-                self.assertEqual(self.warnings(), [self.slow_warning(
-                    "5.943", reads, "5.9", "0.0", "0.0", "0.0", "5.9")])
+                self.assertEqual(self.stall_lines(), [self.slow_warning(
+                    "5.943", reads, "5.9", "0.0", "0.0", "0.0", "5.9"), self.pressure_line()])
                 self.assertEqual(writes, [])
                 resumed = self.health_at(34.943)
                 self.assertTrue(resumed["automatic_boost"])
@@ -1645,11 +1658,94 @@ class RecoveryHandoffMainLoopTests(HardwareFreeMainLoopTests):
                          clock_gap_at=lambda now: 7 if now == 29 else 0,
                          sensor_delay_at=lambda now: 3 if now in (36, 49) else 0)
         reads = "package 0.0s, ec_cpu 0.0s, ec_gpu 0.0s, fan1 3.0s, fan2 0.0s"
-        self.assertEqual(self.warnings(), [
-            self.gap_warning("7.0", "0.0", "7.0", "0.0", "0.0"),
+        self.assertEqual(self.stall_lines(), [
+            self.gap_warning("7.0", "0.0", "7.0", "0.0", "0.0"), self.pressure_line(),
             self.slow_warning("3.000", reads, "3.0", "0.0", "0.0", "0.0", "3.0"),
+            self.pressure_line(),
             self.slow_warning("3.000", reads, "3.0", "0.0", "0.0", "0.0", "3.0"),
-            self.gap_warning("2.5", "2.5", "0.0", "0.0", "0.0")])
+            self.pressure_line(),
+            self.gap_warning("2.5", "2.5", "0.0", "0.0", "0.0"), self.pressure_line()])
+
+    SLOW_FAN1 = "package 0.0s, ec_cpu 0.0s, ec_gpu 0.0s, fan1 3.0s, fan2 0.0s"
+
+    def stall_paths(self, gap):
+        """A gap of that many seconds and a 3 s slow acquisition, both at 29 s.
+
+        Each comes with the time of its Boost write and its warning.
+        """
+        return (({"clock_gap_at": lambda now: gap if now == 29 else 0}, 29.0 + gap,
+                 self.gap_warning(f"{gap:.1f}", "0.0", f"{gap:.1f}", "0.0", "0.0")),
+                ({"sensor_delay_at": lambda now: 3 if now == 29 else 0}, 32.0,
+                 self.slow_warning("3.000", self.SLOW_FAN1, "3.0", "0.0", "0.0", "0.0",
+                                   "3.0")))
+
+    def test_time_spent_reading_pressure_is_reported_once_on_its_own_line(self):
+        # Each pressure read takes 2.5 s. The legacy gap path logs its warning
+        # after the Boost write, reads until 5 s later and reports those 5 s
+        # on the next line; only then does its acquisition start. After the
+        # slow acquisition the next pass finds a gap that only repeats the
+        # reported seconds: it latches Boost and resets the cooldown but logs
+        # nothing more.
+        for stall, at, warning in self.stall_paths(7):
+            with self.subTest(stall=next(iter(stall))):
+                self.health_publisher.reset_mock()
+                _, writes, *_ = self.run_startup(False, duration=50, initial_boost="off",
+                                                 pressure_delay=2.5, **stall)
+                self.assertEqual(self.stall_lines(), [warning, self.pressure_line("5.0")])
+                self.assertEqual(self.io_events, [
+                    (at, "write", "on"), (at, "read", self.unit_pressure()),
+                    (at + 2.5, "read", DAEMON.HOST_MEMORY_PRESSURE)])
+                self.assertEqual(writes, [(at, "on")])
+                sampled = {call.args[0]["sampled_monotonic_ns"]
+                           for call in self.health_publisher.call_args_list}
+                self.assertIn(int((at + 5) * 1_000_000_000), sampled)
+                self.assertEqual(self.health_at(at + 5)["cooldown_elapsed_seconds"], 0)
+
+    def test_a_kill_during_the_reads_still_leaves_the_stall_warning(self):
+        # The reads come right after a stall, when memory is short. One that
+        # blocks until the watchdog kills the daemon must not take the
+        # stall's warning with it: that is printed before the first read.
+        class Killed(BaseException):
+            """Stands for the watchdog's SIGKILL while a read blocks."""
+
+        for stall, at, warning in self.stall_paths(20):
+            with self.subTest(stall=next(iter(stall))), \
+                    mock.patch.object(DAEMON, "read_pressure", side_effect=Killed()):
+                with self.assertRaises(Killed):
+                    self.run_startup(False, duration=60, initial_boost="off", **stall)
+                self.assertEqual(self.stall_lines(), [warning])
+                self.assertEqual(self.io_events, [
+                    (at, "write", "on"), (at, "read", self.unit_pressure())])
+
+    def test_a_stall_and_a_failed_notification_in_one_pass_warn_once_each(self):
+        # The 5.943 s acquisition of 2026-11-10, and that pass's heartbeat
+        # times out. Boost is written first, the pressure reads follow and
+        # the notification fails last; each logs one WARNING, and the next
+        # pass's gap, which only repeats reported time, logs nothing.
+        failed = []
+
+        def first_runtime_heartbeat_after_29(now, message):
+            if message.startswith("WATCHDOG=1\n") and now > 29 and not failed:
+                failed.append(now)
+                return TimeoutError("timed out")
+            return None
+
+        self.run_startup(False, duration=40, initial_boost="off", pressure_delay=0.25,
+                         sensor_delay_at=lambda now: 5.943 if now == 29 else 0,
+                         notify_failure_at=first_runtime_heartbeat_after_29)
+        reads = "package 0.0s, ec_cpu 0.0s, ec_gpu 0.0s, fan1 5.9s, fan2 0.0s"
+        self.assertEqual(self.stall_lines(), [
+            self.slow_warning("5.943", reads, "5.9", "0.0", "0.0", "0.0", "5.9"),
+            self.pressure_line("0.5"),
+            "WARNING runtime watchdog notification failed (consecutive failures: 1); "
+            "monitoring continues, and systemd's watchdog ends the daemon if "
+            "notifications stay broken: TimeoutError: timed out"])
+        self.assertEqual([event[1] for event in self.io_events], ["write", "read", "read"])
+        self.assertEqual([at for at, _ in self.failed_notifications], failed)
+        self.assertLess(self.io_events[-1][0], failed[0])
+        _, recovered = self.notification_reports(self.stderr.getvalue())
+        self.assertEqual(recovered, [
+            "runtime watchdog notification succeeded again (consecutive failures: 1)"])
 
     def test_pressure_is_read_only_in_a_stall_and_after_its_boost_write(self):
         # Without a latch and with Boost off, each stall path writes Boost on
@@ -1685,8 +1781,9 @@ class RecoveryHandoffMainLoopTests(HardwareFreeMainLoopTests):
             with self.subTest(watch=watch):
                 self.run_startup(True, duration=33, pressure_watch=watch,
                                  clock_gap_at=lambda now: 7 if now == 9 else 0)
-                self.assertEqual(self.warnings(), [self.gap_warning(
-                    "7.0", "0.0", "7.0", "0.0", "0.0", pressure=(
+                self.assertEqual(self.stall_lines(), [
+                    self.gap_warning("7.0", "0.0", "7.0", "0.0", "0.0"),
+                    self.pressure_line(pressure=(
                         f"unit memory pressure {unit}; host memory pressure some "
                         "avg10=12.00 total=123456789 full avg10=3.40 total=98765"))])
 
@@ -1725,8 +1822,9 @@ class RecoveryHandoffMainLoopTests(HardwareFreeMainLoopTests):
                 _, writes, *_ = self.run_startup(
                     False, duration=50, initial_boost="off", pressure_watch=watch,
                     clock_gap_at=lambda now: 7 if now == 9 else 0)
-                self.assertEqual(self.warnings(), [self.gap_warning(
-                    "7.0", "0.0", "7.0", "0.0", "0.0", pressure=note)])
+                self.assertEqual(self.stall_lines(), [
+                    self.gap_warning("7.0", "0.0", "7.0", "0.0", "0.0"),
+                    self.pressure_line(pressure=note)])
                 runs.append((writes, [call.args[0]
                                       for call in self.health_publisher.call_args_list]))
         self.assertEqual(len(runs), 5)
