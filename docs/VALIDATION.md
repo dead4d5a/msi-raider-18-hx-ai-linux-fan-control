@@ -37,7 +37,7 @@
 - Real Boost-on acknowledgement verified both fans at 5,714 RPM, followed by an
   acknowledged release after 30 continuously cool seconds and return to normal
   health. This validates the deployed user-space path on the legacy driver, not
-  the new snapshot driver, forced-fault recovery, or suspend/resume.
+  the snapshot driver, forced-fault recovery, or suspend/resume.
 
 ## Field evidence on 2026-10-10 and 2026-10-11
 
@@ -63,8 +63,8 @@ observations, not attended or injected-fault tests.
 - A cool guarded upgrade deployed 6ed5498 at 12:06. The stop logged
   `successful candidate14 service left thermally verified factory auto/off`, and
   Candidate 14 was applied again at 12:06:17. v0.2.0, which contains the fix,
-  replaced this build later that day; its multi-day runs are recorded under
-  "Field evidence from 2026-10-18 to 2026-11-11" below.
+  replaced this build later that day (v0.2.0 tag message); its multi-day runs
+  are recorded under "Field evidence from 2026-10-18 to 2026-11-11" below.
 - Reboot from 7.0.0-34 to 7.0.0-38: at the 12:43:36 shutdown the machine was too
   hot to release Boost. The daemon restored factory auto with Boost on and
   exited `1` with `factory restored; Boost release unsafe`; `ExecStopPost` then
@@ -109,6 +109,8 @@ host, in a directory outside the repository; its units log has SHA-256
 export's manifest `SHA256SUMS`, with the SHA-256 of every other file, has
 SHA-256 `36a6c17dff07553836222e62fea42a0654886434d66d5c92413ba67858baab43`.
 Every figure below can be recomputed from that export and this repository.
+The entries are selected events, among them every monitoring gap; the full
+log is in the export.
 
 - Deployment: the install record in the export names `e4d4e19` as
   `source_commit` and the SHA-256 of that commit's `SHA256SUMS` as
@@ -168,12 +170,29 @@ Every figure below can be recomputed from that export and this repository.
   for 2 h 47 min, until the operator rebooted. The next boot applied
   Candidate 14 normally.
 
-## Field evidence on 2026-11-13
+## Field evidence from 2026-11-12 to 2026-11-13
 
 This is field evidence for v0.2.0, unattended, on the same driver, from a
-later journal export, which also stays on the validation host; its units log
-has SHA-256 `90034453805bdd0da74a221d607c4c2a998fbb6dafea7b46dd119b84f355b3b6`.
+later journal export of 2026-11-13 (America/Denver), which also stays on the
+validation host. From the journal, the entries use the lines of both units and
+of the kernel's out-of-memory killer; from outside it, the recorded exit code
+of `msi-fan-profile status`. The export's units log has SHA-256
+`90034453805bdd0da74a221d607c4c2a998fbb6dafea7b46dd119b84f355b3b6`, and its
+manifest `SHA256SUMS`, with the SHA-256 of every other file, has SHA-256
+`390b3db64b162401bcfdea14de715386e891081182f1bec86636b5d1c8a697e0`.
+That the daemon had run since the boot of 2026-11-10 comes from the export of
+2026-11-11, whose units log agrees line for line with this one where the two
+overlap. Every figure below can be recomputed from the two exports and this
+repository. The entries are selected events, among them every monitoring gap;
+the full log is in the export.
 
+- 2026-11-12, 18:10:23, during a host-wide out-of-memory stall: one monitoring
+  gap, with Cooler Boost on for a CPU alarm since 17:57:11. The daemon logged
+  `WARNING monitoring gap; Boost latched and cooldown reset` and, in the same
+  pass, the `sensor telemetry recovered` line quoted above. Three more CPU
+  alarms followed, and the daemon released Cooler Boost after its 30-second
+  cooldown at 18:48:34. The kernel logged a host-wide out-of-memory kill
+  0.06 s before the warning.
 - 2026-11-13, during another host-wide out-of-memory stall: the 5 s watchdog
   killed the daemon, which had run since the boot of 2026-11-10 (15.1M memory
   peak). `ExecStopPost` verified Candidate 14 in `advanced` mode with Cooler
@@ -287,9 +306,10 @@ of hysteresis is inferred, not observed (DR-15). For fan 2, by evidence level:
 
 - Observed: the EC's fan-2 target alternates once a second between the table's
   step and the one below at a GPU temperature of 43 and 44 °C, and on warm-up
-  fan 2 runs one step below the table up to 54 °C, about 3,750 instead of
-  4,330 RPM at 44 to 54 °C (DR-15: a 90 s read-only sample, and the minute
-  status lines of the field evidence above).
+  fan 2 runs one step below the table up to 54 °C (DR-15: a 90 s read-only
+  sample, and the minute status lines of the field evidence above). At 44 to
+  54 °C that is about 3,750 RPM (status lines) instead of the 70 step's 4,330
+  (calibration rows).
 - Inferred from the factory falling thresholds: the same up to 78 °C, with the
   step at 79 °C and above held.
 - From two rows of the calibration table only (`docs/CALIBRATION.md`): about
@@ -322,16 +342,16 @@ thresholds and of the curve the EC executes to `docs/PROFILE.md`.
   2026-09-29 and stay masked, and Secure Boot lockdown disables hibernation
   there. Keep suspend masked on such a host.
 - Hard CPU temperature enforcement below 90°C
-- That Candidate 14 is optimal or holds a hard thermal ceiling, and noise,
-  throughput or battery-life comparisons beyond the short runs in
-  `docs/CALIBRATION.md` (decision D-4): Candidate 14 is measured and
-  promising, not proven optimal. Nor is a throughput or battery-life
-  improvement claimed for the controller's own efficiency changes, which rest
-  on offline tests.
+- That Candidate 14 is optimal or holds a hard thermal ceiling, thermal
+  comparisons beyond the short runs in `docs/CALIBRATION.md`, and any noise,
+  throughput or battery-life comparison (decision D-4): Candidate 14 is
+  measured and promising, not proven optimal. Nor is a throughput or
+  battery-life improvement claimed for the controller's own efficiency
+  changes, which rest on offline tests.
 - Battery operation: no test on battery power is recorded.
-- Uninstall and fresh installation on real hardware: the uninstall script is
-  tested in a sandbox only, and the validation host is updated with the
-  guarded upgrade.
+- Uninstall and fresh installation on real hardware: the scripts are tested in
+  a sandbox only (fresh installation has no sandbox test until LD-2), and the
+  validation host is updated with the guarded upgrade.
 - Concurrent kernel-store tests, with simultaneous writes to the driver's
   `fan_curve` store, and the real EC's behavior when an EC access fails; fault
   injection uses a mock EC (see Pending).
