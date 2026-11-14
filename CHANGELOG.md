@@ -20,12 +20,13 @@ host-wide out-of-memory stall delayed the daemon past its 5 s systemd
 watchdog. On 2026-11-13 the keeper that took over was then killed by its own
 5 s watchdog three times, and systemd refused to restart it. Both units now
 use a 30 s watchdog, and a failed runtime watchdog notification no longer
-ends the daemon or the keeper. The length of each stall and where the time
-went, the reason each unit last stopped and the EC state the daemon finds at
-startup now show in the journal or in `msi-fan-profile status`, and the
-installed documents describe host memory stalls, with runbooks for a
-watchdog kill and a torn recovery latch. Candidate 14, the alarm limits and
-the accepted driver builds are those of 0.2.0.
+ends the daemon or the keeper. The length of each stall the daemon or keeper
+survives and where the time went, the reason each unit last stopped and the
+EC state the daemon finds at startup now show in the journal or in
+`msi-fan-profile status`, and the installed documents describe host memory
+stalls, with runbooks for a watchdog kill and a torn recovery latch.
+Candidate 14, the alarm limits and the accepted driver builds are those of
+0.2.0.
 
 ### Upgrade notes
 
@@ -39,7 +40,8 @@ the accepted driver builds are those of 0.2.0.
   valid, cool samples and does not disable the service when it refuses. If it
   refuses, the upgrade continues at full cooling when the state the refusal
   left verifies, and otherwise stops with nothing replaced; rerun the upgrade
-  once the machine is cool (`docs/INSTALL.md`).
+  once the machine is cool, or run `sudo msi-fan-profile apply-default` to
+  resume the installed profile now (`docs/INSTALL.md`).
 - After the upgrade, `systemctl show -p WatchdogUSec msi-fan-profile.service`
   prints `WatchdogUSec=30s`. systemd reports a unit's watchdog interval as of
   the unit's last start, so until the keeper next starts, the same query for
@@ -69,9 +71,9 @@ the accepted driver builds are those of 0.2.0.
   falling-threshold bytes, which decide when a step is left again, at their
   factory values; for fan 2 those lie above Candidate 14's rising thresholds.
   0.2.1 does not change this. The alarms and Cooler Boost do not depend on
-  the curve. Under decision D-2 (option (b), decided on 2026-11-13), the
-  transition to a driver build that also writes those 12 bytes and a re-tune
-  of the curve come before the 1.0 release candidate.
+  the curve. Under decision D-2 (option (b), decided on 2026-11-13), a driver
+  build that also writes those 12 bytes and a re-tuned curve are planned for
+  1.0; whether the EC honours written falling thresholds is not yet proven.
 
 ### Changed
 
