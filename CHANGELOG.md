@@ -32,6 +32,18 @@ its section starts with a short summary, upgrade notes and known issues.
   `systemctl show -p WatchdogUSec msi-fan-profile.service` prints
   `WatchdogUSec=30s` (ST-1).
 
+### Operator-visible
+
+- A monitoring stall logs one WARNING with its length to 0.1 s, split into the
+  previous pass after its acquisition, the sleep overrun, this pass before its
+  acquisition and the acquisition, with each channel's read time for a slow
+  acquisition and the `some` and `full` memory pressure of the unit and the
+  host, read after the Cooler Boost write; it replaces the `sensor telemetry
+  degraded` warning of a slow acquisition, and a gap that only repeats a
+  reported slow acquisition logs nothing more. The keeper logs one such
+  WARNING when a pass, with any overrun of the sleep before it, takes more than
+  2 s; no decision and no health field uses these figures (ST-3).
+
 ## 0.2.0 - 2026-10-11
 
 Hardening release for the same laptop and firmware. A genuine daemon fault
