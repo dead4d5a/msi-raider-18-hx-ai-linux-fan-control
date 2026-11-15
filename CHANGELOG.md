@@ -22,7 +22,7 @@ its section starts with a short summary, upgrade notes and known issues.
   entry names the test that closes it, and suspend and resume, curve
   optimality and a thermal ceiling, battery operation, uninstall and fresh
   installation on real hardware, and concurrent kernel-store tests are listed
-  under Not claimed (VA-3).
+  under Not claimed (VA-3, #14).
 
 ## 0.2.1
 

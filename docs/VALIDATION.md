@@ -146,7 +146,8 @@ log is in the export.
   that. These events close the attended sentinel test that was pending, for
   v0.2.0 only. Injecting the sentinel would need a raw EC write, which this
   project does not support (`SECURITY.md`), so a later release that changes
-  this path rests on its unit tests until such an event occurs on it.
+  this path rests on its unit tests until a degraded-telemetry episode occurs
+  on it.
 - 2026-10-24, 16:20:28 and 16:20:30: two monitoring gaps, each in the same
   second as a host-wide out-of-memory kill in the kernel's lines, which give
   whole seconds only. Each latched Cooler Boost and reset the cooldown, and
@@ -276,11 +277,11 @@ Each entry names the test that closes it.
   from an active keeper is recorded for v0.2.0, and field events do not
   replace an attended, injected fault.
 - Guarded deployment of the release candidate with its complete record
-  (VA-10), then its 14-day soak against the roadmap's soak criteria C1 to C10
-  (VA-16). The sustained-load case is the soak's exposure criterion C10, and
-  resume is not claimed (below). For v0.2.0 the field evidence above holds
-  daemon runs of up to 10.3 days and the sustained heat of 2026-10-18 and
-  2026-10-19.
+  (VA-10), then its 14-day soak against criteria C1 to C10 of
+  `docs/ROADMAP.md` section 7 (VA-16). The sustained-load case is the soak's
+  exposure criterion C10, and resume is not claimed (below). For v0.2.0 the
+  field evidence above holds daemon runs of up to 10.3 days and the sustained
+  heat of 2026-10-18 and 2026-10-19.
 - One attended boot with `module_blacklist=msi_ec` on the kernel command line,
   which confirms the visible driver-loss failure: the primary unit fails before
   any EC write, the keeper is skipped, and `msi-fan-profile status` prints
@@ -352,7 +353,8 @@ thresholds and of the curve the EC executes to `docs/PROFILE.md`.
   measured and promising, not proven optimal. Nor is a throughput or
   battery-life improvement claimed for the controller's own efficiency
   changes, which rest on offline tests.
-- Battery operation: no test on battery power is recorded.
+- Battery operation: every attended test runs on AC power, and no test on
+  battery power is recorded.
 - Uninstall and fresh installation on real hardware: the scripts are tested in
   a sandbox only (fresh installation has no sandbox test until LD-2), and the
   validation host is updated with the guarded upgrade.
