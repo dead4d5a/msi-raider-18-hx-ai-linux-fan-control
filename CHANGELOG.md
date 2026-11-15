@@ -13,6 +13,17 @@ ends with its roadmap item ID in parentheses, and with its issue number too
 once that issue exists: `(ST-1)`, later `(ST-1, #N)`. When a version is cut,
 its section starts with a short summary, upgrade notes and known issues.
 
+### Fixed
+
+- `docs/VALIDATION.md` no longer names `6ed5498` as the deployed release. It
+  records the unattended field evidence of v0.2.0 from 2026-10-18 to
+  2026-11-13 with the digests of its two journal exports, and the fan-2
+  limitation of 0.2.x with the evidence level of each statement; each Pending
+  entry names the test that closes it, and suspend and resume, curve
+  optimality and a thermal ceiling, battery operation, uninstall and fresh
+  installation on real hardware, and concurrent kernel-store tests are listed
+  under Not claimed (VA-3, #14).
+
 ## 0.2.1
 
 Hotfix for the watchdog kills of 2026-11-10 and 2026-11-13, in which a
