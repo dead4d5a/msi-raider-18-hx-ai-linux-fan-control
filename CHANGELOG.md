@@ -20,7 +20,8 @@ its section starts with a short summary, upgrade notes and known issues.
   the audit's verification pass), one disposition and an anchor that can be
   checked, such as a commit, a file and line or a CI run. A row whose work is
   not finished, or the part of a finding that a fix left unfinished, reads
-  open and names the roadmap item that carries it (LD-1).
+  open and links the issue of the roadmap item that carries it
+  (LD-1, #12).
 
 ## 0.2.1
 
