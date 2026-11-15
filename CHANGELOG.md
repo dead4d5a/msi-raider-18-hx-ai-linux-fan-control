@@ -13,6 +13,13 @@ ends with its roadmap item ID in parentheses, and with its issue number too
 once that issue exists: `(ST-1)`, later `(ST-1, #N)`. When a version is cut,
 its section starts with a short summary, upgrade notes and known issues.
 
+### Added
+
+- `docs/ROADMAP.md` is the plan from 0.2.0 to 1.0: the gates G0 to G5 with
+  their exit conditions, every work item and decision with its GitHub issue,
+  the merge and release rules, the attended sessions and the soak criterion
+  (PL-1, #10).
+
 ## 0.2.1
 
 Hotfix for the watchdog kills of 2026-11-10 and 2026-11-13, in which a
