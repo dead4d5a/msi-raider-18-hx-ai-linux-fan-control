@@ -46,19 +46,19 @@ roadmap to 1.0; each gets a link to its GitHub issue once the issues are
 published.
 
 The table counts the rows by disposition. Its last column counts those whose
-`left:` part is open, so 28 rows still carry open work: the 22 open rows and
-6 fixed or accepted ones.
+`left:` part is open, so 29 rows still carry open work: the 22 open rows and
+7 fixed or accepted ones.
 
 | Disposition | Rows | With an open `left:` part |
 |---|---:|---:|
-| fixed | 18 | 5 |
+| fixed | 18 | 6 |
 | closed by evidence | 5 | 0 |
 | accepted | 4 | 1 |
 | dropped | 4 | 0 |
 | deferred beyond 1.0 | 1 | 0 |
 | host action | 2 | 0 |
 | open | 22 | 0 |
-| total | 56 | 6 |
+| total | 56 | 7 |
 
 ## Kernel and driver
 
@@ -97,7 +97,7 @@ The table counts the rows by disposition. Its last column counts those whose
 | R4 | `factory-auto` creates its marker before stopping the daemon, and the daemon treats the marker as a fault | low | fixed | `13b85bc` makes the daemon take a new marker as a clean stop request |
 | R5 | The 3,000 RPM fan-response floor is met without Boost, so recovery and the keeper cannot detect an ineffective Boost command | info | accepted | The documents call it a response floor, not proof of maximum speed: `docs/SAFETY.md:95`, `docs/ARCHITECTURE.md:81`, `docs/OPERATIONS.md:160-161` |
 | R6 | The root programs use `#!/usr/bin/env python3`, so their interpreter depends on `PATH`, where `/usr/local/bin` comes first | low | fixed | `0b95cea` pins `#!/usr/bin/python3 -I` in all three programs |
-| R7 | No tests for the recovery decisions or the `factory-auto` failure paths; the manager tests have no guard against the real hardware or systemd | medium | fixed; left: a residual, accepted | `6b91e17` guards the manager tests against the host; `c5e4aeb` tests the `ExecStopPost` decisions, the Boost release, the latch and the lock; `13b85bc` runs `factory-auto` against an in-memory systemd and EC. The residual: no test compares the latch payload across programs; each defines the same `RECOVERY_LATCH_PAYLOAD` (`src/msi-fan-profile:36`, `src/msi-fan-profiled:34`, `src/msi-gpu-recover:29`) |
+| R7 | No tests for the recovery decisions or the `factory-auto` failure paths; the manager tests have no guard against the real hardware or systemd | medium | fixed; left: a cross-program test of the latch payload, open (ST-9) | `6b91e17` guards the manager tests against the host; `c5e4aeb` tests the `ExecStopPost` decisions, the Boost release, the latch and the lock; `13b85bc` runs `factory-auto` against an in-memory systemd and EC. The residual: no test compares the latch payload across programs; each defines the same `RECOVERY_LATCH_PAYLOAD` (`src/msi-fan-profile:36`, `src/msi-fan-profiled:34`, `src/msi-gpu-recover:29`); ST-9 adds that test |
 | R8 | `boost-release` waits by running `systemctl show` every 250 ms, with no time limit | info | dropped | The cost is small and arises only while a release is pending; the wait ends with the daemon's acknowledgement, with a newer `boost-on`, or when the daemon stops or is replaced (`src/msi-fan-profile:642-670`, `:709`) |
 
 ## Efficiency
